@@ -89,6 +89,20 @@ pub enum XpubPrefix {
     Test,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitcoinNetwork {
+    Main,
+    Test,
+    Regtest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinglesigScriptVariant {
+    Pkh,
+    Wpkh,
+    ShWpkh,
+}
+
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
     if !matches!(seed.len(), 16 | 32 | 64) {
         return None;
@@ -114,10 +128,11 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
     use super::{
-        BlindingFactorBytes, BlindingFactorKind, XpubPrefix, EC_PRIVATE_KEY_LEN,
-        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN,
+        BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind, SinglesigScriptVariant,
+        XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN,
     };
     use alloc::string::String;
+    use alloc::vec::Vec;
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -143,6 +158,61 @@ pub mod pure_rust {
             XpubPrefix::Test => bip32::Prefix::TPUB,
         };
         Some(private_key.public_key().to_string(prefix))
+    }
+
+    pub fn public_key_from_seed_path(
+        seed: &[u8],
+        path: &[u32],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let mut derivation_path = bip32::DerivationPath::default();
+        for value in path {
+            let hardened = value & bip32::ChildNumber::HARDENED_FLAG != 0;
+            let child =
+                bip32::ChildNumber::new(value & !bip32::ChildNumber::HARDENED_FLAG, hardened)
+                    .ok()?;
+            derivation_path.push(child);
+        }
+
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        Some(private_key.public_key().to_bytes())
+    }
+
+    pub fn bitcoin_singlesig_address_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        network: BitcoinNetwork,
+        variant: SinglesigScriptVariant,
+    ) -> Option<String> {
+        let public_key = public_key_from_seed_path(seed, path)?;
+        let pubkey_hash = hash160(&public_key);
+        match variant {
+            SinglesigScriptVariant::Pkh => {
+                let mut payload = Vec::with_capacity(21);
+                payload.push(match network {
+                    BitcoinNetwork::Main => 0x00,
+                    BitcoinNetwork::Test | BitcoinNetwork::Regtest => 0x6f,
+                });
+                payload.extend_from_slice(&pubkey_hash);
+                Some(base58ck::encode_check(&payload))
+            }
+            SinglesigScriptVariant::Wpkh => {
+                bech32::segwit::encode_v0(segwit_hrp(network), &pubkey_hash).ok()
+            }
+            SinglesigScriptVariant::ShWpkh => {
+                let mut redeem_script = [0u8; 22];
+                redeem_script[1] = 0x14;
+                redeem_script[2..].copy_from_slice(&pubkey_hash);
+                let script_hash = hash160(&redeem_script);
+
+                let mut payload = Vec::with_capacity(21);
+                payload.push(match network {
+                    BitcoinNetwork::Main => 0x05,
+                    BitcoinNetwork::Test | BitcoinNetwork::Regtest => 0xc4,
+                });
+                payload.extend_from_slice(&script_hash);
+                Some(base58ck::encode_check(&payload))
+            }
+        }
     }
 
     pub fn slip77_blinding_private_key(
@@ -228,6 +298,22 @@ pub mod pure_rust {
 
         Some(output)
     }
+
+    fn hash160(bytes: &[u8]) -> [u8; 20] {
+        let sha = Sha256::digest(bytes);
+        let ripemd = <ripemd::Ripemd160 as ripemd::Digest>::digest(sha.as_slice());
+        let mut output = [0u8; 20];
+        output.copy_from_slice(&ripemd);
+        output
+    }
+
+    fn segwit_hrp(network: BitcoinNetwork) -> bech32::Hrp {
+        match network {
+            BitcoinNetwork::Main => bech32::hrp::BC,
+            BitcoinNetwork::Test => bech32::hrp::TB,
+            BitcoinNetwork::Regtest => bech32::hrp::BCRT,
+        }
+    }
 }
 
 #[cfg(all(test, feature = "pure-rust-curves"))]
@@ -291,6 +377,56 @@ mod tests {
             pure_rust::xpub_from_seed(&seed, &[0x8000_0000], XpubPrefix::Test)
                 .unwrap()
                 .starts_with("tpub")
+        );
+    }
+
+    #[test]
+    fn bitcoin_singlesig_addresses_match_bip32_vector_child() {
+        let seed = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let path = [0x8000_0000];
+
+        assert_eq!(
+            pure_rust::bitcoin_singlesig_address_from_seed(
+                &seed,
+                &path,
+                BitcoinNetwork::Main,
+                SinglesigScriptVariant::Pkh,
+            )
+            .unwrap(),
+            "19Q2WoS5hSS6T8GjhK8KZLMgmWaq4neXrh"
+        );
+        assert_eq!(
+            pure_rust::bitcoin_singlesig_address_from_seed(
+                &seed,
+                &path,
+                BitcoinNetwork::Main,
+                SinglesigScriptVariant::Wpkh,
+            )
+            .unwrap(),
+            "bc1qtsdavj8dyw49l4gt554jg47pr60gpf48ww2ens"
+        );
+        assert_eq!(
+            pure_rust::bitcoin_singlesig_address_from_seed(
+                &seed,
+                &path,
+                BitcoinNetwork::Main,
+                SinglesigScriptVariant::ShWpkh,
+            )
+            .unwrap(),
+            "3AbBmNbPDSzeZKHywDrH3h5v2rL8xGfT7e"
+        );
+        assert_eq!(
+            pure_rust::bitcoin_singlesig_address_from_seed(
+                &seed,
+                &path,
+                BitcoinNetwork::Regtest,
+                SinglesigScriptVariant::Wpkh,
+            )
+            .unwrap(),
+            "bcrt1qtsdavj8dyw49l4gt554jg47pr60gpf48xpg8l2"
         );
     }
 

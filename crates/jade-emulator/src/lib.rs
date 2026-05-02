@@ -153,6 +153,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_xpub" => {
                 self.xpub_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_receive_address" => {
+                self.receive_address_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
                 self.master_blinding_key_result(request)
             }
@@ -592,6 +595,79 @@ impl Emulator {
         V1Outcome::TextResult { result: xpub }
     }
 
+    fn receive_address_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        let network_name = match params.str("network") {
+            Ok(Some(network)) if valid_network_name(network) => network,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters");
+            }
+        };
+        let is_liquid = is_liquid_network(network_name);
+        let confidential = if params.contains("confidential").unwrap_or(false) {
+            match params.bool("confidential") {
+                Ok(Some(confidential)) => confidential,
+                Ok(None) | Err(_) => return bad_parameters("Invalid confidential flag"),
+            }
+        } else {
+            is_liquid
+        };
+        if confidential && !is_liquid {
+            return bad_parameters("Confidential addresses only apply to liquid networks");
+        }
+
+        if is_liquid
+            || params.contains("multisig_name").unwrap_or(false)
+            || params.contains("descriptor_name").unwrap_or(false)
+            || !params.contains("variant").unwrap_or(false)
+        {
+            return V1Outcome::DeferredToCore {
+                method: "get_receive_address".to_string(),
+            };
+        }
+
+        let variant = match params.str("variant") {
+            Ok(Some("pkh(k)")) => jade_crypto::SinglesigScriptVariant::Pkh,
+            Ok(Some("wpkh(k)")) => jade_crypto::SinglesigScriptVariant::Wpkh,
+            Ok(Some("sh(wpkh(k))")) => jade_crypto::SinglesigScriptVariant::ShWpkh,
+            Ok(Some("tr(k)")) => {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => {
+                return bad_parameters("Invalid script variant parameter");
+            }
+        };
+        let path = match params.u32_array("path", MAX_PATH_LEN) {
+            Ok(Some(path)) if !path.is_empty() => path,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid path from parameters");
+            }
+        };
+        let Some(network) = bitcoin_network_for_name(network_name) else {
+            return V1Outcome::DeferredToCore {
+                method: "get_receive_address".to_string(),
+            };
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return bad_parameters("Failed to generate valid singlesig script");
+        };
+        let Some(address) = jade_crypto::pure_rust::bitcoin_singlesig_address_from_seed(
+            seed, &path, network, variant,
+        ) else {
+            return bad_parameters("Failed to generate valid singlesig script");
+        };
+
+        V1Outcome::TextResult { result: address }
+    }
+
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -1001,6 +1077,26 @@ fn optional_str<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Option
 
 fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Option<&'a [u8]> {
     params.bytes(field).ok().flatten()
+}
+
+fn valid_network_name(network: &str) -> bool {
+    matches!(
+        network,
+        "mainnet" | "liquid" | "testnet" | "testnet-liquid" | "localtest" | "localtest-liquid"
+    )
+}
+
+fn is_liquid_network(network: &str) -> bool {
+    matches!(network, "liquid" | "testnet-liquid" | "localtest-liquid")
+}
+
+fn bitcoin_network_for_name(network: &str) -> Option<jade_crypto::BitcoinNetwork> {
+    match network {
+        "mainnet" => Some(jade_crypto::BitcoinNetwork::Main),
+        "testnet" => Some(jade_crypto::BitcoinNetwork::Test),
+        "localtest" => Some(jade_crypto::BitcoinNetwork::Regtest),
+        _ => None,
+    }
 }
 
 fn xpub_prefix_for_network(network: &str) -> Option<jade_crypto::XpubPrefix> {
@@ -1804,6 +1900,249 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::InternalError,
                 message: "Cannot get xpub for path".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn get_receive_address_derives_bitcoin_singlesig_addresses() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(vec![
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+
+        for (variant, network, expected) in [
+            ("pkh(k)", "mainnet", "19Q2WoS5hSS6T8GjhK8KZLMgmWaq4neXrh"),
+            (
+                "wpkh(k)",
+                "mainnet",
+                "bc1qtsdavj8dyw49l4gt554jg47pr60gpf48ww2ens",
+            ),
+            (
+                "sh(wpkh(k))",
+                "mainnet",
+                "3AbBmNbPDSzeZKHywDrH3h5v2rL8xGfT7e",
+            ),
+            (
+                "wpkh(k)",
+                "localtest",
+                "bcrt1qtsdavj8dyw49l4gt554jg47pr60gpf48xpg8l2",
+            ),
+        ] {
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(3)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(network)
+                .unwrap()
+                .str("variant")
+                .unwrap()
+                .str(variant)
+                .unwrap()
+                .str("path")
+                .unwrap()
+                .array(1)
+                .unwrap()
+                .u32(0x8000_0000)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("a"),
+                method: Cow::Borrowed("get_receive_address"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::TextResult {
+                    result: expected.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn raw_v1_get_receive_address_returns_string_result() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(vec![
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("a")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_receive_address")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wpkh(k)")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut result = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "a"),
+                "result" => result = Some(decoder.str().unwrap()),
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(result, Some("bc1qtsdavj8dyw49l4gt554jg47pr60gpf48ww2ens"));
+    }
+
+    #[test]
+    fn get_receive_address_rejects_invalid_singlesig_inputs_and_defers_other_branches() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x11; jade_crypto::SHA512_LEN]);
+
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wpkh(k)")
+            .unwrap()
+            .str("confidential")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Confidential addresses only apply to liquid networks".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wpkh(k)")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid path from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "get_receive_address".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("tr(k)")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "get_receive_address".to_string()
             }
         );
     }
