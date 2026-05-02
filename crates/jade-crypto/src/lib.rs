@@ -104,6 +104,13 @@ pub enum BitcoinNetwork {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidNetwork {
+    Main,
+    Test,
+    Regtest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinglesigScriptVariant {
     Pkh,
     Wpkh,
@@ -495,7 +502,7 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
-        IdentityKeyType, MultisigScriptVariant, SinglesigScriptVariant, XpubPrefix,
+        IdentityKeyType, LiquidNetwork, MultisigScriptVariant, SinglesigScriptVariant, XpubPrefix,
         EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
@@ -644,6 +651,56 @@ pub mod pure_rust {
                 witness_program[2..].copy_from_slice(witness_script_hash.as_ref());
                 let script_hash = hash160(&witness_program);
                 p2sh_address(network, &script_hash)
+            }
+        }
+    }
+
+    pub fn liquid_unconfidential_multisig_address_from_xpubs(
+        xpubs: &[[u8; 78]],
+        paths: &[Vec<u32>],
+        network: LiquidNetwork,
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<String> {
+        if xpubs.len() != paths.len() {
+            return None;
+        }
+
+        let mut pubkeys = Vec::with_capacity(xpubs.len());
+        for (xpub, path) in xpubs.iter().zip(paths.iter()) {
+            pubkeys.push(public_key_from_serialized_xpub_path(xpub, path)?);
+        }
+
+        liquid_unconfidential_multisig_address_from_pubkeys(
+            &pubkeys, network, variant, sorted, threshold,
+        )
+    }
+
+    pub fn liquid_unconfidential_multisig_address_from_pubkeys(
+        pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
+        network: LiquidNetwork,
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<String> {
+        let multisig_script = multisig_script(pubkeys, sorted, threshold)?;
+        match variant {
+            MultisigScriptVariant::P2wsh => {
+                let script_hash = Sha256::digest(&multisig_script);
+                bech32::segwit::encode_v0(liquid_segwit_hrp(network), script_hash.as_ref()).ok()
+            }
+            MultisigScriptVariant::P2sh => {
+                let script_hash = hash160(&multisig_script);
+                liquid_p2sh_address(network, &script_hash)
+            }
+            MultisigScriptVariant::P2wshP2sh => {
+                let witness_script_hash = Sha256::digest(&multisig_script);
+                let mut witness_program = [0u8; 34];
+                witness_program[1] = SHA256_LEN as u8;
+                witness_program[2..].copy_from_slice(witness_script_hash.as_ref());
+                let script_hash = hash160(&witness_program);
+                liquid_p2sh_address(network, &script_hash)
             }
         }
     }
@@ -895,6 +952,47 @@ pub mod pure_rust {
         }
     }
 
+    pub fn liquid_unconfidential_singlesig_address_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        network: LiquidNetwork,
+        variant: SinglesigScriptVariant,
+    ) -> Option<String> {
+        let public_key = public_key_from_seed_path(seed, path)?;
+        let pubkey_hash = hash160(&public_key);
+        match variant {
+            SinglesigScriptVariant::Pkh => {
+                let mut payload = Vec::with_capacity(21);
+                payload.push(match network {
+                    LiquidNetwork::Main => 57,
+                    LiquidNetwork::Test => 36,
+                    LiquidNetwork::Regtest => 235,
+                });
+                payload.extend_from_slice(&pubkey_hash);
+                Some(base58ck::encode_check(&payload))
+            }
+            SinglesigScriptVariant::Wpkh => {
+                bech32::segwit::encode_v0(liquid_segwit_hrp(network), &pubkey_hash).ok()
+            }
+            SinglesigScriptVariant::ShWpkh => {
+                let mut redeem_script = [0u8; 22];
+                redeem_script[1] = 0x14;
+                redeem_script[2..].copy_from_slice(&pubkey_hash);
+                let script_hash = hash160(&redeem_script);
+
+                let mut payload = Vec::with_capacity(21);
+                payload.push(match network {
+                    LiquidNetwork::Main => 39,
+                    LiquidNetwork::Test => 19,
+                    LiquidNetwork::Regtest => 75,
+                });
+                payload.extend_from_slice(&script_hash);
+                Some(base58ck::encode_check(&payload))
+            }
+            SinglesigScriptVariant::Tr => None,
+        }
+    }
+
     pub fn slip77_blinding_private_key(
         master_unblinding_key: &[u8; 64],
         script: &[u8],
@@ -997,6 +1095,17 @@ pub mod pure_rust {
         Some(base58ck::encode_check(&payload))
     }
 
+    fn liquid_p2sh_address(network: LiquidNetwork, script_hash: &[u8; 20]) -> Option<String> {
+        let mut payload = Vec::with_capacity(21);
+        payload.push(match network {
+            LiquidNetwork::Main => 39,
+            LiquidNetwork::Test => 19,
+            LiquidNetwork::Regtest => 75,
+        });
+        payload.extend_from_slice(script_hash);
+        Some(base58ck::encode_check(&payload))
+    }
+
     fn multisig_script(
         pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
         sorted: bool,
@@ -1060,6 +1169,14 @@ pub mod pure_rust {
             BitcoinNetwork::Main => bech32::hrp::BC,
             BitcoinNetwork::Test => bech32::hrp::TB,
             BitcoinNetwork::Regtest => bech32::hrp::BCRT,
+        }
+    }
+
+    fn liquid_segwit_hrp(network: LiquidNetwork) -> bech32::Hrp {
+        match network {
+            LiquidNetwork::Main => bech32::Hrp::parse_unchecked("ex"),
+            LiquidNetwork::Test => bech32::Hrp::parse_unchecked("tex"),
+            LiquidNetwork::Regtest => bech32::Hrp::parse_unchecked("ert"),
         }
     }
 
@@ -1473,6 +1590,24 @@ mod tests {
             )
             .unwrap(),
             "bcrt1qtsdavj8dyw49l4gt554jg47pr60gpf48xpg8l2"
+        );
+    }
+
+    #[test]
+    fn liquid_unconfidential_singlesig_address_matches_jade_vector() {
+        let seed =
+            decode_hex_32("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c");
+        let path = [0x8000_0000, 0x8000_0000, 0x8000_0009];
+
+        assert_eq!(
+            pure_rust::liquid_unconfidential_singlesig_address_from_seed(
+                &seed,
+                &path,
+                LiquidNetwork::Regtest,
+                SinglesigScriptVariant::Pkh,
+            )
+            .unwrap(),
+            "2dafKNiCKbRum9S1u5BYqTByZT5R9zSqcWy"
         );
     }
 

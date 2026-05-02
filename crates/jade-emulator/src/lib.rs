@@ -34,6 +34,12 @@ pub struct Emulator {
     ota: Option<HostOtaSession>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultisigAddressNetwork {
+    Bitcoin(jade_crypto::BitcoinNetwork),
+    Liquid(jade_crypto::LiquidNetwork),
+}
+
 impl Default for Emulator {
     fn default() -> Self {
         Self {
@@ -634,12 +640,19 @@ impl Emulator {
             return self.register_multisig_file_result(multisig_file);
         }
 
-        let network = match params.str("network") {
-            Ok(Some(network)) => match bitcoin_network_for_name(network) {
-                Some(network) => network,
-                None => return bad_parameters("Failed to extract valid network from parameters"),
-            },
+        let xpub_prefix = match params.str("network") {
+            Ok(Some(network)) if valid_network_name(network) => {
+                match xpub_prefix_for_network(network) {
+                    Some(prefix) => prefix,
+                    None => {
+                        return bad_parameters("Failed to extract valid network from parameters")
+                    }
+                }
+            }
             Ok(None) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters")
+            }
+            Ok(Some(_)) => {
                 return bad_parameters("Failed to extract valid network from parameters")
             }
         };
@@ -696,7 +709,7 @@ impl Emulator {
             signers,
         };
 
-        self.persist_multisig_registration(&registration, network)
+        self.persist_multisig_registration(&registration, xpub_prefix)
     }
 
     fn register_multisig_file_result(&mut self, multisig_file: &str) -> V1Outcome {
@@ -706,13 +719,13 @@ impl Emulator {
             Err(message) => return bad_parameters(message),
         };
 
-        self.persist_multisig_registration(&parsed, network)
+        self.persist_multisig_registration(&parsed, jade_crypto::XpubPrefix::Main)
     }
 
     fn persist_multisig_registration(
         &mut self,
         registration: &ParsedMultisigFile,
-        network: jade_crypto::BitcoinNetwork,
+        xpub_prefix: jade_crypto::XpubPrefix,
     ) -> V1Outcome {
         let multisig_name = registration.name.as_str();
         let signers = registration.signers.as_slice();
@@ -722,7 +735,7 @@ impl Emulator {
         if registration.threshold as usize > signers.len() {
             return bad_parameters("Invalid multisig threshold");
         }
-        if !self.validate_registration_signers(signers, network) {
+        if !self.validate_registration_signers(signers, xpub_prefix) {
             return bad_parameters("Failed to validate co-signers");
         }
 
@@ -867,7 +880,7 @@ impl Emulator {
     fn validate_registration_signers(
         &self,
         signers: &[MultisigSignerDetails],
-        network: jade_crypto::BitcoinNetwork,
+        xpub_prefix: jade_crypto::XpubPrefix,
     ) -> bool {
         let Some(seed) = self.platform.wallet_seed() else {
             return false;
@@ -875,25 +888,19 @@ impl Emulator {
         let Some(fingerprint) = wallet_fingerprint_from_seed(seed) else {
             return false;
         };
-        let prefix = match network {
-            jade_crypto::BitcoinNetwork::Main => jade_crypto::XpubPrefix::Main,
-            jade_crypto::BitcoinNetwork::Test | jade_crypto::BitcoinNetwork::Regtest => {
-                jade_crypto::XpubPrefix::Test
-            }
-        };
 
         let mut found_wallet_signer = false;
         for signer in signers {
             if signer.path.iter().any(|value| value & 0x8000_0000 != 0)
                 || signer.derivation.len() > MAX_PATH_LEN
                 || signer.path.len() > MAX_PATH_LEN
-                || !valid_serialized_xpub_for_network(&signer.xpub, network)
+                || !valid_serialized_xpub_for_prefix(&signer.xpub, xpub_prefix)
             {
                 return false;
             }
             if signer.fingerprint == fingerprint {
                 let Some(expected_xpub) =
-                    jade_crypto::pure_rust::xpub_from_seed(seed, &signer.derivation, prefix)
+                    jade_crypto::pure_rust::xpub_from_seed(seed, &signer.derivation, xpub_prefix)
                 else {
                     return false;
                 };
@@ -1007,19 +1014,30 @@ impl Emulator {
             return self.receive_descriptor_address_result(params, network);
         }
 
-        if is_liquid {
-            return V1Outcome::DeferredToCore {
-                method: "get_receive_address".to_string(),
-            };
-        }
-
-        let Some(network) = bitcoin_network_for_name(network_name) else {
-            return V1Outcome::DeferredToCore {
-                method: "get_receive_address".to_string(),
-            };
-        };
         if params.contains("multisig_name").unwrap_or(false) {
-            return self.receive_multisig_address_result(params, network);
+            if is_liquid {
+                if confidential {
+                    return V1Outcome::DeferredToCore {
+                        method: "get_receive_address".to_string(),
+                    };
+                }
+                let Some(network) = liquid_network_for_name(network_name) else {
+                    return V1Outcome::DeferredToCore {
+                        method: "get_receive_address".to_string(),
+                    };
+                };
+                return self.receive_multisig_address_result(
+                    params,
+                    MultisigAddressNetwork::Liquid(network),
+                );
+            }
+            let Some(network) = bitcoin_network_for_name(network_name) else {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            };
+            return self
+                .receive_multisig_address_result(params, MultisigAddressNetwork::Bitcoin(network));
         }
         if !params.contains("variant").unwrap_or(false) {
             return V1Outcome::DeferredToCore {
@@ -1045,9 +1063,37 @@ impl Emulator {
         let Some(seed) = self.platform.wallet_seed() else {
             return bad_parameters("Failed to generate valid singlesig script");
         };
-        let Some(address) = jade_crypto::pure_rust::bitcoin_singlesig_address_from_seed(
-            seed, &path, network, variant,
-        ) else {
+
+        let address = if is_liquid {
+            if confidential {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            }
+            let Some(network) = liquid_network_for_name(network_name) else {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            };
+            if variant == jade_crypto::SinglesigScriptVariant::Tr {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            }
+            jade_crypto::pure_rust::liquid_unconfidential_singlesig_address_from_seed(
+                seed, &path, network, variant,
+            )
+        } else {
+            let Some(network) = bitcoin_network_for_name(network_name) else {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            };
+            jade_crypto::pure_rust::bitcoin_singlesig_address_from_seed(
+                seed, &path, network, variant,
+            )
+        };
+        let Some(address) = address else {
             return bad_parameters("Failed to generate valid singlesig script");
         };
 
@@ -1111,7 +1157,7 @@ impl Emulator {
     fn receive_multisig_address_result(
         &self,
         params: jade_protocol_v1::Params<'_>,
-        network: jade_crypto::BitcoinNetwork,
+        network: MultisigAddressNetwork,
     ) -> V1Outcome {
         let multisig_name = match params.str("multisig_name") {
             Ok(Some(name)) if key_name_valid(name) => name,
@@ -1180,14 +1226,30 @@ impl Emulator {
             None => (details.address_xpubs.clone(), paths),
         };
 
-        let Some(address) = jade_crypto::pure_rust::bitcoin_multisig_address_from_xpubs(
-            &xpubs,
-            &effective_paths,
-            network,
-            crypto_multisig_variant(details.summary.variant),
-            details.summary.sorted,
-            details.summary.threshold,
-        ) else {
+        let variant = crypto_multisig_variant(details.summary.variant);
+        let address = match network {
+            MultisigAddressNetwork::Bitcoin(network) => {
+                jade_crypto::pure_rust::bitcoin_multisig_address_from_xpubs(
+                    &xpubs,
+                    &effective_paths,
+                    network,
+                    variant,
+                    details.summary.sorted,
+                    details.summary.threshold,
+                )
+            }
+            MultisigAddressNetwork::Liquid(network) => {
+                jade_crypto::pure_rust::liquid_unconfidential_multisig_address_from_xpubs(
+                    &xpubs,
+                    &effective_paths,
+                    network,
+                    variant,
+                    details.summary.sorted,
+                    details.summary.threshold,
+                )
+            }
+        };
+        let Some(address) = address else {
             return bad_parameters(
                 "Unexpected number of signer paths or invalid path for multisig",
             );
@@ -3026,6 +3088,15 @@ fn bitcoin_network_for_name(network: &str) -> Option<jade_crypto::BitcoinNetwork
     }
 }
 
+fn liquid_network_for_name(network: &str) -> Option<jade_crypto::LiquidNetwork> {
+    match network {
+        "liquid" => Some(jade_crypto::LiquidNetwork::Main),
+        "testnet-liquid" => Some(jade_crypto::LiquidNetwork::Test),
+        "localtest-liquid" => Some(jade_crypto::LiquidNetwork::Regtest),
+        _ => None,
+    }
+}
+
 fn descriptor_receive_address(
     details: &DescriptorDetails,
     branch: u32,
@@ -3549,16 +3620,28 @@ fn wallet_fingerprint_from_seed(seed: &[u8]) -> Option<[u8; 4]> {
     hash[..4].try_into().ok()
 }
 
+#[cfg(test)]
 fn valid_serialized_xpub_for_network(
     xpub: &[u8; jade_storage::BIP32_SERIALIZED_LEN],
     network: jade_crypto::BitcoinNetwork,
 ) -> bool {
-    let prefix = u32::from_be_bytes(xpub[..4].try_into().expect("fixed prefix len"));
-    match network {
-        jade_crypto::BitcoinNetwork::Main => prefix == 0x0488_b21e,
+    let prefix = match network {
+        jade_crypto::BitcoinNetwork::Main => jade_crypto::XpubPrefix::Main,
         jade_crypto::BitcoinNetwork::Test | jade_crypto::BitcoinNetwork::Regtest => {
-            prefix == 0x0435_87cf
+            jade_crypto::XpubPrefix::Test
         }
+    };
+    valid_serialized_xpub_for_prefix(xpub, prefix)
+}
+
+fn valid_serialized_xpub_for_prefix(
+    xpub: &[u8; jade_storage::BIP32_SERIALIZED_LEN],
+    xpub_prefix: jade_crypto::XpubPrefix,
+) -> bool {
+    let prefix = u32::from_be_bytes(xpub[..4].try_into().expect("fixed prefix len"));
+    match xpub_prefix {
+        jade_crypto::XpubPrefix::Main => prefix == 0x0488_b21e,
+        jade_crypto::XpubPrefix::Test => prefix == 0x0435_87cf,
     }
 }
 
@@ -5207,6 +5290,54 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn get_receive_address_derives_liquid_unconfidential_singlesig_address() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(
+            decode_hex::<32>("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c")
+                .to_vec(),
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("pkh(k)")
+            .unwrap()
+            .str("confidential")
+            .unwrap()
+            .bool(false)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(3)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .u32(0x8000_0009)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "2dafKNiCKbRum9S1u5BYqTByZT5R9zSqcWy".to_string()
+            }
+        );
     }
 
     #[test]
@@ -7040,6 +7171,126 @@ mod tests {
             .str("multisig_name")
             .unwrap()
             .str("wallet-r")
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult { result: expected }
+        );
+    }
+
+    #[test]
+    fn register_multisig_accepts_liquid_network_and_derives_unconfidential_address() {
+        let mut emulator = Emulator::new();
+        let seed = test_mnemonic_seed();
+        emulator.platform_mut().set_debug_wallet_seed(seed.to_vec());
+        let fingerprint = wallet_fingerprint_from_seed(&seed).unwrap();
+        let xpub =
+            jade_crypto::pure_rust::xpub_from_seed(&seed, &[], jade_crypto::XpubPrefix::Test)
+                .unwrap();
+        let xpub_bytes: [u8; BIP32_SERIALIZED_LEN] =
+            base58ck::decode_check(&xpub).unwrap().try_into().unwrap();
+        let expected = jade_crypto::pure_rust::liquid_unconfidential_multisig_address_from_xpubs(
+            &[xpub_bytes],
+            &[vec![0]],
+            jade_crypto::LiquidNetwork::Regtest,
+            jade_crypto::MultisigScriptVariant::P2wsh,
+            true,
+            1,
+        )
+        .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("liquid-r")
+            .unwrap()
+            .str("descriptor")
+            .unwrap()
+            .map(5)
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wsh(multi(k))")
+            .unwrap()
+            .str("sorted")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("threshold")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("master_blinding_key")
+            .unwrap()
+            .bytes(&[0x33; MULTISIG_MASTER_BLINDING_KEY_SIZE])
+            .unwrap()
+            .str("signers")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .map(4)
+            .unwrap()
+            .str("fingerprint")
+            .unwrap()
+            .bytes(&fingerprint)
+            .unwrap()
+            .str("derivation")
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .str("xpub")
+            .unwrap()
+            .str(&xpub)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("r"),
+            method: Cow::Borrowed("register_multisig"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("liquid-r")
+            .unwrap()
+            .str("confidential")
+            .unwrap()
+            .bool(false)
             .unwrap()
             .str("paths")
             .unwrap()
