@@ -2,7 +2,11 @@
 
 extern crate alloc;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::str;
 
 use zeroize::Zeroize;
 
@@ -56,6 +60,19 @@ pub struct DescriptorSummary {
     pub num_datavalues: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorDetails {
+    pub descriptor_type: u8,
+    pub descriptor: String,
+    pub datavalues: Vec<DescriptorDataValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorDataValue {
+    pub key: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultisigSummary {
     pub variant: MultisigVariant,
@@ -96,6 +113,19 @@ pub fn parse_descriptor_summary(
     record: &[u8],
     authenticator: &impl RecordAuthenticator,
 ) -> StorageResult<DescriptorSummary> {
+    let details = parse_descriptor_details(record, authenticator)?;
+
+    Ok(DescriptorSummary {
+        descriptor_type: details.descriptor_type,
+        descriptor_len: details.descriptor.len() as u16,
+        num_datavalues: details.datavalues.len() as u8,
+    })
+}
+
+pub fn parse_descriptor_details(
+    record: &[u8],
+    authenticator: &impl RecordAuthenticator,
+) -> StorageResult<DescriptorDetails> {
     let payload = authenticated_payload(record, authenticator)?;
     let mut reader = RecordReader::new(payload);
 
@@ -106,25 +136,33 @@ pub fn parse_descriptor_summary(
 
     let descriptor_type = reader.u8()?;
     let descriptor_len = reader.u16_le()?;
-    reader.skip(descriptor_len as usize)?;
+    let descriptor = str::from_utf8(reader.take(descriptor_len as usize)?)
+        .map_err(|_| StorageError::InvalidRecord)?
+        .to_string();
 
     let num_datavalues = reader.u8()?;
     if num_datavalues as usize > MAX_ALLOWED_SIGNERS {
         return Err(StorageError::InvalidRecord);
     }
 
+    let mut datavalues = Vec::with_capacity(num_datavalues as usize);
     for _ in 0..num_datavalues {
         let key_len = reader.u16_le()? as usize;
-        reader.skip(key_len)?;
+        let key = str::from_utf8(reader.take(key_len)?)
+            .map_err(|_| StorageError::InvalidRecord)?
+            .to_string();
         let value_len = reader.u16_le()? as usize;
-        reader.skip(value_len)?;
+        let value = str::from_utf8(reader.take(value_len)?)
+            .map_err(|_| StorageError::InvalidRecord)?
+            .to_string();
+        datavalues.push(DescriptorDataValue { key, value });
     }
     reader.finish()?;
 
-    Ok(DescriptorSummary {
+    Ok(DescriptorDetails {
         descriptor_type,
-        descriptor_len,
-        num_datavalues,
+        descriptor,
+        datavalues,
     })
 }
 
@@ -758,8 +796,8 @@ mod tests {
         payload.extend_from_slice(&3u16.to_le_bytes());
         payload.extend_from_slice(b"abc");
 
-        let summary =
-            parse_descriptor_summary(&authenticated_record(payload), &TestAuthenticator).unwrap();
+        let record = authenticated_record(payload);
+        let summary = parse_descriptor_summary(&record, &TestAuthenticator).unwrap();
 
         assert_eq!(
             summary,
@@ -768,6 +806,22 @@ mod tests {
                 descriptor_len: 3,
                 num_datavalues: 2,
             }
+        );
+
+        let details = parse_descriptor_details(&record, &TestAuthenticator).unwrap();
+        assert_eq!(details.descriptor, "wsh");
+        assert_eq!(
+            details.datavalues,
+            vec![
+                DescriptorDataValue {
+                    key: "k".to_string(),
+                    value: "value".to_string(),
+                },
+                DescriptorDataValue {
+                    key: "xpub".to_string(),
+                    value: "abc".to_string(),
+                },
+            ]
         );
     }
 

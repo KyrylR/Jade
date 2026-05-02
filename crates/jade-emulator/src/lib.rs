@@ -12,8 +12,9 @@ use jade_protocol_v1::{
     MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry, V1Value,
 };
 use jade_storage::{
-    parse_descriptor_summary, parse_multisig_summary, JadeStorage, MemoryStorage,
-    RecordAuthenticator, StorageLimits, StorageNamespace, StorageRecord, HMAC_SHA256_LEN,
+    key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_summary,
+    JadeStorage, MemoryStorage, RecordAuthenticator, StorageLimits, StorageNamespace,
+    StorageRecord, HMAC_SHA256_LEN,
 };
 
 #[derive(Debug)]
@@ -116,6 +117,9 @@ impl Emulator {
             }
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptors" => {
                 self.registered_wallets_result(StorageNamespace::Descriptor, "descriptor")
+            }
+            Some(MethodClass::Authenticated) if request.method == "get_registered_descriptor" => {
+                self.registered_descriptor_details(request)
             }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
@@ -294,6 +298,75 @@ impl Emulator {
         }
 
         V1Outcome::OwnedMapResult { entries }
+    }
+
+    fn registered_descriptor_details(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let descriptor_name = match params.str("descriptor_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: "Missing or invalid descriptor name parameter".to_string(),
+                };
+            }
+        };
+
+        let mut record = Vec::new();
+        if self
+            .storage
+            .get_record(
+                StorageRecord::DescriptorRegistration {
+                    name: descriptor_name,
+                },
+                &mut record,
+            )
+            .is_err()
+        {
+            return missing_descriptor_result();
+        }
+
+        let Ok(details) = parse_descriptor_details(&record, &HostRecordAuthenticator) else {
+            return missing_descriptor_result();
+        };
+
+        V1Outcome::OwnedMapResult {
+            entries: vec![
+                OwnedResultMapEntry {
+                    key: "descriptor_name".to_string(),
+                    value: OwnedV1Value::Text(descriptor_name.to_string()),
+                },
+                OwnedResultMapEntry {
+                    key: "descriptor".to_string(),
+                    value: OwnedV1Value::Text(details.descriptor),
+                },
+                OwnedResultMapEntry {
+                    key: "datavalues".to_string(),
+                    value: OwnedV1Value::Map(
+                        details
+                            .datavalues
+                            .into_iter()
+                            .map(|datavalue| OwnedResultMapEntry {
+                                key: datavalue.key,
+                                value: OwnedV1Value::Text(datavalue.value),
+                            })
+                            .collect(),
+                    ),
+                },
+            ],
+        }
+    }
+}
+
+fn missing_descriptor_result() -> V1Outcome {
+    V1Outcome::Reject {
+        code: ErrorCode::BadParameters,
+        message: "Named descriptor wallet does not exist for this signer".to_string(),
     }
 }
 
@@ -825,6 +898,185 @@ mod tests {
                 }]
             }
         );
+    }
+
+    #[test]
+    fn registered_descriptor_detail_requires_valid_name() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("d"),
+            method: Cow::Borrowed("get_registered_descriptor"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("bad name")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("d"),
+            method: Cow::Borrowed("get_registered_descriptor"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Missing or invalid descriptor name parameter".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn registered_descriptor_detail_uses_authenticated_record_parser() {
+        let mut emulator = Emulator::new();
+        let mut payload = Vec::new();
+        let script = b"wsh(sortedmulti(2,@0/**,@1/**))";
+        payload.extend_from_slice(&[0, 2]);
+        payload.extend_from_slice(&(script.len() as u16).to_le_bytes());
+        payload.extend_from_slice(script);
+        payload.push(2);
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(b"@0");
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(b"xpub0");
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(b"@1");
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(b"xpub1");
+        emulator
+            .storage_mut()
+            .set_descriptor_registration("desc-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("d"),
+            method: Cow::Borrowed("get_registered_descriptor"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "descriptor_name".to_string(),
+                        value: OwnedV1Value::Text("desc-a".to_string()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "descriptor".to_string(),
+                        value: OwnedV1Value::Text("wsh(sortedmulti(2,@0/**,@1/**))".to_string()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "datavalues".to_string(),
+                        value: OwnedV1Value::Map(vec![
+                            OwnedResultMapEntry {
+                                key: "@0".to_string(),
+                                value: OwnedV1Value::Text("xpub0".to_string()),
+                            },
+                            OwnedResultMapEntry {
+                                key: "@1".to_string(),
+                                value: OwnedV1Value::Text("xpub1".to_string()),
+                            },
+                        ]),
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn raw_v1_registered_descriptor_detail_returns_nested_datavalues() {
+        let mut emulator = Emulator::new();
+        let mut payload = Vec::new();
+        let script = b"wsh(@0/**)";
+        payload.extend_from_slice(&[0, 2]);
+        payload.extend_from_slice(&(script.len() as u16).to_le_bytes());
+        payload.extend_from_slice(script);
+        payload.push(1);
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(b"@0");
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(b"xpub0");
+        emulator
+            .storage_mut()
+            .set_descriptor_registration("desc-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("d")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_registered_descriptor")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-a")
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut descriptor_name = None;
+        let mut descriptor = None;
+        let mut data_value = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "d"),
+                "result" => {
+                    assert_eq!(decoder.map().unwrap(), Some(3));
+                    for _ in 0..3 {
+                        match decoder.str().unwrap() {
+                            "descriptor_name" => descriptor_name = Some(decoder.str().unwrap()),
+                            "descriptor" => descriptor = Some(decoder.str().unwrap()),
+                            "datavalues" => {
+                                assert_eq!(decoder.map().unwrap(), Some(1));
+                                assert_eq!(decoder.str().unwrap(), "@0");
+                                data_value = Some(decoder.str().unwrap());
+                            }
+                            _ => decoder.skip().unwrap(),
+                        }
+                    }
+                }
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(descriptor_name, Some("desc-a"));
+        assert_eq!(descriptor, Some("wsh(@0/**)"));
+        assert_eq!(data_value, Some("xpub0"));
     }
 
     #[test]
