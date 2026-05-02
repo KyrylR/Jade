@@ -101,6 +101,7 @@ pub enum SinglesigScriptVariant {
     Pkh,
     Wpkh,
     ShWpkh,
+    Tr,
 }
 
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
@@ -135,8 +136,8 @@ pub mod pure_rust {
     use alloc::vec::Vec;
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    use k256::{ProjectivePoint, PublicKey, SecretKey};
+    use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
+    use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
     use sha2::{Digest, Sha256};
 
@@ -211,6 +212,10 @@ pub mod pure_rust {
                 });
                 payload.extend_from_slice(&script_hash);
                 Some(base58ck::encode_check(&payload))
+            }
+            SinglesigScriptVariant::Tr => {
+                let output_key = taproot_keyspend_output_key(&public_key)?;
+                bech32::segwit::encode_v1(segwit_hrp(network), &output_key).ok()
             }
         }
     }
@@ -313,6 +318,41 @@ pub mod pure_rust {
             BitcoinNetwork::Test => bech32::hrp::TB,
             BitcoinNetwork::Regtest => bech32::hrp::BCRT,
         }
+    }
+
+    pub(crate) fn taproot_keyspend_output_key(
+        public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<[u8; SHA256_LEN]> {
+        let mut even_internal_key = [0u8; EC_PUBLIC_KEY_COMPRESSED_LEN];
+        even_internal_key[0] = 0x02;
+        even_internal_key[1..].copy_from_slice(&public_key[1..]);
+
+        let internal_public_key = PublicKey::from_sec1_bytes(&even_internal_key).ok()?;
+        let internal_point = ProjectivePoint::from(*internal_public_key.as_affine());
+        let tweak_hash = tagged_hash(b"TapTweak", &public_key[1..]);
+        let tweak_bytes: FieldBytes = tweak_hash.into();
+        let tweak = <Scalar as Reduce<U256>>::reduce_bytes(&tweak_bytes);
+        let output_point = (internal_point + ProjectivePoint::GENERATOR * tweak).to_affine();
+        if bool::from(
+            k256::elliptic_curve::group::prime::PrimeCurveAffine::is_identity(&output_point),
+        ) {
+            return None;
+        }
+
+        let encoded = output_point.to_encoded_point(true);
+        encoded.as_bytes()[1..].try_into().ok()
+    }
+
+    fn tagged_hash(tag: &[u8], message: &[u8]) -> [u8; SHA256_LEN] {
+        let tag_hash = Sha256::digest(tag);
+        let digest = Sha256::new()
+            .chain_update(tag_hash.as_slice())
+            .chain_update(tag_hash.as_slice())
+            .chain_update(message)
+            .finalize();
+        let mut output = [0u8; SHA256_LEN];
+        output.copy_from_slice(&digest);
+        output
     }
 }
 
@@ -427,6 +467,38 @@ mod tests {
             )
             .unwrap(),
             "bcrt1qtsdavj8dyw49l4gt554jg47pr60gpf48xpg8l2"
+        );
+    }
+
+    #[test]
+    fn bitcoin_taproot_address_matches_bip86_vector() {
+        let seed = [
+            0x5e, 0xb0, 0x0b, 0xbd, 0xdc, 0xf0, 0x69, 0x08, 0x48, 0x89, 0xa8, 0xab, 0x91, 0x55,
+            0x56, 0x81, 0x65, 0xf5, 0xc4, 0x53, 0xcc, 0xb8, 0x5e, 0x70, 0x81, 0x1a, 0xae, 0xd6,
+            0xf6, 0xda, 0x5f, 0xc1, 0x9a, 0x5a, 0xc4, 0x0b, 0x38, 0x9c, 0xd3, 0x70, 0xd0, 0x86,
+            0x20, 0x6d, 0xec, 0x8a, 0xa6, 0xc4, 0x3d, 0xae, 0xa6, 0x69, 0x0f, 0x20, 0xad, 0x3d,
+            0x8d, 0x48, 0xb2, 0xd2, 0xce, 0x9e, 0x38, 0xe4,
+        ];
+        let path = [0x8000_0056, 0x8000_0000, 0x8000_0000, 0, 0];
+        let public_key = pure_rust::public_key_from_seed_path(&seed, &path).unwrap();
+
+        assert_eq!(
+            pure_rust::taproot_keyspend_output_key(&public_key).unwrap(),
+            [
+                0xa6, 0x08, 0x69, 0xf0, 0xdb, 0xcf, 0x1d, 0xc6, 0x59, 0xc9, 0xce, 0xcb, 0xaf, 0x80,
+                0x50, 0x13, 0x5e, 0xa9, 0xe8, 0xcd, 0xc4, 0x87, 0x05, 0x3f, 0x1d, 0xc6, 0x88, 0x09,
+                0x49, 0xdc, 0x68, 0x4c,
+            ]
+        );
+        assert_eq!(
+            pure_rust::bitcoin_singlesig_address_from_seed(
+                &seed,
+                &path,
+                BitcoinNetwork::Main,
+                SinglesigScriptVariant::Tr,
+            )
+            .unwrap(),
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
         );
     }
 

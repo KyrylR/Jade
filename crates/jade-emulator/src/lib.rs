@@ -636,11 +636,7 @@ impl Emulator {
             Ok(Some("pkh(k)")) => jade_crypto::SinglesigScriptVariant::Pkh,
             Ok(Some("wpkh(k)")) => jade_crypto::SinglesigScriptVariant::Wpkh,
             Ok(Some("sh(wpkh(k))")) => jade_crypto::SinglesigScriptVariant::ShWpkh,
-            Ok(Some("tr(k)")) => {
-                return V1Outcome::DeferredToCore {
-                    method: "get_receive_address".to_string(),
-                };
-            }
+            Ok(Some("tr(k)")) => jade_crypto::SinglesigScriptVariant::Tr,
             Ok(Some(_)) | Ok(None) | Err(_) => {
                 return bad_parameters("Invalid script variant parameter");
             }
@@ -1964,6 +1960,57 @@ mod tests {
     }
 
     #[test]
+    fn get_receive_address_derives_taproot_bip86_address() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(vec![
+            0x5e, 0xb0, 0x0b, 0xbd, 0xdc, 0xf0, 0x69, 0x08, 0x48, 0x89, 0xa8, 0xab, 0x91, 0x55,
+            0x56, 0x81, 0x65, 0xf5, 0xc4, 0x53, 0xcc, 0xb8, 0x5e, 0x70, 0x81, 0x1a, 0xae, 0xd6,
+            0xf6, 0xda, 0x5f, 0xc1, 0x9a, 0x5a, 0xc4, 0x0b, 0x38, 0x9c, 0xd3, 0x70, 0xd0, 0x86,
+            0x20, 0x6d, 0xec, 0x8a, 0xa6, 0xc4, 0x3d, 0xae, 0xa6, 0x69, 0x0f, 0x20, 0xad, 0x3d,
+            0x8d, 0x48, 0xb2, 0xd2, 0xce, 0x9e, 0x38, 0xe4,
+        ]);
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("tr(k)")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(5)
+            .unwrap()
+            .u32(0x8000_0056)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .u32(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
     fn raw_v1_get_receive_address_returns_string_result() {
         let mut emulator = Emulator::new();
         emulator.platform_mut().set_debug_wallet_seed(vec![
@@ -2118,15 +2165,19 @@ mod tests {
 
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
-            .map(3)
+            .map(4)
             .unwrap()
             .str("network")
             .unwrap()
-            .str("mainnet")
+            .str("liquid")
             .unwrap()
             .str("variant")
             .unwrap()
             .str("tr(k)")
+            .unwrap()
+            .str("confidential")
+            .unwrap()
+            .bool(false)
             .unwrap()
             .str("path")
             .unwrap()
