@@ -139,9 +139,10 @@ pub mod pure_rust {
     use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest, Sha256, Sha512};
 
     type HmacSha256 = Hmac<Sha256>;
+    type HmacSha512 = Hmac<Sha512>;
 
     pub fn xpub_from_seed(seed: &[u8], path: &[u32], prefix: XpubPrefix) -> Option<String> {
         let mut derivation_path = bip32::DerivationPath::default();
@@ -176,6 +177,40 @@ pub mod pure_rust {
 
         let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
         Some(private_key.public_key().to_bytes())
+    }
+
+    pub fn bip85_bip39_entropy_from_seed(
+        seed: &[u8],
+        nwords: usize,
+        index: u32,
+    ) -> Option<Vec<u8>> {
+        let entropy_len = match nwords {
+            12 => 16,
+            24 => 32,
+            _ => return None,
+        };
+        if index > 0x7fff_ffff {
+            return None;
+        }
+
+        let path = [
+            bip32::ChildNumber::HARDENED_FLAG | 83_696_968,
+            bip32::ChildNumber::HARDENED_FLAG | 39,
+            bip32::ChildNumber::HARDENED_FLAG,
+            bip32::ChildNumber::HARDENED_FLAG | nwords as u32,
+            bip32::ChildNumber::HARDENED_FLAG | index,
+        ];
+        let mut derivation_path = bip32::DerivationPath::default();
+        for value in path {
+            let child =
+                bip32::ChildNumber::new(value & !bip32::ChildNumber::HARDENED_FLAG, true).ok()?;
+            derivation_path.push(child);
+        }
+
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        let mut mac = HmacSha512::new_from_slice(b"bip-entropy-from-k").ok()?;
+        mac.update(private_key.to_bytes().as_ref());
+        Some(mac.finalize().into_bytes()[..entropy_len].to_vec())
     }
 
     pub fn bitcoin_singlesig_address_from_seed(
@@ -359,6 +394,7 @@ pub mod pure_rust {
 #[cfg(all(test, feature = "pure-rust-curves"))]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     fn slip77_master_unblinding_key_from_seed_matches_wally_symmetric_derivation() {
@@ -467,6 +503,56 @@ mod tests {
             )
             .unwrap(),
             "bcrt1qtsdavj8dyw49l4gt554jg47pr60gpf48xpg8l2"
+        );
+    }
+
+    #[test]
+    fn bip85_bip39_entropy_matches_jade_python_vectors() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "fish inner face ginger orchard permit useful method fence kidney chuckle party \
+             favorite sunset draw limb science crane oval letter slot invite sadness banana",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+
+        for (nwords, index, expected) in [
+            (
+                12,
+                0,
+                "elephant this puppy lucky fatigue skate aerobic emotion peanut outer clinic casino",
+            ),
+            (
+                12,
+                65535,
+                "curtain angle fatigue siren involve bleak detail frame name spare size cycle",
+            ),
+            (
+                24,
+                0,
+                "certain act palace ball plug they divide fold climb hand tuition inside choose \
+                 sponsor grass scheme choose split top twenty always vendor fit thank",
+            ),
+            (
+                24,
+                65535,
+                "humble museum grab fitness wrap window front job quarter update rich grape gap \
+                 daring blame cricket traffic sad trade easily genius boost lumber rhythm",
+            ),
+        ] {
+            let entropy = pure_rust::bip85_bip39_entropy_from_seed(&seed, nwords, index).unwrap();
+            let derived = bip39::Mnemonic::from_entropy(&entropy).unwrap();
+            assert_eq!(derived.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn bip85_bip39_entropy_rejects_unsupported_word_counts_and_indices() {
+        let seed = [0x11; SHA512_LEN];
+
+        assert_eq!(pure_rust::bip85_bip39_entropy_from_seed(&seed, 18, 0), None);
+        assert_eq!(
+            pure_rust::bip85_bip39_entropy_from_seed(&seed, 12, 0x8000_0000),
+            None
         );
     }
 

@@ -359,6 +359,7 @@ dependencies = [
  "base58ck",
  "bech32",
  "bip32",
+ "bip39",
  "hmac 0.13.0",
  "k256",
  "p256",
