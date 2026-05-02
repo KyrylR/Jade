@@ -1072,6 +1072,14 @@ pub mod pure_rust {
             inputs: &tx.inputs,
             outputs: &tx.outputs,
         };
+        let prev_outputs = if signing_inputs
+            .iter()
+            .any(|input| input.sighash == 0 || is_p2tr_script_pubkey(input.script_code))
+        {
+            Some(taproot_prev_outputs(&sighash_tx, signing_inputs)?)
+        } else {
+            None
+        };
         let mut signatures = Vec::with_capacity(signing_inputs.len());
         for signing_input in signing_inputs {
             if signing_input.path.is_empty()
@@ -1080,10 +1088,38 @@ pub mod pure_rust {
             {
                 return Err(TxSignError::Invalid);
             }
+
+            if is_p2tr_script_pubkey(signing_input.script_code) {
+                if !matches!(signing_input.sighash, 0 | 1) {
+                    return Err(TxSignError::Unsupported);
+                }
+                let public_key = public_key_from_seed_path(seed, signing_input.path)
+                    .ok_or(TxSignError::Unsupported)?;
+                let output_key =
+                    taproot_keyspend_output_key(&public_key).ok_or(TxSignError::Unsupported)?;
+                if p2tr_script_pubkey(&output_key) != signing_input.script_code {
+                    return Err(TxSignError::Unsupported);
+                }
+                let digest = taproot_key_spend_sighash(
+                    &sighash_tx,
+                    prev_outputs.as_deref().ok_or(TxSignError::Invalid)?,
+                    signing_input.tx_input_index,
+                    signing_input.sighash as u8,
+                );
+                let signature = sign_taproot_key_spend_from_seed(
+                    seed,
+                    signing_input.path,
+                    &digest,
+                    signing_input.sighash as u8,
+                )
+                .ok_or(TxSignError::Unsupported)?;
+                signatures.push(signature);
+                continue;
+            }
+
             if signing_input.sighash != 1 {
                 return Err(TxSignError::Unsupported);
             }
-
             let digest = if signing_input.is_witness {
                 let amount = signing_input.satoshi.ok_or(TxSignError::Invalid)?;
                 segwit_v0_sighash_all(
@@ -1116,6 +1152,28 @@ pub mod pure_rust {
         }
 
         Ok(signatures)
+    }
+
+    fn taproot_prev_outputs<'a>(
+        tx: &SighashTx<'_, '_>,
+        signing_inputs: &'a [BitcoinTxSignInput<'a>],
+    ) -> Result<Vec<TxOutputView<'a>>, TxSignError> {
+        if signing_inputs.len() != tx.inputs.len() {
+            return Err(TxSignError::Unsupported);
+        }
+        let mut prev_outputs = Vec::with_capacity(tx.inputs.len());
+        for (index, signing_input) in signing_inputs.iter().enumerate() {
+            if signing_input.tx_input_index != index
+                || !is_p2tr_script_pubkey(signing_input.script_code)
+            {
+                return Err(TxSignError::Unsupported);
+            }
+            prev_outputs.push(TxOutputView {
+                amount: signing_input.satoshi.ok_or(TxSignError::Invalid)?,
+                script: signing_input.script_code,
+            });
+        }
+        Ok(prev_outputs)
     }
 
     struct PsbtEntry<'a> {
@@ -1561,6 +1619,10 @@ pub mod pure_rust {
         script.extend_from_slice(&[0x51, 0x20]);
         script.extend_from_slice(output_key);
         script
+    }
+
+    fn is_p2tr_script_pubkey(script: &[u8]) -> bool {
+        script.len() == 2 + SHA256_LEN && script[0] == 0x51 && script[1] == SHA256_LEN as u8
     }
 
     fn legacy_sighash_all(
