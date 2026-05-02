@@ -39,6 +39,11 @@ impl Default for CoreState {
 }
 
 impl CoreState {
+    pub fn logout(&mut self) {
+        self.wallet = WalletLifecycle::Locked;
+        self.operation = OperationState::Idle;
+    }
+
     pub fn ping_response<'a>(&self, id: Cow<'a, str>) -> Response<'a> {
         Response {
             id,
@@ -52,5 +57,23 @@ impl CoreState {
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logout_clears_active_operation_and_locks_wallet() {
+        let mut state = CoreState {
+            wallet: WalletLifecycle::Ready,
+            operation: OperationState::ClientMessage,
+        };
+
+        state.logout();
+
+        assert_eq!(state.wallet, WalletLifecycle::Locked);
+        assert_eq!(state.operation, OperationState::Idle);
     }
 }

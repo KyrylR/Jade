@@ -2,8 +2,8 @@ use std::borrow::Cow;
 
 use jade_core::{CoreState, OperationState};
 use jade_protocol_v1::{
-    decode_request, encode_error_response, encode_uint_result, method_spec, ErrorCode,
-    ErrorResponse, MethodClass, Request,
+    decode_request, encode_bool_result, encode_error_response, encode_uint_result, method_spec,
+    ErrorCode, ErrorResponse, MethodClass, Request,
 };
 
 #[derive(Debug, Default)]
@@ -28,6 +28,10 @@ impl Emulator {
             Some(MethodClass::Immediate) if request.method == "ping" => V1Outcome::ImmediatePing {
                 activity: self.state.operation,
             },
+            Some(MethodClass::PreAuth) if request.method == "logout" => {
+                self.state.logout();
+                V1Outcome::BoolResult { result: true }
+            }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
@@ -44,6 +48,7 @@ impl Emulator {
                 V1Outcome::ImmediatePing { activity } => {
                     encode_uint_result(&request.id, v1_activity_code(activity))
                 }
+                V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
                 V1Outcome::Reject { code, message } => encode_error_response(&ErrorResponse {
                     id: request.id,
                     code: code as i32,
@@ -81,6 +86,7 @@ fn v1_activity_code(activity: OperationState) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V1Outcome {
     ImmediatePing { activity: jade_core::OperationState },
+    BoolResult { result: bool },
     DeferredToCore { method: String },
     Reject { code: ErrorCode, message: String },
 }
@@ -132,6 +138,35 @@ mod tests {
             V1Outcome::DeferredToCore {
                 method: "sign_psbt".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn logout_returns_ok_boolean() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("3"),
+            method: Cow::Borrowed("logout"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+    }
+
+    #[test]
+    fn raw_v1_logout_returns_true() {
+        let mut emulator = Emulator::new();
+        let request = [
+            0xa2, 0x62, b'i', b'd', 0x61, b'3', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x66,
+            b'l', b'o', b'g', b'o', b'u', b't',
+        ];
+
+        assert_eq!(
+            emulator.handle_v1_cbor(&request),
+            [0xa2, 0x62, b'i', b'd', 0x61, b'3', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
         );
     }
 }
