@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jade-core",
+    "crates/jade-crypto",
+    "crates/jade-emulator",
+    "crates/jade-fw-esp32",
+    "crates/jade-fw-esp32s3",
+    "crates/jade-protocol-v1",
+    "crates/jade-protocol-v2",
+    "crates/jade-storage",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Blockstream/Jade"
+rust-version = "1.81"
+
+[workspace.dependencies]
+aes = { version = "0.9", default-features = false }
+bip32 = { version = "0.5", default-features = false, features = ["alloc", "secp256k1"] }
+bip39 = { version = "2.2", default-features = false, features = ["zeroize"] }
+bitcoin = { version = "0.32", default-features = false, features = ["alloc"] }
+cfg-if = "1"
+digest = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false }
+k256 = { version = "0.13", default-features = false, features = ["alloc", "arithmetic", "ecdsa", "schnorr", "ecdh"] }
+minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
+p256 = { version = "0.13", default-features = false, features = ["alloc", "arithmetic", "ecdsa", "ecdh"] }
+pbkdf2 = { version = "0.13", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc", "derive"] }
+
+jade-core = { path = "crates/jade-core" }
+jade-crypto = { path = "crates/jade-crypto" }
+jade-protocol-v1 = { path = "crates/jade-protocol-v1" }
+jade-protocol-v2 = { path = "crates/jade-protocol-v2" }
+jade-storage = { path = "crates/jade-storage" }

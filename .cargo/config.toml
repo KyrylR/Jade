@@ -1,0 +1,2 @@
+[alias]
+check-rust-core = "check --workspace --all-targets"

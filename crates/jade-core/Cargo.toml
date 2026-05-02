@@ -1,0 +1,13 @@
+[package]
+name = "jade-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jade-protocol-v1.workspace = true
+jade-protocol-v2.workspace = true
+minicbor.workspace = true
+zeroize.workspace = true

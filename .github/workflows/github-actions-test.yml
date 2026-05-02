@@ -1,6 +1,24 @@
 name: GitHub Actions test
 on: [push]
 jobs:
+  rust_core:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v5
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+    - name: Check Rust workspace formatting
+      run: cargo fmt --all --check
+    - name: Check Rust workspace
+      run: cargo check --workspace --all-targets
+    - name: Test Rust workspace
+      run: cargo test --workspace
+    - name: Clippy Rust workspace
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   build_v1_1:
     runs-on: ubuntu-latest
     steps:

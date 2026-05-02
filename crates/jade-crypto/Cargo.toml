@@ -1,0 +1,19 @@
+[package]
+name = "jade-crypto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+pure-rust-curves = ["dep:k256", "dep:p256"]
+
+[dependencies]
+hmac.workspace = true
+k256 = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+pbkdf2.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
