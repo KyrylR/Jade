@@ -184,6 +184,12 @@ pub enum PsbtScanError {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsbtSignError {
+    Invalid,
+    Unsupported,
+}
+
 pub fn psbt_envelope(bytes: &[u8]) -> Option<PsbtEnvelope> {
     if bytes.starts_with(b"psbt\xff") {
         Some(PsbtEnvelope::Bitcoin)
@@ -725,8 +731,9 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
-        IdentityKeyType, LiquidNetwork, MultisigScriptVariant, SinglesigScriptVariant, XpubPrefix,
-        EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
+        IdentityKeyType, LiquidNetwork, MultisigScriptVariant, PsbtEnvelope, PsbtSignError,
+        SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN,
+        SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
@@ -735,15 +742,14 @@ pub mod pure_rust {
     use bech32::{ByteIterExt, Fe32IterExt};
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
+    use k256::ecdsa::hazmat::{bits2field, SignPrimitive};
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
     use k256::ecdsa::SigningKey as K256SigningKey;
     use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
     use p256::{
-        ecdsa::{
-            signature::hazmat::PrehashSigner, Signature as P256Signature,
-            SigningKey as P256SigningKey,
-        },
+        ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey},
         FieldBytes as P256FieldBytes, ProjectivePoint as P256ProjectivePoint,
         PublicKey as P256PublicKey, Scalar as P256Scalar, SecretKey as P256SecretKey,
     };
@@ -795,6 +801,456 @@ pub mod pure_rust {
         recoverable[0] = 27 + recid.to_byte() + 4;
         recoverable[1..].copy_from_slice(signature.to_bytes().as_ref());
         Some(super::base64_encode(&recoverable))
+    }
+
+    pub fn sign_bitcoin_psbt_p2pkh_from_seed(
+        psbt: &[u8],
+        seed: &[u8],
+        wallet_fingerprint: &[u8; 4],
+    ) -> Result<Option<Vec<u8>>, PsbtSignError> {
+        if super::psbt_envelope(psbt) != Some(PsbtEnvelope::Bitcoin) {
+            return Err(PsbtSignError::Invalid);
+        }
+
+        let mut pos = 5;
+        let global = parsed_psbt_map(psbt, &mut pos)?;
+        let tx_version = global
+            .single_value(0x02)
+            .and_then(le_u32)
+            .ok_or(PsbtSignError::Unsupported)?;
+        let lock_time = global.single_value(0x03).and_then(le_u32).unwrap_or(0);
+        let input_count = global
+            .single_value(0x04)
+            .and_then(compact_size_value)
+            .ok_or(PsbtSignError::Unsupported)?;
+        let output_count = global
+            .single_value(0x05)
+            .and_then(compact_size_value)
+            .ok_or(PsbtSignError::Unsupported)?;
+        if global.single_value(0x00).is_some() {
+            return Err(PsbtSignError::Unsupported);
+        }
+
+        let mut inputs = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            inputs.push(parsed_psbt_map(psbt, &mut pos)?);
+        }
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            outputs.push(parsed_psbt_map(psbt, &mut pos)?);
+        }
+        if pos != psbt.len() {
+            return Err(PsbtSignError::Invalid);
+        }
+
+        let mut tx_outputs = Vec::with_capacity(outputs.len());
+        for output in &outputs {
+            let amount = output
+                .single_value(0x03)
+                .and_then(le_u64)
+                .ok_or(PsbtSignError::Unsupported)?;
+            let script = output
+                .single_value(0x04)
+                .ok_or(PsbtSignError::Unsupported)?;
+            tx_outputs.push(TxOutputView { amount, script });
+        }
+
+        let mut tx_inputs = Vec::with_capacity(inputs.len());
+        let mut prev_scripts = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let prev_tx = input.single_value(0x00).ok_or(PsbtSignError::Unsupported)?;
+            let prev_txid = input
+                .single_value(0x0e)
+                .and_then(|value| <&[u8; SHA256_LEN]>::try_from(value).ok())
+                .ok_or(PsbtSignError::Unsupported)?;
+            let prev_vout = input
+                .single_value(0x0f)
+                .and_then(le_u32)
+                .ok_or(PsbtSignError::Unsupported)?;
+            let sequence = input
+                .single_value(0x10)
+                .and_then(le_u32)
+                .unwrap_or(u32::MAX);
+            let sighash = input.single_value(0x03).and_then(le_u32).unwrap_or(1);
+            if sighash != 1 {
+                return Err(PsbtSignError::Unsupported);
+            }
+            if &double_sha256(prev_tx) != prev_txid {
+                return Err(PsbtSignError::Invalid);
+            }
+            let prev_script = bitcoin_tx_output_script(prev_tx, prev_vout as usize)
+                .ok_or(PsbtSignError::Invalid)?;
+            tx_inputs.push(TxInputView {
+                prev_txid,
+                prev_vout,
+                sequence,
+            });
+            prev_scripts.push(prev_script);
+        }
+
+        let mut signatures = Vec::new();
+        for (index, input) in inputs.iter().enumerate() {
+            let sighash = input.single_value(0x03).and_then(le_u32).unwrap_or(1);
+            let prev_script = prev_scripts[index];
+
+            let mut signed_pubkeys = Vec::new();
+            let mut wallet_candidates = Vec::new();
+            for entry in &input.entries {
+                match entry.key.first().copied() {
+                    Some(0x02) => signed_pubkeys.push(&entry.key[1..]),
+                    Some(0x06)
+                        if entry.value.get(..4) == Some(wallet_fingerprint)
+                            && compressed_pubkey_len(&entry.key[1..]) =>
+                    {
+                        wallet_candidates.push((&entry.key[1..], &entry.value[4..]));
+                    }
+                    Some(0x16)
+                        if super::tap_derivation_matches_fingerprint(
+                            entry.value,
+                            wallet_fingerprint,
+                        ) =>
+                    {
+                        return Err(PsbtSignError::Unsupported);
+                    }
+                    _ => {}
+                }
+            }
+
+            for (pubkey, path_bytes) in wallet_candidates {
+                if signed_pubkeys.iter().any(|signed| signed == &pubkey) {
+                    continue;
+                }
+                let path = parse_psbt_derivation_path(path_bytes)?;
+                let derived_pubkey =
+                    public_key_from_seed_path(seed, &path).ok_or(PsbtSignError::Unsupported)?;
+                if derived_pubkey.as_slice() != pubkey {
+                    continue;
+                }
+                if p2pkh_script_pubkey(&hash160(pubkey)) != prev_script {
+                    return Err(PsbtSignError::Unsupported);
+                }
+                let digest = legacy_sighash_all(
+                    tx_version,
+                    lock_time,
+                    &tx_inputs,
+                    &tx_outputs,
+                    index,
+                    prev_script,
+                );
+                let signature = sign_digest_der_from_seed(seed, &path, &digest, sighash as u8)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                signatures.push(PsbtSignature {
+                    input_index: index,
+                    pubkey: pubkey.to_vec(),
+                    signature,
+                });
+            }
+        }
+
+        if signatures.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(insert_psbt_partial_signatures(
+            psbt,
+            &inputs,
+            &signatures,
+        )?))
+    }
+
+    struct PsbtEntry<'a> {
+        key: &'a [u8],
+        value: &'a [u8],
+        end: usize,
+    }
+
+    struct ParsedPsbtMap<'a> {
+        entries: Vec<PsbtEntry<'a>>,
+        content_start: usize,
+        end: usize,
+    }
+
+    impl<'a> ParsedPsbtMap<'a> {
+        fn single_value(&self, key_type: u8) -> Option<&'a [u8]> {
+            self.entries
+                .iter()
+                .find(|entry| entry.key.len() == 1 && entry.key[0] == key_type)
+                .map(|entry| entry.value)
+        }
+    }
+
+    struct TxInputView<'a> {
+        prev_txid: &'a [u8; SHA256_LEN],
+        prev_vout: u32,
+        sequence: u32,
+    }
+
+    struct TxOutputView<'a> {
+        amount: u64,
+        script: &'a [u8],
+    }
+
+    struct PsbtSignature {
+        input_index: usize,
+        pubkey: Vec<u8>,
+        signature: Vec<u8>,
+    }
+
+    fn parsed_psbt_map<'a>(
+        bytes: &'a [u8],
+        pos: &mut usize,
+    ) -> Result<ParsedPsbtMap<'a>, PsbtSignError> {
+        let content_start = *pos;
+        let mut entries = Vec::new();
+        loop {
+            let key_len = read_compact_size_sign(bytes, pos)?;
+            if key_len == 0 {
+                return Ok(ParsedPsbtMap {
+                    entries,
+                    content_start,
+                    end: *pos,
+                });
+            }
+            let key = read_exact_sign(bytes, pos, key_len)?;
+            if key.is_empty() {
+                return Err(PsbtSignError::Invalid);
+            }
+            let value_len = read_compact_size_sign(bytes, pos)?;
+            let value = read_exact_sign(bytes, pos, value_len)?;
+            entries.push(PsbtEntry {
+                key,
+                value,
+                end: *pos,
+            });
+        }
+    }
+
+    fn read_compact_size_sign(bytes: &[u8], pos: &mut usize) -> Result<usize, PsbtSignError> {
+        super::read_compact_size(bytes, pos).map_err(|_| PsbtSignError::Invalid)
+    }
+
+    fn read_exact_sign<'a>(
+        bytes: &'a [u8],
+        pos: &mut usize,
+        len: usize,
+    ) -> Result<&'a [u8], PsbtSignError> {
+        super::read_exact(bytes, pos, len).map_err(|_| PsbtSignError::Invalid)
+    }
+
+    fn compact_size_value(value: &[u8]) -> Option<usize> {
+        let mut pos = 0;
+        let parsed = read_compact_size_sign(value, &mut pos).ok()?;
+        (pos == value.len()).then_some(parsed)
+    }
+
+    fn le_u32(value: &[u8]) -> Option<u32> {
+        Some(u32::from_le_bytes(value.try_into().ok()?))
+    }
+
+    fn le_u64(value: &[u8]) -> Option<u64> {
+        Some(u64::from_le_bytes(value.try_into().ok()?))
+    }
+
+    fn compressed_pubkey_len(value: &[u8]) -> bool {
+        value.len() == EC_PUBLIC_KEY_COMPRESSED_LEN && matches!(value[0], 0x02 | 0x03)
+    }
+
+    fn parse_psbt_derivation_path(value: &[u8]) -> Result<Vec<u32>, PsbtSignError> {
+        if value.len() % 4 != 0 {
+            return Err(PsbtSignError::Invalid);
+        }
+        let mut path = Vec::with_capacity(value.len() / 4);
+        for chunk in value.chunks_exact(4) {
+            path.push(u32::from_le_bytes(
+                chunk.try_into().expect("fixed path component"),
+            ));
+        }
+        Ok(path)
+    }
+
+    fn double_sha256(bytes: &[u8]) -> [u8; SHA256_LEN] {
+        let first = Sha256::digest(bytes);
+        Sha256::digest(first).into()
+    }
+
+    fn bitcoin_tx_output_script(tx: &[u8], output_index: usize) -> Option<&[u8]> {
+        let mut pos = 0;
+        super::read_exact_opt(tx, &mut pos, 4)?;
+        let input_count = super::read_compact_size_opt(tx, &mut pos)?;
+        for _ in 0..input_count {
+            super::read_exact_opt(tx, &mut pos, 36)?;
+            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
+            super::read_exact_opt(tx, &mut pos, script_len)?;
+            super::read_exact_opt(tx, &mut pos, 4)?;
+        }
+
+        let output_count = super::read_compact_size_opt(tx, &mut pos)?;
+        for index in 0..output_count {
+            super::read_exact_opt(tx, &mut pos, 8)?;
+            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
+            let script = super::read_exact_opt(tx, &mut pos, script_len)?;
+            if index == output_index {
+                return Some(script);
+            }
+        }
+        None
+    }
+
+    fn legacy_sighash_all(
+        tx_version: u32,
+        lock_time: u32,
+        inputs: &[TxInputView<'_>],
+        outputs: &[TxOutputView<'_>],
+        signing_input: usize,
+        script_code: &[u8],
+    ) -> [u8; SHA256_LEN] {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&tx_version.to_le_bytes());
+        push_compact_size(&mut tx, inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            tx.extend_from_slice(input.prev_txid);
+            tx.extend_from_slice(&input.prev_vout.to_le_bytes());
+            if index == signing_input {
+                push_compact_size(&mut tx, script_code.len());
+                tx.extend_from_slice(script_code);
+            } else {
+                tx.push(0);
+            }
+            tx.extend_from_slice(&input.sequence.to_le_bytes());
+        }
+        push_compact_size(&mut tx, outputs.len());
+        for output in outputs {
+            tx.extend_from_slice(&output.amount.to_le_bytes());
+            push_compact_size(&mut tx, output.script.len());
+            tx.extend_from_slice(output.script);
+        }
+        tx.extend_from_slice(&lock_time.to_le_bytes());
+        tx.extend_from_slice(&1u32.to_le_bytes());
+        double_sha256(&tx)
+    }
+
+    fn sign_digest_der_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        digest: &[u8; SHA256_LEN],
+        sighash_type: u8,
+    ) -> Option<Vec<u8>> {
+        let mut derivation_path = bip32::DerivationPath::default();
+        for value in path {
+            let hardened = value & bip32::ChildNumber::HARDENED_FLAG != 0;
+            let child =
+                bip32::ChildNumber::new(value & !bip32::ChildNumber::HARDENED_FLAG, hardened)
+                    .ok()?;
+            derivation_path.push(child);
+        }
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        let secret = SecretKey::from_slice(private_key.to_bytes().as_ref()).ok()?;
+        let secret_scalar = *secret.to_nonzero_scalar().as_ref();
+        let z = bits2field::<k256::Secp256k1>(digest).ok()?;
+
+        let mut counter = 0u32;
+        let mut extra_entropy = [0u8; 32];
+        loop {
+            let ad = if counter == 0 {
+                &[][..]
+            } else {
+                &extra_entropy[..]
+            };
+            let (signature, _) = secret_scalar
+                .try_sign_prehashed_rfc6979::<k256::sha2::Sha256>(&z, ad)
+                .ok()?;
+            let signature = signature.normalize_s().unwrap_or(signature);
+            let der = signature.to_der();
+            if der.as_bytes().len() < 71 {
+                let mut output = der.as_bytes().to_vec();
+                output.push(sighash_type);
+                return Some(output);
+            }
+
+            counter = counter.checked_add(1)?;
+            extra_entropy = [0u8; 32];
+            extra_entropy[..4].copy_from_slice(&counter.to_le_bytes());
+        }
+    }
+
+    fn insert_psbt_partial_signatures(
+        psbt: &[u8],
+        inputs: &[ParsedPsbtMap<'_>],
+        signatures: &[PsbtSignature],
+    ) -> Result<Vec<u8>, PsbtSignError> {
+        let extra_len: usize = signatures
+            .iter()
+            .map(|signature| {
+                compact_size_len(1 + signature.pubkey.len())
+                    + 1
+                    + signature.pubkey.len()
+                    + compact_size_len(signature.signature.len())
+                    + signature.signature.len()
+            })
+            .sum();
+        let mut output = Vec::with_capacity(psbt.len() + extra_len);
+        let mut cursor = 0;
+
+        for (input_index, input) in inputs.iter().enumerate() {
+            let mut matching = signatures
+                .iter()
+                .filter(|signature| signature.input_index == input_index)
+                .peekable();
+            if matching.peek().is_none() {
+                continue;
+            }
+
+            let insert_offset = input
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.key.first().copied(), Some(0x00 | 0x01)))
+                .map(|entry| entry.end)
+                .next_back()
+                .unwrap_or(input.content_start);
+            if insert_offset < cursor || insert_offset > input.end || insert_offset > psbt.len() {
+                return Err(PsbtSignError::Invalid);
+            }
+
+            output.extend_from_slice(&psbt[cursor..insert_offset]);
+            for signature in matching {
+                push_compact_size(&mut output, 1 + signature.pubkey.len());
+                output.push(0x02);
+                output.extend_from_slice(&signature.pubkey);
+                push_compact_size(&mut output, signature.signature.len());
+                output.extend_from_slice(&signature.signature);
+            }
+            cursor = insert_offset;
+        }
+
+        output.extend_from_slice(&psbt[cursor..]);
+        Ok(output)
+    }
+
+    fn push_compact_size(output: &mut Vec<u8>, value: usize) {
+        match value {
+            0x00..=0xfc => output.push(value as u8),
+            0xfd..=0xffff => {
+                output.push(0xfd);
+                output.extend_from_slice(&(value as u16).to_le_bytes());
+            }
+            0x1_0000..=0xffff_ffff => {
+                output.push(0xfe);
+                output.extend_from_slice(&(value as u32).to_le_bytes());
+            }
+            _ => {
+                output.push(0xff);
+                output.extend_from_slice(&(value as u64).to_le_bytes());
+            }
+        }
+    }
+
+    fn compact_size_len(value: usize) -> usize {
+        match value {
+            0x00..=0xfc => 1,
+            0xfd..=0xffff => 3,
+            0x1_0000..=0xffff_ffff => 5,
+            _ => 9,
+        }
     }
 
     pub fn xpub_from_seed(seed: &[u8], path: &[u32], prefix: XpubPrefix) -> Option<String> {

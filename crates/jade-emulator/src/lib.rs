@@ -1943,6 +1943,20 @@ impl Emulator {
                 message: "Failed to inspect psbt signing paths".to_string(),
             };
         };
+        if !is_liquid {
+            match jade_crypto::pure_rust::sign_bitcoin_psbt_p2pkh_from_seed(
+                &psbt,
+                seed,
+                &fingerprint,
+            ) {
+                Ok(Some(result)) => return V1Outcome::BytesResult { result },
+                Ok(None) => return V1Outcome::BytesResult { result: psbt },
+                Err(jade_crypto::PsbtSignError::Invalid) => {
+                    return bad_parameters("Failed to extract psbt from parameters");
+                }
+                Err(jade_crypto::PsbtSignError::Unsupported) => {}
+            }
+        }
         match jade_crypto::psbt_needs_wallet_signature(&psbt, &fingerprint) {
             Ok(false) => V1Outcome::BytesResult { result: psbt },
             Ok(true) => V1Outcome::DeferredToCore {
@@ -4329,6 +4343,12 @@ mod tests {
         &rest[..end]
     }
 
+    fn fixture_expected_output_psbt_base64(fixture: &str) -> &str {
+        let marker = "\"expected_output\":";
+        let start = fixture.find(marker).unwrap() + marker.len();
+        fixture_psbt_base64(&fixture[start..])
+    }
+
     fn decode_xpub(input: &str) -> [u8; BIP32_SERIALIZED_LEN] {
         let bytes = base58ck::decode_check(input).unwrap();
         bytes.try_into().unwrap()
@@ -4559,12 +4579,46 @@ mod tests {
     }
 
     #[test]
-    fn sign_psbt_defers_when_wallet_signature_is_missing() {
+    fn sign_psbt_signs_p2pkh_v2_wallet_input() {
         let mut emulator = Emulator::new();
         emulator
             .platform_mut()
             .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
-        let psbt = fixture_psbt_base64(include_str!("../../../test_data/psbt_ss_p2pkh_v2.json"));
+        let fixture = include_str!("../../../test_data/psbt_ss_p2pkh_v2.json");
+        let psbt = fixture_psbt_base64(fixture);
+        let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: expected }
+        );
+    }
+
+    #[test]
+    fn sign_psbt_defers_for_unsupported_wallet_signature() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let psbt = fixture_psbt_base64(include_str!("../../../test_data/psbt_ss_p2wpkh.json"));
 
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)

@@ -57,10 +57,11 @@ the continuation methods used by multi-message flows.
   `jade-crypto`, adapted from the local rust-elements implementation under
   `/Users/inter/Desktop/Simpl/rust-elements`. The C++ Elements tree at
   `/Users/inter/Desktop/Simpl/elements` was checked for Blech32 constants and
-  network HRPs, but it is not copied into the Rust core. The full `elements`
-  crate remains a later decision because its transaction stack brings
-  `secp256k1-zkp` concerns that must be audited separately for the no-C-core
-  rule.
+  network HRPs, but it is not copied into the Rust core. The Rust `elements`
+  crate was also evaluated: it is useful as an oracle and may be acceptable
+  behind a temporary platform/research boundary, but its transaction stack
+  depends directly on `secp256k1-zkp`, so it is not a final no-C-core dependency
+  until a pure-Rust ZKP backend or an explicit release exception exists.
 
 ## Elements Copy/Paste Evaluation
 
@@ -101,9 +102,10 @@ is a reviewed pure-Rust replacement or an explicit release exception.
 - PSBT/PSET signing front door: Rust now validates PSBT vs. PSET envelope
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
   no-op PSBT/PSET payloads unchanged when there is nothing to sign or wallet
-  inputs are already signed, and defers only when new signatures must be
-  produced. Full sighash/signature insertion remains in the transaction-signing
-  milestone.
+  inputs are already signed, and produces pure-Rust ECDSA signatures for the
+  first Bitcoin PSBTv2 P2PKH path. P2WPKH, P2SH-wrapped SegWit, Taproot,
+  multisig, anti-exfil PSBT flows, and Liquid/PSET signing still defer to the
+  transaction-signing milestone.
 
 ## First Parity Gates
 
