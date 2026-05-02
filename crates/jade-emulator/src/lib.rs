@@ -8,10 +8,13 @@ use jade_core::{
 };
 use jade_protocol_v1::{
     decode_request, encode_bool_result, encode_error_response, encode_map_result,
-    encode_uint_result, method_spec, ErrorCode, ErrorResponse, MethodClass, Request,
-    ResultMapEntry, V1Value,
+    encode_owned_map_result, encode_uint_result, method_spec, ErrorCode, ErrorResponse,
+    MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry, V1Value,
 };
-use jade_storage::{JadeStorage, MemoryStorage, StorageLimits, StorageNamespace};
+use jade_storage::{
+    parse_descriptor_summary, parse_multisig_summary, JadeStorage, MemoryStorage,
+    RecordAuthenticator, StorageLimits, StorageNamespace, StorageRecord, HMAC_SHA256_LEN,
+};
 
 #[derive(Debug)]
 pub struct Emulator {
@@ -133,6 +136,9 @@ impl Emulator {
                 V1Outcome::VersionInfo { info } => encode_version_info_result(&request.id, &info),
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
                 V1Outcome::EmptyMapResult => encode_map_result(&request.id, &[]),
+                V1Outcome::OwnedMapResult { entries } => {
+                    encode_owned_map_result(&request.id, &entries)
+                }
                 V1Outcome::Reject { code, message } => encode_error_response(&ErrorResponse {
                     id: request.id,
                     code: code as i32,
@@ -163,17 +169,140 @@ impl Emulator {
     ) -> V1Outcome {
         match self.storage.count(namespace) {
             Ok(0) => V1Outcome::EmptyMapResult,
-            Ok(_) => V1Outcome::Reject {
-                code: ErrorCode::InternalError,
-                message: format!(
-                    "registered {wallet_kind} summary parser not yet ported to Rust core"
-                ),
-            },
+            Ok(_) if namespace == StorageNamespace::Multisig => {
+                self.registered_multisig_summaries()
+            }
+            Ok(_) if namespace == StorageNamespace::Descriptor => {
+                self.registered_descriptor_summaries()
+            }
+            Ok(_) => V1Outcome::EmptyMapResult,
             Err(_) => V1Outcome::Reject {
                 code: ErrorCode::InternalError,
                 message: format!("failed to load registered {wallet_kind} records"),
             },
         }
+    }
+
+    fn registered_multisig_summaries(&self) -> V1Outcome {
+        let mut names = Vec::new();
+        if self
+            .storage
+            .list_names(StorageNamespace::Multisig, &mut names)
+            .is_err()
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "failed to load registered multisig records".to_string(),
+            };
+        }
+
+        let authenticator = HostRecordAuthenticator;
+        let mut entries = Vec::new();
+        for name in names {
+            let mut record = Vec::new();
+            if self
+                .storage
+                .get_record(
+                    StorageRecord::MultisigRegistration { name: &name },
+                    &mut record,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(summary) = parse_multisig_summary(&record, &authenticator) else {
+                continue;
+            };
+            entries.push(OwnedResultMapEntry {
+                key: name,
+                value: OwnedV1Value::Map(vec![
+                    OwnedResultMapEntry {
+                        key: "variant".to_string(),
+                        value: OwnedV1Value::Text(summary.variant.as_v1_str().to_string()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "sorted".to_string(),
+                        value: OwnedV1Value::Bool(summary.sorted),
+                    },
+                    OwnedResultMapEntry {
+                        key: "threshold".to_string(),
+                        value: OwnedV1Value::U64(summary.threshold.into()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "num_signers".to_string(),
+                        value: OwnedV1Value::U64(summary.num_signers.into()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "master_blinding_key".to_string(),
+                        value: OwnedV1Value::Bytes(
+                            summary
+                                .master_blinding_key
+                                .map(|key| key.to_vec())
+                                .unwrap_or_default(),
+                        ),
+                    },
+                ]),
+            });
+        }
+
+        V1Outcome::OwnedMapResult { entries }
+    }
+
+    fn registered_descriptor_summaries(&self) -> V1Outcome {
+        let mut names = Vec::new();
+        if self
+            .storage
+            .list_names(StorageNamespace::Descriptor, &mut names)
+            .is_err()
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "failed to load registered descriptor records".to_string(),
+            };
+        }
+
+        let authenticator = HostRecordAuthenticator;
+        let mut entries = Vec::new();
+        for name in names {
+            let mut record = Vec::new();
+            if self
+                .storage
+                .get_record(
+                    StorageRecord::DescriptorRegistration { name: &name },
+                    &mut record,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(summary) = parse_descriptor_summary(&record, &authenticator) else {
+                continue;
+            };
+            entries.push(OwnedResultMapEntry {
+                key: name,
+                value: OwnedV1Value::Map(vec![
+                    OwnedResultMapEntry {
+                        key: "descriptor_len".to_string(),
+                        value: OwnedV1Value::U64(summary.descriptor_len.into()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "num_datavalues".to_string(),
+                        value: OwnedV1Value::U64(summary.num_datavalues.into()),
+                    },
+                ]),
+            });
+        }
+
+        V1Outcome::OwnedMapResult { entries }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostRecordAuthenticator;
+
+impl RecordAuthenticator for HostRecordAuthenticator {
+    fn verify_record(&self, _payload: &[u8], tag: &[u8; HMAC_SHA256_LEN]) -> bool {
+        tag == &[0xa5; HMAC_SHA256_LEN]
     }
 }
 
@@ -411,6 +540,7 @@ pub enum V1Outcome {
     VersionInfo { info: Box<VersionInfo<'static>> },
     BoolResult { result: bool },
     EmptyMapResult,
+    OwnedMapResult { entries: Vec<OwnedResultMapEntry> },
     DeferredToCore { method: String },
     Reject { code: ErrorCode, message: String },
 }
@@ -418,7 +548,13 @@ pub enum V1Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jade_storage::{BIP32_SERIALIZED_LEN, MULTISIG_MASTER_BLINDING_KEY_SIZE};
     use minicbor::Decoder;
+
+    fn authenticated_record(mut payload: Vec<u8>) -> Vec<u8> {
+        payload.extend_from_slice(&[0xa5; HMAC_SHA256_LEN]);
+        payload
+    }
 
     #[test]
     fn ping_is_immediate() {
@@ -569,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_wallet_enumeration_rejects_until_summary_parser_is_ported() {
+    fn registered_wallet_enumeration_skips_unauthenticated_records() {
         let mut emulator = Emulator::new();
         emulator
             .storage_mut()
@@ -583,10 +719,110 @@ mod tests {
 
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::Reject {
-                code: ErrorCode::InternalError,
-                message: "registered multisig summary parser not yet ported to Rust core"
-                    .to_string()
+            V1Outcome::OwnedMapResult { entries: vec![] }
+        );
+    }
+
+    #[test]
+    fn registered_multisig_enumeration_uses_authenticated_summary_parser() {
+        let mut emulator = Emulator::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, 4, 1, 2]);
+        payload.push(MULTISIG_MASTER_BLINDING_KEY_SIZE as u8);
+        payload.extend_from_slice(&[0x22; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        payload.push(2);
+        for signer in 0..2u8 {
+            payload.extend_from_slice(&[signer; 4]);
+            payload.push(0);
+            payload.extend_from_slice(&[0; BIP32_SERIALIZED_LEN]);
+            payload.push(0);
+        }
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", &authenticated_record(payload))
+            .unwrap();
+
+        let request = Request {
+            id: Cow::Borrowed("w"),
+            method: Cow::Borrowed("get_registered_multisigs"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![OwnedResultMapEntry {
+                    key: "wallet-a".to_string(),
+                    value: OwnedV1Value::Map(vec![
+                        OwnedResultMapEntry {
+                            key: "variant".to_string(),
+                            value: OwnedV1Value::Text("wsh(multi(k))".to_string()),
+                        },
+                        OwnedResultMapEntry {
+                            key: "sorted".to_string(),
+                            value: OwnedV1Value::Bool(true),
+                        },
+                        OwnedResultMapEntry {
+                            key: "threshold".to_string(),
+                            value: OwnedV1Value::U64(2),
+                        },
+                        OwnedResultMapEntry {
+                            key: "num_signers".to_string(),
+                            value: OwnedV1Value::U64(2),
+                        },
+                        OwnedResultMapEntry {
+                            key: "master_blinding_key".to_string(),
+                            value: OwnedV1Value::Bytes(vec![
+                                0x22;
+                                MULTISIG_MASTER_BLINDING_KEY_SIZE
+                            ]),
+                        },
+                    ]),
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn registered_descriptor_enumeration_uses_authenticated_summary_parser() {
+        let mut emulator = Emulator::new();
+        let mut payload = Vec::new();
+        let script = b"wsh(sorted)";
+        payload.extend_from_slice(&[0, 2]);
+        payload.extend_from_slice(&(script.len() as u16).to_le_bytes());
+        payload.extend_from_slice(script);
+        payload.push(1);
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice(b"xpub");
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(b"abc");
+        emulator
+            .storage_mut()
+            .set_descriptor_registration("desc-a", &authenticated_record(payload))
+            .unwrap();
+
+        let request = Request {
+            id: Cow::Borrowed("d"),
+            method: Cow::Borrowed("get_registered_descriptors"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![OwnedResultMapEntry {
+                    key: "desc-a".to_string(),
+                    value: OwnedV1Value::Map(vec![
+                        OwnedResultMapEntry {
+                            key: "descriptor_len".to_string(),
+                            value: OwnedV1Value::U64(script.len() as u64),
+                        },
+                        OwnedResultMapEntry {
+                            key: "num_datavalues".to_string(),
+                            value: OwnedV1Value::U64(1),
+                        },
+                    ]),
+                }]
             }
         );
     }

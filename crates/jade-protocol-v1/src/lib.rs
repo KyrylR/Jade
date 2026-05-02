@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use minicbor::{data::Type, Decoder, Encoder};
 
 pub const MAX_ID_LEN: usize = 16;
@@ -344,6 +344,22 @@ pub enum V1Value<'a> {
     U64(u64),
     Text(&'a str),
     Bytes(&'a [u8]),
+    Map(&'a [ResultMapEntry<'a>]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedResultMapEntry {
+    pub key: String,
+    pub value: OwnedV1Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedV1Value {
+    Bool(bool),
+    U64(u64),
+    Text(String),
+    Bytes(Vec<u8>),
+    Map(Vec<OwnedResultMapEntry>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,25 +586,84 @@ pub fn encode_map_result(id: &str, entries: &[ResultMapEntry<'_>]) -> Vec<u8> {
         .expect("Vec-backed CBOR encoding is infallible");
 
     for entry in entries {
-        encoder
-            .str(entry.key)
-            .expect("Vec-backed CBOR encoding is infallible");
-        match entry.value {
-            V1Value::Bool(value) => encoder
-                .bool(value)
-                .expect("Vec-backed CBOR encoding is infallible"),
-            V1Value::U64(value) => encoder
-                .u64(value)
-                .expect("Vec-backed CBOR encoding is infallible"),
-            V1Value::Text(value) => encoder
-                .str(value)
-                .expect("Vec-backed CBOR encoding is infallible"),
-            V1Value::Bytes(value) => encoder
-                .bytes(value)
-                .expect("Vec-backed CBOR encoding is infallible"),
-        };
+        encode_borrowed_entry(&mut encoder, entry);
     }
     output
+}
+
+pub fn encode_owned_map_result(id: &str, entries: &[OwnedResultMapEntry]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.map(entries.len() as u64))
+        .expect("Vec-backed CBOR encoding is infallible");
+
+    for entry in entries {
+        encode_owned_entry(&mut encoder, entry);
+    }
+    output
+}
+
+fn encode_borrowed_entry(encoder: &mut Encoder<&mut Vec<u8>>, entry: &ResultMapEntry<'_>) {
+    encoder
+        .str(entry.key)
+        .expect("Vec-backed CBOR encoding is infallible");
+    match entry.value {
+        V1Value::Bool(value) => encoder
+            .bool(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        V1Value::U64(value) => encoder
+            .u64(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        V1Value::Text(value) => encoder
+            .str(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        V1Value::Bytes(value) => encoder
+            .bytes(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        V1Value::Map(entries) => {
+            encoder
+                .map(entries.len() as u64)
+                .expect("Vec-backed CBOR encoding is infallible");
+            for entry in entries {
+                encode_borrowed_entry(encoder, entry);
+            }
+            encoder
+        }
+    };
+}
+
+fn encode_owned_entry(encoder: &mut Encoder<&mut Vec<u8>>, entry: &OwnedResultMapEntry) {
+    encoder
+        .str(&entry.key)
+        .expect("Vec-backed CBOR encoding is infallible");
+    match &entry.value {
+        OwnedV1Value::Bool(value) => encoder
+            .bool(*value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::U64(value) => encoder
+            .u64(*value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::Text(value) => encoder
+            .str(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::Bytes(value) => encoder
+            .bytes(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::Map(entries) => {
+            encoder
+                .map(entries.len() as u64)
+                .expect("Vec-backed CBOR encoding is infallible");
+            for entry in entries {
+                encode_owned_entry(encoder, entry);
+            }
+            encoder
+        }
+    };
 }
 
 pub fn validate_id(id: &str) -> Result<(), ValidationError> {
@@ -772,5 +847,38 @@ mod tests {
                 b'P', b'I', b'N', 0xf4,
             ]
         );
+    }
+
+    #[test]
+    fn encodes_owned_nested_map_results() {
+        let encoded = encode_owned_map_result(
+            "w",
+            &[OwnedResultMapEntry {
+                key: String::from("wallet-a"),
+                value: OwnedV1Value::Map(vec![
+                    OwnedResultMapEntry {
+                        key: String::from("threshold"),
+                        value: OwnedV1Value::U64(2),
+                    },
+                    OwnedResultMapEntry {
+                        key: String::from("sorted"),
+                        value: OwnedV1Value::Bool(true),
+                    },
+                ]),
+            }],
+        );
+
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "id");
+        assert_eq!(decoder.str().unwrap(), "w");
+        assert_eq!(decoder.str().unwrap(), "result");
+        assert_eq!(decoder.map().unwrap(), Some(1));
+        assert_eq!(decoder.str().unwrap(), "wallet-a");
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "threshold");
+        assert_eq!(decoder.u64().unwrap(), 2);
+        assert_eq!(decoder.str().unwrap(), "sorted");
+        assert!(decoder.bool().unwrap());
     }
 }
