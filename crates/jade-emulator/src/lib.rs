@@ -755,10 +755,12 @@ impl Emulator {
             Ok(details) => details,
             Err(_) => return bad_parameters("Cannot de-serialise multisig wallet data"),
         };
-        let Some(signers) = details.signers.as_ref() else {
-            return bad_parameters("Cannot de-serialise multisig wallet data");
-        };
-        if signers.len() != details.summary.num_signers as usize
+        let signer_count = details
+            .signers
+            .as_ref()
+            .map(|signers| signers.len())
+            .unwrap_or(details.address_xpubs.len());
+        if signer_count != details.summary.num_signers as usize
             || details.summary.threshold == 0
             || details.summary.threshold > details.summary.num_signers
         {
@@ -776,21 +778,27 @@ impl Emulator {
                 return bad_parameters("Failed to extract signer paths from parameters");
             }
         };
-        if paths.len() != signers.len() {
+        if paths.len() != signer_count {
             return bad_parameters(
                 "Unexpected number of signer paths or invalid path for multisig",
             );
         }
 
-        let mut xpubs = Vec::with_capacity(signers.len());
-        let mut effective_paths = Vec::with_capacity(paths.len());
-        for (signer, path) in signers.iter().zip(paths.iter()) {
-            let mut effective_path = Vec::with_capacity(signer.path.len() + path.len());
-            effective_path.extend_from_slice(&signer.path);
-            effective_path.extend_from_slice(path);
-            xpubs.push(signer.xpub);
-            effective_paths.push(effective_path);
-        }
+        let (xpubs, effective_paths) = match details.signers.as_ref() {
+            Some(signers) => {
+                let mut xpubs = Vec::with_capacity(signers.len());
+                let mut effective_paths = Vec::with_capacity(paths.len());
+                for (signer, path) in signers.iter().zip(paths.iter()) {
+                    let mut effective_path = Vec::with_capacity(signer.path.len() + path.len());
+                    effective_path.extend_from_slice(&signer.path);
+                    effective_path.extend_from_slice(path);
+                    xpubs.push(signer.xpub);
+                    effective_paths.push(effective_path);
+                }
+                (xpubs, effective_paths)
+            }
+            None => (details.address_xpubs.clone(), paths),
+        };
 
         let Some(address) = jade_crypto::pure_rust::bitcoin_multisig_address_from_xpubs(
             &xpubs,
@@ -3737,6 +3745,61 @@ mod tests {
             .str("multisig_name")
             .unwrap()
             .str("wallet-a")
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(1)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "bc1qyjkdrj9rr6uzt46fgr7j7kelx92n0lu99ex2zsxlmlvcsaf3yy3qaxune3"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_receive_address_derives_legacy_registered_multisig_address() {
+        let mut emulator = Emulator::new();
+        let xpub = decode_xpub(
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhe\
+             PY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[2, MultisigVariant::P2wsh as u8, 0, 2, 0]);
+        payload.extend_from_slice(&xpub);
+        payload.extend_from_slice(&xpub);
+        emulator
+            .storage_mut()
+            .set_multisig_registration("legacy-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("legacy-a")
             .unwrap()
             .str("paths")
             .unwrap()

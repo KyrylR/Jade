@@ -85,6 +85,7 @@ pub struct MultisigSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultisigDetails {
     pub summary: MultisigSummary,
+    pub address_xpubs: Vec<[u8; BIP32_SERIALIZED_LEN]>,
     pub signers: Option<Vec<MultisigSignerDetails>>,
 }
 
@@ -218,14 +219,14 @@ pub fn parse_multisig_details(
         None
     };
 
-    let (num_signers, signers) = if version < 3 {
+    let (num_signers, address_xpubs, signers) = if version < 3 {
+        let xpubs = parse_legacy_multisig_xpubs(reader.remaining())?;
         let remaining_len = reader.remaining().len();
-        let num_signers = parse_legacy_multisig_signer_count(reader.remaining())?;
         reader.skip(remaining_len)?;
-        (num_signers, None)
+        (xpubs.len() as u8, xpubs, None)
     } else {
         let signers = parse_current_multisig_signers(&mut reader)?;
-        (signers.len() as u8, Some(signers))
+        (signers.len() as u8, Vec::new(), Some(signers))
     };
     if threshold == 0 || threshold > num_signers {
         return Err(StorageError::InvalidRecord);
@@ -240,6 +241,7 @@ pub fn parse_multisig_details(
             num_signers,
             master_blinding_key,
         },
+        address_xpubs,
         signers,
     })
 }
@@ -624,7 +626,9 @@ fn authenticated_payload<'a>(
     }
 }
 
-fn parse_legacy_multisig_signer_count(signer_bytes: &[u8]) -> StorageResult<u8> {
+fn parse_legacy_multisig_xpubs(
+    signer_bytes: &[u8],
+) -> StorageResult<Vec<[u8; BIP32_SERIALIZED_LEN]>> {
     let num_signers = signer_bytes.len() / BIP32_SERIALIZED_LEN;
     if num_signers == 0
         || num_signers > MAX_ALLOWED_SIGNERS
@@ -632,7 +636,12 @@ fn parse_legacy_multisig_signer_count(signer_bytes: &[u8]) -> StorageResult<u8> 
     {
         return Err(StorageError::InvalidRecord);
     }
-    Ok(num_signers as u8)
+
+    let mut xpubs = Vec::with_capacity(num_signers);
+    for xpub in signer_bytes.chunks_exact(BIP32_SERIALIZED_LEN) {
+        xpubs.push(xpub.try_into().map_err(|_| StorageError::InvalidRecord)?);
+    }
+    Ok(xpubs)
 }
 
 fn parse_current_multisig_signers(
@@ -980,6 +989,7 @@ mod tests {
         );
 
         let details = parse_multisig_details(&record, &TestAuthenticator).unwrap();
+        assert!(details.address_xpubs.is_empty());
         let signers = details.signers.unwrap();
         assert_eq!(signers.len(), 3);
         assert_eq!(signers[0].fingerprint, [0; 4]);
@@ -1007,6 +1017,7 @@ mod tests {
 
         let details = parse_multisig_details(&record, &TestAuthenticator).unwrap();
         assert_eq!(details.summary, summary);
+        assert_eq!(details.address_xpubs, vec![[0; BIP32_SERIALIZED_LEN]; 2]);
         assert_eq!(details.signers, None);
     }
 
