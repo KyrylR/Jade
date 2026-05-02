@@ -977,7 +977,7 @@ pub mod pure_rust {
             let prev_output = prev_outputs[index];
 
             let mut signed_pubkeys = Vec::new();
-            let mut wallet_candidates = Vec::new();
+            let mut bip32_candidates = Vec::new();
             let mut tap_key_signed = false;
             let mut tap_candidates = Vec::new();
             for entry in &input.entries {
@@ -985,10 +985,17 @@ pub mod pure_rust {
                     Some(0x13) if entry.key.len() == 1 => tap_key_signed = true,
                     Some(0x02) => signed_pubkeys.push(&entry.key[1..]),
                     Some(0x06)
-                        if entry.value.get(..4) == Some(wallet_fingerprint)
-                            && compressed_pubkey_len(&entry.key[1..]) =>
+                        if entry.value.len() >= 4 && compressed_pubkey_len(&entry.key[1..]) =>
                     {
-                        wallet_candidates.push((&entry.key[1..], &entry.value[4..]));
+                        let fingerprint = entry.value[..4]
+                            .try_into()
+                            .expect("checked fingerprint length");
+                        let path = parse_psbt_derivation_path(&entry.value[4..])?;
+                        bip32_candidates.push(PsbtBip32Candidate {
+                            pubkey: &entry.key[1..],
+                            fingerprint,
+                            path,
+                        });
                     }
                     Some(0x16)
                         if entry.key.len() == 1 + SHA256_LEN
@@ -1003,11 +1010,19 @@ pub mod pure_rust {
                 }
             }
 
-            for (pubkey, path_bytes) in wallet_candidates {
+            for candidate in &bip32_candidates {
+                let pubkey = candidate.pubkey;
                 if signed_pubkeys.iter().any(|signed| signed == &pubkey) {
                     continue;
                 }
-                let path = parse_psbt_derivation_path(path_bytes)?;
+                let Some(path) = psbt_seed_path_for_candidate(
+                    seed,
+                    wallet_fingerprint,
+                    candidate,
+                    &bip32_candidates,
+                ) else {
+                    continue;
+                };
                 let derived_pubkey =
                     public_key_from_seed_path(seed, &path).ok_or(PsbtSignError::Unsupported)?;
                 if derived_pubkey.as_slice() != pubkey {
@@ -1333,6 +1348,12 @@ pub mod pure_rust {
         signature: Vec<u8>,
     }
 
+    struct PsbtBip32Candidate<'a> {
+        pubkey: &'a [u8],
+        fingerprint: [u8; 4],
+        path: Vec<u32>,
+    }
+
     struct SighashTx<'tx, 'data> {
         version: u32,
         lock_time: u32,
@@ -1427,6 +1448,63 @@ pub mod pure_rust {
         }
         pos += 4;
         parse_psbt_derivation_path(&value[pos..])
+    }
+
+    fn psbt_seed_path_for_candidate(
+        seed: &[u8],
+        wallet_fingerprint: &[u8; 4],
+        candidate: &PsbtBip32Candidate<'_>,
+        candidates: &[PsbtBip32Candidate<'_>],
+    ) -> Option<Vec<u32>> {
+        if &candidate.fingerprint == wallet_fingerprint {
+            return Some(candidate.path.clone());
+        }
+
+        if !green_recovery_short_path(&candidate.path) {
+            return None;
+        }
+
+        // Green 2-of-3 recovery PSBTs may encode the recovery key relative to
+        // m/3'/subaccount' while another key reveals the full user path.
+        for other in candidates {
+            let Some(parent) = green_user_parent_path(&other.path) else {
+                continue;
+            };
+            if !other.path.ends_with(&candidate.path) {
+                continue;
+            }
+            if fingerprint_from_seed_path(seed, &parent) == Some(candidate.fingerprint) {
+                let mut full_path = parent;
+                full_path.extend_from_slice(&candidate.path);
+                return Some(full_path);
+            }
+        }
+
+        None
+    }
+
+    fn green_recovery_short_path(path: &[u32]) -> bool {
+        path.len() == 2
+            && path
+                .iter()
+                .all(|value| value & bip32::ChildNumber::HARDENED_FLAG == 0)
+    }
+
+    fn green_user_parent_path(path: &[u32]) -> Option<Vec<u32>> {
+        if path.len() < 4
+            || path[0] != (bip32::ChildNumber::HARDENED_FLAG | 3)
+            || path[1] & bip32::ChildNumber::HARDENED_FLAG == 0
+            || path[2] & bip32::ChildNumber::HARDENED_FLAG != 0
+            || path[3] & bip32::ChildNumber::HARDENED_FLAG != 0
+        {
+            return None;
+        }
+        Some(path[..2].to_vec())
+    }
+
+    fn fingerprint_from_seed_path(seed: &[u8], path: &[u32]) -> Option<[u8; 4]> {
+        let public_key = public_key_from_seed_path(seed, path)?;
+        hash160(&public_key)[..4].try_into().ok()
     }
 
     fn double_sha256(bytes: &[u8]) -> [u8; SHA256_LEN] {
