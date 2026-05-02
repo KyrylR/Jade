@@ -10,12 +10,14 @@ use jade_protocol_v2::{
 
 pub mod allocation;
 pub mod bip32_path;
+pub mod ota;
 pub mod platform;
 pub mod state;
 
 pub use allocation::{AllocationBudget, AllocationFailure};
 pub use bip32_path::{JadeDerivationPath, PathError};
 pub use jade_protocol_v2::{NetworkRestriction, VersionDebugInfo, VersionInfo, VersionInfoState};
+pub use ota::{OtaHashType, OtaKind, OtaRequest, OTA_HASH_LEN};
 pub use platform::Platform;
 pub use state::{InterfaceKind, InterfaceSession, OperationState, WalletLifecycle};
 

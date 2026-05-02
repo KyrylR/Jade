@@ -380,6 +380,7 @@ dependencies = [
  "jade-protocol-v2",
  "jade-storage",
  "minicbor",
+ "sha2 0.11.0",
 ]
 
 [[package]]

@@ -15,3 +15,4 @@ jade-protocol-v1.workspace = true
 jade-protocol-v2.workspace = true
 jade-storage.workspace = true
 minicbor = { workspace = true, features = ["std"] }
+sha2.workspace = true

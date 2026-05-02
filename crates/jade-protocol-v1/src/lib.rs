@@ -779,9 +779,6 @@ pub fn validate_method(method: &str) -> Result<(), ValidationError> {
     if method.len() > MAX_METHOD_LEN {
         return Err(ValidationError::MethodTooLong);
     }
-    if method_spec(method).is_none() {
-        return Err(ValidationError::UnknownMethod);
-    }
     Ok(())
 }
 
@@ -891,6 +888,20 @@ mod tests {
         ];
 
         assert_eq!(decode_request(&bytes), Err(ValidationError::TrailingData));
+    }
+
+    #[test]
+    fn decodes_unknown_method_for_adapter_error_parity() {
+        let bytes = [
+            0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x6c,
+            b'n', b'o', b't', b'_', b'a', b'_', b'm', b'e', b't', b'h', b'o', b'd',
+        ];
+
+        let request = decode_request(&bytes).unwrap();
+
+        assert_eq!(request.id, "1");
+        assert_eq!(request.method, "not_a_method");
+        assert!(method_spec(&request.method).is_none());
     }
 
     #[test]

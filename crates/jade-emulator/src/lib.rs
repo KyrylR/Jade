@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::boxed::Box;
+use std::fmt;
 use std::string::String;
 use std::vec::Vec;
 
 use jade_core::{
     bip32_path::MAX_PATH_LEN, CoreError, CoreResult, CoreState, NetworkRestriction, OperationState,
-    Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
+    OtaHashType, OtaRequest, Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
 };
 use jade_protocol_v1::{
     decode_request, encode_bool_result, encode_bytes_result, encode_error_response,
@@ -19,12 +20,15 @@ use jade_storage::{
     MultisigVariant, RecordAuthenticator, StorageLimits, StorageNamespace, StorageRecord,
     HMAC_SHA256_LEN,
 };
+use minicbor::Decoder;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 pub struct Emulator {
     state: CoreState,
     platform: HostPlatform,
     storage: JadeStorage<MemoryStorage>,
+    ota: Option<HostOtaSession>,
 }
 
 impl Default for Emulator {
@@ -33,6 +37,7 @@ impl Default for Emulator {
             state: CoreState::default(),
             platform: HostPlatform::default(),
             storage: JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT),
+            ota: None,
         }
     }
 }
@@ -119,6 +124,11 @@ impl Emulator {
                 self.state.logout();
                 V1Outcome::BoolResult { result: true }
             }
+            Some(MethodClass::PreAuth) if request.method == "cancel" => V1Outcome::NoReply,
+            Some(MethodClass::PreAuth) if request.method == "ota" => self.start_ota(request, false),
+            Some(MethodClass::PreAuth) if request.method == "ota_delta" => {
+                self.start_ota(request, true)
+            }
             Some(MethodClass::PreAuth) if request.method == "update_pinserver" => {
                 self.update_pinserver(request)
             }
@@ -127,6 +137,7 @@ impl Emulator {
                     Ok(()) => {
                         self.state = CoreState::default();
                         self.platform.clear_debug_wallet();
+                        self.ota = None;
                         V1Outcome::BoolResult { result: true }
                     }
                     Err(_) => V1Outcome::Reject {
@@ -134,6 +145,9 @@ impl Emulator {
                         message: "debug clean reset failed".to_string(),
                     },
                 }
+            }
+            Some(MethodClass::Debug) if request.method == "debug_selfcheck" => {
+                V1Outcome::UintResult { result: 0 }
             }
             Some(MethodClass::Debug) if request.method == "debug_set_mnemonic" => {
                 self.debug_set_mnemonic(request)
@@ -168,12 +182,22 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_blinding_factor" => {
                 self.blinding_factor_result(request)
             }
+            Some(MethodClass::Continuation) if request.method == "ota_data" => {
+                self.handle_ota_data(request)
+            }
+            Some(MethodClass::Continuation) if request.method == "ota_complete" => {
+                self.handle_ota_complete()
+            }
+            Some(MethodClass::Continuation) => V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            },
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
             None => V1Outcome::Reject {
                 code: ErrorCode::UnknownMethod,
-                message: "unknown method".to_string(),
+                message: "Unknown method".to_string(),
             },
         }
     }
@@ -186,12 +210,14 @@ impl Emulator {
                 }
                 V1Outcome::VersionInfo { info } => encode_version_info_result(&request.id, &info),
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
+                V1Outcome::UintResult { result } => encode_uint_result(&request.id, result),
                 V1Outcome::TextResult { result } => encode_text_result(&request.id, &result),
                 V1Outcome::BytesResult { result } => encode_bytes_result(&request.id, &result),
                 V1Outcome::EmptyMapResult => encode_map_result(&request.id, &[]),
                 V1Outcome::OwnedMapResult { entries } => {
                     encode_owned_map_result(&request.id, &entries)
                 }
+                V1Outcome::NoReply => Vec::new(),
                 V1Outcome::Reject { code, message } => encode_error_response(&ErrorResponse {
                     id: request.id,
                     code: code as i32,
@@ -847,6 +873,152 @@ impl Emulator {
         }
     }
 
+    fn start_ota(&mut self, request: &Request<'_>, is_delta: bool) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return bad_parameters("Expecting parameters map");
+        };
+        if self.ota.is_some() {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "OTA already in progress".to_string(),
+            };
+        }
+
+        let firmware_size = match params.u64("fwsize") {
+            Ok(Some(size)) => size,
+            Ok(None) | Err(_) => return bad_parameters("Bad filesize parameters"),
+        };
+        let compressed_size = match params.u64("cmpsize") {
+            Ok(Some(size)) => size,
+            Ok(None) | Err(_) => return bad_parameters("Bad filesize parameters"),
+        };
+        let full_hash = hash32_param(params, "fwhash");
+        let compressed_hash = hash32_param(params, "cmphash");
+        let extended_replies = optional_bool(params, "extended_replies");
+
+        let request = if is_delta {
+            let patch_size = match params.u64("patchsize") {
+                Ok(Some(size)) => size,
+                Ok(None) | Err(_) => return bad_parameters("Bad delta filesize parameters"),
+            };
+            match OtaRequest::delta(
+                firmware_size,
+                patch_size,
+                compressed_size,
+                full_hash,
+                compressed_hash,
+                extended_replies,
+            ) {
+                Ok(request) => request,
+                Err(_) if patch_size <= compressed_size => {
+                    return bad_parameters("Bad delta filesize parameters")
+                }
+                Err(_) => return bad_parameters("Cannot extract valid fw hash value"),
+            }
+        } else {
+            match OtaRequest::full(
+                firmware_size,
+                compressed_size,
+                full_hash,
+                compressed_hash,
+                extended_replies,
+            ) {
+                Ok(request) => request,
+                Err(_) if firmware_size <= compressed_size => {
+                    return bad_parameters("Bad filesize parameters")
+                }
+                Err(_) => return bad_parameters("Cannot extract valid fw hash value"),
+            }
+        };
+
+        self.ota = Some(HostOtaSession {
+            request,
+            received_compressed: 0,
+            compressed_hasher: Sha256::new(),
+        });
+        self.state.operation = OperationState::Ota {
+            session: jade_protocol_v2::SessionId(0),
+        };
+
+        V1Outcome::BoolResult { result: true }
+    }
+
+    fn handle_ota_data(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(session) = self.ota.as_mut() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        };
+        let Ok(data) = direct_bytes_params(request) else {
+            return bad_parameters("Invalid OTA data");
+        };
+        if data.is_empty() {
+            return bad_parameters("Invalid OTA data");
+        }
+
+        let Some(next_received) = session.received_compressed.checked_add(data.len() as u64) else {
+            return bad_parameters("Invalid OTA data");
+        };
+        if next_received > session.request.compressed_size {
+            return bad_parameters("Invalid OTA data");
+        }
+
+        session.compressed_hasher.update(data);
+        session.received_compressed = next_received;
+
+        if session.request.extended_replies {
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "confirmed".to_string(),
+                        value: OwnedV1Value::Bool(false),
+                    },
+                    OwnedResultMapEntry {
+                        key: "progress".to_string(),
+                        value: OwnedV1Value::U64(
+                            session
+                                .request
+                                .upload_progress_percent(session.received_compressed),
+                        ),
+                    },
+                ],
+            }
+        } else {
+            V1Outcome::BoolResult { result: true }
+        }
+    }
+
+    fn handle_ota_complete(&mut self) -> V1Outcome {
+        let Some(session) = self.ota.take() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        };
+        self.state.operation = OperationState::Idle;
+
+        if session.received_compressed != session.request.compressed_size {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Error completing OTA".to_string(),
+            };
+        }
+
+        if session.request.hash_type == OtaHashType::CompressedUpload {
+            let calculated: [u8; jade_core::OTA_HASH_LEN] =
+                session.compressed_hasher.finalize().into();
+            if calculated != session.request.expected_hash {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Error completing OTA".to_string(),
+                };
+            }
+        }
+
+        V1Outcome::BoolResult { result: true }
+    }
+
     fn master_unblinding_key_for_params(
         &self,
         params: jade_protocol_v1::Params<'_>,
@@ -1063,6 +1235,27 @@ fn bad_parameters(message: &'static str) -> V1Outcome {
     }
 }
 
+fn hash32_param(
+    params: jade_protocol_v1::Params<'_>,
+    field: &str,
+) -> Option<[u8; jade_core::OTA_HASH_LEN]> {
+    let bytes = optional_bytes(params, field)?;
+    bytes.try_into().ok()
+}
+
+fn direct_bytes_params<'a>(request: &Request<'a>) -> Result<&'a [u8], ()> {
+    let Some(params) = request.params() else {
+        return Err(());
+    };
+    let raw = params.raw();
+    let mut decoder = Decoder::new(raw);
+    let bytes = decoder.bytes().map_err(|_| ())?;
+    if decoder.position() != raw.len() {
+        return Err(());
+    }
+    Ok(bytes)
+}
+
 fn optional_bool(params: jade_protocol_v1::Params<'_>, field: &str) -> bool {
     params.bool(field).ok().flatten().unwrap_or(false)
 }
@@ -1234,6 +1427,21 @@ struct HostRecordAuthenticator;
 impl RecordAuthenticator for HostRecordAuthenticator {
     fn verify_record(&self, _payload: &[u8], tag: &[u8; HMAC_SHA256_LEN]) -> bool {
         tag == &[0xa5; HMAC_SHA256_LEN]
+    }
+}
+
+struct HostOtaSession {
+    request: OtaRequest,
+    received_compressed: u64,
+    compressed_hasher: Sha256,
+}
+
+impl fmt::Debug for HostOtaSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostOtaSession")
+            .field("request", &self.request)
+            .field("received_compressed", &self.received_compressed)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1502,10 +1710,12 @@ pub enum V1Outcome {
     ImmediatePing { activity: jade_core::OperationState },
     VersionInfo { info: Box<VersionInfo<'static>> },
     BoolResult { result: bool },
+    UintResult { result: u64 },
     TextResult { result: String },
     BytesResult { result: Vec<u8> },
     EmptyMapResult,
     OwnedMapResult { entries: Vec<OwnedResultMapEntry> },
+    NoReply,
     DeferredToCore { method: String },
     Reject { code: ErrorCode, message: String },
 }
@@ -1519,6 +1729,34 @@ mod tests {
     fn authenticated_record(mut payload: Vec<u8>) -> Vec<u8> {
         payload.extend_from_slice(&[0xa5; HMAC_SHA256_LEN]);
         payload
+    }
+
+    fn decode_v1_error(response: &[u8]) -> (i32, String) {
+        let mut decoder = Decoder::new(response);
+        let mut code = None;
+        let mut message = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => {
+                    decoder.skip().unwrap();
+                }
+                "error" => {
+                    assert_eq!(decoder.map().unwrap(), Some(2));
+                    for _ in 0..2 {
+                        match decoder.str().unwrap() {
+                            "code" => code = Some(decoder.i32().unwrap()),
+                            "message" => message = Some(decoder.str().unwrap().to_string()),
+                            _ => decoder.skip().unwrap(),
+                        }
+                    }
+                }
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        (code.unwrap(), message.unwrap())
     }
 
     #[test]
@@ -1547,6 +1785,38 @@ mod tests {
         assert_eq!(
             emulator.handle_v1_cbor(&request),
             [0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x00,]
+        );
+    }
+
+    #[test]
+    fn debug_selfcheck_returns_elapsed_ms_uint() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("selfcheck"),
+            method: Cow::Borrowed("debug_selfcheck"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::UintResult { result: 0 }
+        );
+
+        let mut raw = Vec::new();
+        minicbor::Encoder::new(&mut raw)
+            .map(2)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("s")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("debug_selfcheck")
+            .unwrap();
+        assert_eq!(
+            emulator.handle_v1_cbor(&raw),
+            [0xa2, 0x62, b'i', b'd', 0x61, b's', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x00,]
         );
     }
 
@@ -1615,6 +1885,315 @@ mod tests {
             emulator.handle_v1_request(&request),
             V1Outcome::DeferredToCore {
                 method: "sign_psbt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn top_level_cancel_is_ignored_without_response() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("c"),
+            method: Cow::Borrowed("cancel"),
+            params: None,
+        };
+
+        assert_eq!(emulator.handle_v1_request(&request), V1Outcome::NoReply);
+
+        let mut raw = Vec::new();
+        minicbor::Encoder::new(&mut raw)
+            .map(2)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("c")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("cancel")
+            .unwrap();
+        assert!(emulator.handle_v1_cbor(&raw).is_empty());
+    }
+
+    #[test]
+    fn continuation_methods_reject_without_active_flow() {
+        let mut emulator = Emulator::new();
+
+        for method in [
+            "ota_data",
+            "ota_complete",
+            "tx_input",
+            "get_extended_data",
+            "get_signature",
+            "pin",
+        ] {
+            let request = Request {
+                id: Cow::Borrowed("cont"),
+                method: Cow::Borrowed(method),
+                params: None,
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Unexpected method".to_string(),
+                },
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_v1_continuation_returns_protocol_error() {
+        let mut emulator = Emulator::new();
+        let mut raw = Vec::new();
+        minicbor::Encoder::new(&mut raw)
+            .map(2)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("cont")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_extended_data")
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&raw);
+
+        assert_eq!(
+            decode_v1_error(&response),
+            (
+                ErrorCode::ProtocolError as i32,
+                "Unexpected method".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn raw_v1_unknown_method_returns_unknown_method_error() {
+        let mut emulator = Emulator::new();
+        let mut raw = Vec::new();
+        minicbor::Encoder::new(&mut raw)
+            .map(2)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("unknown")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("not_a_method")
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&raw);
+
+        assert_eq!(
+            decode_v1_error(&response),
+            (
+                ErrorCode::UnknownMethod as i32,
+                "Unknown method".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn ota_full_upload_tracks_metadata_progress_and_compressed_hash() {
+        let mut emulator = Emulator::new();
+        let upload = b"abc";
+        let compressed_hash = Sha256::digest(upload);
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("fwsize")
+            .unwrap()
+            .u64(10)
+            .unwrap()
+            .str("cmpsize")
+            .unwrap()
+            .u64(upload.len() as u64)
+            .unwrap()
+            .str("cmphash")
+            .unwrap()
+            .bytes(&compressed_hash)
+            .unwrap()
+            .str("extended_replies")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("ota"),
+            method: Cow::Borrowed("ota"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert!(matches!(
+            emulator.state.operation,
+            OperationState::Ota { .. }
+        ));
+
+        let mut chunk = Vec::new();
+        minicbor::Encoder::new(&mut chunk).bytes(b"a").unwrap();
+        let data_request = Request {
+            id: Cow::Borrowed("ota-data"),
+            method: Cow::Borrowed("ota_data"),
+            params: Some(&chunk),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&data_request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "confirmed".to_string(),
+                        value: OwnedV1Value::Bool(false),
+                    },
+                    OwnedResultMapEntry {
+                        key: "progress".to_string(),
+                        value: OwnedV1Value::U64(33),
+                    },
+                ],
+            }
+        );
+
+        let mut chunk = Vec::new();
+        minicbor::Encoder::new(&mut chunk).bytes(b"bc").unwrap();
+        let data_request = Request {
+            id: Cow::Borrowed("ota-data"),
+            method: Cow::Borrowed("ota_data"),
+            params: Some(&chunk),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&data_request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "confirmed".to_string(),
+                        value: OwnedV1Value::Bool(false),
+                    },
+                    OwnedResultMapEntry {
+                        key: "progress".to_string(),
+                        value: OwnedV1Value::U64(100),
+                    },
+                ],
+            }
+        );
+
+        let complete_request = Request {
+            id: Cow::Borrowed("ota-complete"),
+            method: Cow::Borrowed("ota_complete"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&complete_request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.state.operation, OperationState::Idle);
+    }
+
+    #[test]
+    fn ota_delta_rejects_bad_patch_size() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("fwsize")
+            .unwrap()
+            .u64(10)
+            .unwrap()
+            .str("patchsize")
+            .unwrap()
+            .u64(3)
+            .unwrap()
+            .str("cmpsize")
+            .unwrap()
+            .u64(3)
+            .unwrap()
+            .str("cmphash")
+            .unwrap()
+            .bytes(&[0x22; jade_core::OTA_HASH_LEN])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("ota"),
+            method: Cow::Borrowed("ota_delta"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Bad delta filesize parameters".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ota_complete_rejects_compressed_hash_mismatch_and_clears_session() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("fwsize")
+            .unwrap()
+            .u64(10)
+            .unwrap()
+            .str("cmpsize")
+            .unwrap()
+            .u64(3)
+            .unwrap()
+            .str("cmphash")
+            .unwrap()
+            .bytes(&[0x22; jade_core::OTA_HASH_LEN])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("ota"),
+            method: Cow::Borrowed("ota"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut chunk = Vec::new();
+        minicbor::Encoder::new(&mut chunk).bytes(b"abc").unwrap();
+        let data_request = Request {
+            id: Cow::Borrowed("ota-data"),
+            method: Cow::Borrowed("ota_data"),
+            params: Some(&chunk),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&data_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let complete_request = Request {
+            id: Cow::Borrowed("ota-complete"),
+            method: Cow::Borrowed("ota_complete"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&complete_request),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Error completing OTA".to_string(),
+            }
+        );
+        assert_eq!(emulator.state.operation, OperationState::Idle);
+
+        assert_eq!(
+            emulator.handle_v1_request(&complete_request),
+            V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
             }
         );
     }
