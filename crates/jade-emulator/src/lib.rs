@@ -5028,6 +5028,14 @@ mod tests {
         &rest[..end]
     }
 
+    fn fixture_network(fixture: &str) -> &str {
+        let marker = "\"network\": \"";
+        let start = fixture.find(marker).unwrap() + marker.len();
+        let rest = &fixture[start..];
+        let end = rest.find('"').unwrap();
+        &rest[..end]
+    }
+
     fn fixture_expected_output_psbt_base64(fixture: &str) -> &str {
         let marker = "\"expected_output\":";
         let start = fixture.find(marker).unwrap() + marker.len();
@@ -6586,6 +6594,44 @@ mod tests {
             emulator.handle_v1_request(&request),
             V1Outcome::BytesResult { result: expected }
         );
+    }
+
+    #[test]
+    fn sign_psbt_signs_green_multisig_wallet_inputs() {
+        for fixture in [
+            include_str!("../../../test_data/psbt_tm_green_multisig_2of2csv.json"),
+            include_str!("../../../test_data/psbt_tm_green_multisig_2of3.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let psbt = fixture_psbt_base64(fixture);
+            let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(2)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(fixture_network(fixture))
+                .unwrap()
+                .str("psbt")
+                .unwrap()
+                .str(psbt)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("psbt"),
+                method: Cow::Borrowed("sign_psbt"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult { result: expected }
+            );
+        }
     }
 
     #[test]

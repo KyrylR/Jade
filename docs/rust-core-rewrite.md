@@ -111,9 +111,11 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   inputs are already signed, and produces pure-Rust ECDSA signatures for the
   first Bitcoin signing paths: single-sig legacy P2PKH, native P2WPKH,
   P2SH-wrapped P2WPKH, Taproot key-path DEFAULT/ALL, and one-device multisig
-  partial signatures for P2SH, P2WSH, and P2SH-P2WSH. Anti-exfil PSBT flows,
-  script-path Taproot, full multisig finalization, and Liquid/PSET signing
-  still defer to the transaction-signing milestone.
+  partial signatures for P2SH, P2WSH, P2SH-P2WSH, Green 2-of-2 CSV, and
+  Green 2-of-3 fixtures. PSBT anti-exfil, Green recovery policy cases,
+  multi-input PSBT byte-order golden parity, script-path Taproot, full
+  multisig finalization, and Liquid/PSET signing still defer to the
+  transaction-signing milestone.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
