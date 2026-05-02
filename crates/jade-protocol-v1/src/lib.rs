@@ -575,6 +575,19 @@ pub fn encode_bool_result(id: &str, result: bool) -> Vec<u8> {
     output
 }
 
+pub fn encode_bytes_result(id: &str, result: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.bytes(result))
+        .expect("Vec-backed CBOR encoding is infallible");
+    output
+}
+
 pub fn encode_map_result(id: &str, entries: &[ResultMapEntry<'_>]) -> Vec<u8> {
     let mut output = Vec::new();
     let mut encoder = Encoder::new(&mut output);
@@ -864,6 +877,17 @@ mod tests {
         assert_eq!(
             encode_uint_result("1", 0),
             [0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x00,]
+        );
+    }
+
+    #[test]
+    fn encodes_v1_bytes_result_shape() {
+        assert_eq!(
+            encode_bytes_result("b", &[1, 2, 3]),
+            [
+                0xa2, 0x62, b'i', b'd', 0x61, b'b', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x43,
+                1, 2, 3,
+            ]
         );
     }
 

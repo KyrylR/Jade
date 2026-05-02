@@ -8,9 +8,10 @@ use jade_core::{
     VersionDebugInfo, VersionInfo,
 };
 use jade_protocol_v1::{
-    decode_request, encode_bool_result, encode_error_response, encode_map_result,
-    encode_owned_map_result, encode_uint_result, method_spec, ErrorCode, ErrorResponse,
-    MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry, V1Value,
+    decode_request, encode_bool_result, encode_bytes_result, encode_error_response,
+    encode_map_result, encode_owned_map_result, encode_uint_result, method_spec, ErrorCode,
+    ErrorResponse, MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry,
+    V1Value,
 };
 use jade_storage::{
     key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
@@ -43,6 +44,10 @@ impl Emulator {
 
     pub fn platform(&self) -> &HostPlatform {
         &self.platform
+    }
+
+    pub fn platform_mut(&mut self) -> &mut HostPlatform {
+        &mut self.platform
     }
 
     pub fn storage_mut(&mut self) -> &mut JadeStorage<MemoryStorage> {
@@ -138,6 +143,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptor" => {
                 self.registered_descriptor_details(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
+                self.master_blinding_key_result(request)
+            }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
@@ -156,6 +164,7 @@ impl Emulator {
                 }
                 V1Outcome::VersionInfo { info } => encode_version_info_result(&request.id, &info),
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
+                V1Outcome::BytesResult { result } => encode_bytes_result(&request.id, &result),
                 V1Outcome::EmptyMapResult => encode_map_result(&request.id, &[]),
                 V1Outcome::OwnedMapResult { entries } => {
                     encode_owned_map_result(&request.id, &entries)
@@ -505,6 +514,24 @@ impl Emulator {
             ],
         }
     }
+
+    fn master_blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
+        let only_if_silent = request
+            .params()
+            .and_then(|params| params.bool("only_if_silent").ok())
+            .flatten()
+            .unwrap_or(false);
+        if only_if_silent && self.platform.confirm_export_blinding_key {
+            return V1Outcome::Reject {
+                code: ErrorCode::UserCancelled,
+                message: "User declined to export master blinding key".to_string(),
+            };
+        }
+
+        V1Outcome::BytesResult {
+            result: self.platform.master_blinding_key().to_vec(),
+        }
+    }
 }
 
 fn missing_descriptor_result() -> V1Outcome {
@@ -647,6 +674,8 @@ pub struct HostPlatform {
     version: Cow<'static, str>,
     entropy_bytes_received: usize,
     epoch: Option<u64>,
+    master_unblinding_key: [u8; 64],
+    confirm_export_blinding_key: bool,
 }
 
 impl Default for HostPlatform {
@@ -655,6 +684,8 @@ impl Default for HostPlatform {
             version: Cow::Borrowed("rust-emulator"),
             entropy_bytes_received: 0,
             epoch: None,
+            master_unblinding_key: [0; 64],
+            confirm_export_blinding_key: false,
         }
     }
 }
@@ -666,6 +697,18 @@ impl HostPlatform {
 
     pub fn epoch(&self) -> Option<u64> {
         self.epoch
+    }
+
+    pub fn set_master_unblinding_key(&mut self, key: [u8; 64]) {
+        self.master_unblinding_key = key;
+    }
+
+    pub fn set_confirm_export_blinding_key(&mut self, confirm: bool) {
+        self.confirm_export_blinding_key = confirm;
+    }
+
+    fn master_blinding_key(&self) -> &[u8] {
+        &self.master_unblinding_key[32..64]
     }
 }
 
@@ -875,6 +918,7 @@ pub enum V1Outcome {
     ImmediatePing { activity: jade_core::OperationState },
     VersionInfo { info: Box<VersionInfo<'static>> },
     BoolResult { result: bool },
+    BytesResult { result: Vec<u8> },
     EmptyMapResult,
     OwnedMapResult { entries: Vec<OwnedResultMapEntry> },
     DeferredToCore { method: String },
@@ -1645,6 +1689,85 @@ mod tests {
             [0xa2, 0x62, b'i', b'd', 0x61, b't', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
         );
         assert_eq!(emulator.platform().epoch(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn get_master_blinding_key_returns_slip77_half() {
+        let mut emulator = Emulator::new();
+        let mut key = [0u8; 64];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        emulator.platform_mut().set_master_unblinding_key(key);
+
+        let request = Request {
+            id: Cow::Borrowed("blind"),
+            method: Cow::Borrowed("get_master_blinding_key"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: (32u8..64).collect()
+            }
+        );
+    }
+
+    #[test]
+    fn get_master_blinding_key_only_if_silent_rejects_when_confirmation_needed() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_confirm_export_blinding_key(true);
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("only_if_silent")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("blind"),
+            method: Cow::Borrowed("get_master_blinding_key"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::UserCancelled,
+                message: "User declined to export master blinding key".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn raw_v1_get_master_blinding_key_returns_bytes() {
+        let mut emulator = Emulator::new();
+        let mut key = [0u8; 64];
+        key[32..64].copy_from_slice(&[0x42; 32]);
+        emulator.platform_mut().set_master_unblinding_key(key);
+        let request = [
+            0xa2, 0x62, b'i', b'd', 0x61, b'b', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x77,
+            b'g', b'e', b't', b'_', b'm', b'a', b's', b't', b'e', b'r', b'_', b'b', b'l', b'i',
+            b'n', b'd', b'i', b'n', b'g', b'_', b'k', b'e', b'y',
+        ];
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut result = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "b"),
+                "result" => result = Some(decoder.bytes().unwrap()),
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(result, Some(&[0x42; 32][..]));
     }
 
     #[test]
