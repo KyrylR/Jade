@@ -190,6 +190,12 @@ pub enum PsbtSignError {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxSignError {
+    Invalid,
+    Unsupported,
+}
+
 pub fn psbt_envelope(bytes: &[u8]) -> Option<PsbtEnvelope> {
     if bytes.starts_with(b"psbt\xff") {
         Some(PsbtEnvelope::Bitcoin)
@@ -732,8 +738,8 @@ pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
         IdentityKeyType, LiquidNetwork, MultisigScriptVariant, PsbtEnvelope, PsbtSignError,
-        SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN,
-        SHA256_LEN, SHA512_LEN,
+        SinglesigScriptVariant, TxSignError, XpubPrefix, EC_PRIVATE_KEY_LEN,
+        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
@@ -758,6 +764,16 @@ pub mod pure_rust {
 
     type HmacSha256 = Hmac<Sha256>;
     type HmacSha512 = Hmac<Sha512>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BitcoinTxSignInput<'a> {
+        pub tx_input_index: usize,
+        pub path: &'a [u32],
+        pub script_code: &'a [u8],
+        pub sighash: u32,
+        pub is_witness: bool,
+        pub satoshi: Option<u64>,
+    }
 
     #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     enum Blech32 {}
@@ -1022,6 +1038,70 @@ pub mod pure_rust {
         )?))
     }
 
+    pub fn bitcoin_tx_input_count(txn: &[u8]) -> Result<usize, TxSignError> {
+        bitcoin_transaction_view(txn)
+            .map(|tx| tx.inputs.len())
+            .ok_or(TxSignError::Invalid)
+    }
+
+    pub fn sign_bitcoin_tx_from_seed(
+        txn: &[u8],
+        seed: &[u8],
+        signing_inputs: &[BitcoinTxSignInput<'_>],
+    ) -> Result<Vec<Vec<u8>>, TxSignError> {
+        let tx = bitcoin_transaction_view(txn).ok_or(TxSignError::Invalid)?;
+        let sighash_tx = SighashTx {
+            version: tx.version,
+            lock_time: tx.lock_time,
+            inputs: &tx.inputs,
+            outputs: &tx.outputs,
+        };
+        let mut signatures = Vec::with_capacity(signing_inputs.len());
+        for signing_input in signing_inputs {
+            if signing_input.path.is_empty()
+                || signing_input.script_code.is_empty()
+                || signing_input.tx_input_index >= sighash_tx.inputs.len()
+            {
+                return Err(TxSignError::Invalid);
+            }
+            if signing_input.sighash != 1 {
+                return Err(TxSignError::Unsupported);
+            }
+
+            let digest = if signing_input.is_witness {
+                let amount = signing_input.satoshi.ok_or(TxSignError::Invalid)?;
+                segwit_v0_sighash_all(
+                    sighash_tx.version,
+                    sighash_tx.lock_time,
+                    sighash_tx.inputs,
+                    sighash_tx.outputs,
+                    signing_input.tx_input_index,
+                    signing_input.script_code,
+                    amount,
+                )
+            } else {
+                legacy_sighash_all(
+                    sighash_tx.version,
+                    sighash_tx.lock_time,
+                    sighash_tx.inputs,
+                    sighash_tx.outputs,
+                    signing_input.tx_input_index,
+                    signing_input.script_code,
+                )
+            };
+            let signature = sign_digest_der_from_seed(
+                seed,
+                signing_input.path,
+                &digest,
+                signing_input.sighash as u8,
+            )
+            .ok_or(TxSignError::Unsupported)?;
+            signatures.push(signature);
+        }
+
+        Ok(signatures)
+    }
+
     struct PsbtEntry<'a> {
         key: &'a [u8],
         value: &'a [u8],
@@ -1226,6 +1306,69 @@ pub mod pure_rust {
         }
         let lock_time = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
 
+        (pos == tx.len()).then_some(BitcoinTxView {
+            version,
+            lock_time,
+            inputs,
+            outputs,
+        })
+    }
+
+    fn bitcoin_transaction_view(tx: &[u8]) -> Option<BitcoinTxView<'_>> {
+        let mut pos = 0;
+        let version = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+        let has_witness = match tx.get(pos).copied() {
+            Some(0) => {
+                pos += 1;
+                if super::read_exact_opt(tx, &mut pos, 1)? != [1] {
+                    return None;
+                }
+                true
+            }
+            Some(_) => false,
+            None => return None,
+        };
+        let input_count = super::read_compact_size_opt(tx, &mut pos)?;
+        if input_count == 0 {
+            return None;
+        }
+
+        let mut inputs = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            let prev_txid =
+                <&[u8; SHA256_LEN]>::try_from(super::read_exact_opt(tx, &mut pos, SHA256_LEN)?)
+                    .ok()?;
+            let prev_vout = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
+            super::read_exact_opt(tx, &mut pos, script_len)?;
+            let sequence = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+            inputs.push(TxInputView {
+                prev_txid,
+                prev_vout,
+                sequence,
+            });
+        }
+
+        let output_count = super::read_compact_size_opt(tx, &mut pos)?;
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            let amount = le_u64(super::read_exact_opt(tx, &mut pos, 8)?)?;
+            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
+            let script = super::read_exact_opt(tx, &mut pos, script_len)?;
+            outputs.push(TxOutputView { amount, script });
+        }
+
+        if has_witness {
+            for _ in 0..input_count {
+                let item_count = super::read_compact_size_opt(tx, &mut pos)?;
+                for _ in 0..item_count {
+                    let item_len = super::read_compact_size_opt(tx, &mut pos)?;
+                    super::read_exact_opt(tx, &mut pos, item_len)?;
+                }
+            }
+        }
+
+        let lock_time = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
         (pos == tx.len()).then_some(BitcoinTxView {
             version,
             lock_time,

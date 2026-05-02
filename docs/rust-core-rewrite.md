@@ -108,6 +108,12 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   partial signatures for P2SH, P2WSH, and P2SH-P2WSH. Anti-exfil PSBT flows,
   script-path Taproot, full multisig finalization, and Liquid/PSET signing
   still defer to the transaction-signing milestone.
+- Bitcoin legacy `sign_tx` flow: Rust now has a stateful v1 `sign_tx` /
+  `tx_input` continuation path for non-anti-exfil Bitcoin transactions and a
+  pure-Rust transaction parser/sighash signer that matches the existing
+  single-sig P2PKH and single-input P2WPKH legacy-output fixtures. Anti-exfil
+  `tx_input` / `get_signature`, Taproot `sign_tx`, multisig `sign_tx`, and
+  Liquid `sign_liquid_tx` remain explicit defers.
 
 ## First Parity Gates
 
