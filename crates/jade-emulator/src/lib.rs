@@ -1944,7 +1944,7 @@ impl Emulator {
             };
         };
         if !is_liquid {
-            match jade_crypto::pure_rust::sign_bitcoin_psbt_p2pkh_from_seed(
+            match jade_crypto::pure_rust::sign_bitcoin_psbt_singlesig_from_seed(
                 &psbt,
                 seed,
                 &fingerprint,
@@ -4647,12 +4647,82 @@ mod tests {
     }
 
     #[test]
+    fn sign_psbt_signs_p2wpkh_wallet_inputs() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let fixture = include_str!("../../../test_data/psbt_ss_p2wpkh.json");
+        let psbt = fixture_psbt_base64(fixture);
+        let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: expected }
+        );
+    }
+
+    #[test]
+    fn sign_psbt_signs_p2sh_p2wpkh_wallet_inputs() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let fixture = include_str!("../../../test_data/psbt_ss_p2sh_p2wpkh.json");
+        let psbt = fixture_psbt_base64(fixture);
+        let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: expected }
+        );
+    }
+
+    #[test]
     fn sign_psbt_defers_for_unsupported_wallet_signature() {
         let mut emulator = Emulator::new();
         emulator
             .platform_mut()
             .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
-        let psbt = fixture_psbt_base64(include_str!("../../../test_data/psbt_ss_p2wpkh.json"));
+        let psbt = fixture_psbt_base64(include_str!(
+            "../../../test_data/psbt_ss_p2tr_default_all.json"
+        ));
 
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
