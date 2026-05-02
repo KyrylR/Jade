@@ -2173,6 +2173,16 @@ impl Emulator {
                 message: "Unexpected method".to_string(),
             };
         };
+        if input.path.is_some()
+            && ae_host_entropy.is_some_and(|entropy| {
+                !entropy.is_empty() && entropy.len() != jade_crypto::SHA256_LEN
+            })
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Failed to extract valid host entropy from parameters".to_string(),
+            };
+        }
         let signature = if input.path.is_none() {
             Vec::new()
         } else if input.ae_host_commitment.is_some() {
@@ -5156,6 +5166,10 @@ mod tests {
     }
 
     fn get_signature_params_with_entropy(host_entropy: &[u8; jade_crypto::SHA256_LEN]) -> Vec<u8> {
+        get_signature_params_with_raw_entropy(host_entropy)
+    }
+
+    fn get_signature_params_with_raw_entropy(host_entropy: &[u8]) -> Vec<u8> {
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
             .map(1)
@@ -5681,6 +5695,64 @@ mod tests {
             emulator.handle_v1_request(&second_signature_request),
             V1Outcome::BytesResult {
                 result: decode_hex_vec(expected[3])
+            }
+        );
+    }
+
+    #[test]
+    fn sign_tx_staged_flow_rejects_wrong_size_anti_exfil_entropy() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let fixture = include_str!("../../../test_data/tx_ss_bad_ae_4.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let script = decode_hex_vec(fixture_hex_values(fixture, "script")[0]);
+        let host_commitment =
+            decode_hex("ee3dfd0944dcfb10b6ecf8ae4df1ba2c179cfb4a0cf0e4f20c39317891862c8a");
+
+        let start_params = sign_tx_start_params(&txn, 1, true);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let input_params = sign_tx_input_params_with_ae(
+            true,
+            &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 2],
+            &script,
+            Some(10_000),
+            None,
+            &host_commitment,
+        );
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert!(matches!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult { result } if result.len() == 33
+        ));
+
+        let wrong_size_entropy =
+            decode_hex_vec("9e02c7553f61576b17df8983fefd0f3dcbca289c34ebb52e1b9e67f9d4f549");
+        let signature_params = get_signature_params_with_raw_entropy(&wrong_size_entropy);
+        let signature_request = Request {
+            id: Cow::Borrowed("sig"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&signature_request),
+            V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Failed to extract valid host entropy from parameters".to_string()
             }
         );
     }

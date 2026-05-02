@@ -128,9 +128,10 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   Bitcoin anti-exfil `sign_tx` now returns signer commitments from `tx_input`
   and DER signatures from `get_signature`, matching the P2WSH and multi-input
   legacy P2PKH anti-exfil fixtures, including empty responses for pathless
-  inputs. PSBT anti-exfil, Taproot anti-exfil signing, registered/generic
-  multisig policy validation, and Liquid `sign_liquid_tx` remain explicit
-  defers.
+  inputs. Bad anti-exfil host-entropy lengths now return the v1-compatible
+  protocol error before the commitment/entropy consistency check. PSBT
+  anti-exfil, Taproot anti-exfil signing, registered/generic multisig policy
+  validation, and Liquid `sign_liquid_tx` remain explicit defers.
 
 ## First Parity Gates
 
