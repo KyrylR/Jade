@@ -155,6 +155,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_shared_nonce" => {
                 self.shared_nonce_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_blinding_factor" => {
+                self.blinding_factor_result(request)
+            }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
@@ -664,6 +667,64 @@ impl Emulator {
             V1Outcome::BytesResult {
                 result: shared_nonce.to_vec(),
             }
+        }
+    }
+
+    fn blinding_factor_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let hash_prevouts = match params.bytes("hash_prevouts") {
+            Ok(Some(hash_prevouts)) if hash_prevouts.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(hash_prevouts);
+                bytes
+            }
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract hash_prevouts from parameters");
+            }
+        };
+        let output_index = match params.u64("output_index") {
+            Ok(Some(index)) if index <= u32::MAX as u64 => index as u32,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract output index from parameters")
+            }
+        };
+        let kind = match params.str("type") {
+            Ok(Some("ASSET_AND_VALUE")) => jade_crypto::BlindingFactorKind::AssetAndValue,
+            Ok(Some("ASSET")) => jade_crypto::BlindingFactorKind::Asset,
+            Ok(Some("VALUE")) => jade_crypto::BlindingFactorKind::Value,
+            Ok(Some(_)) => {
+                return bad_parameters(
+                    "Invalid blinding factor type - must be either 'ASSET', 'VALUE' or 'ASSET_AND_VALUE'",
+                );
+            }
+            Ok(None) | Err(_) => {
+                return bad_parameters("Cannot extract blinding factor type from parameters");
+            }
+        };
+        let master_unblinding_key = match self.master_unblinding_key_for_params(params) {
+            Ok(key) => key,
+            Err(outcome) => return outcome,
+        };
+
+        let Some(blinding_factor) = jade_crypto::pure_rust::deterministic_blinding_factor(
+            &master_unblinding_key,
+            &hash_prevouts,
+            output_index,
+            kind,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Cannot get blinding factor for output".to_string(),
+            };
+        };
+
+        V1Outcome::BytesResult {
+            result: blinding_factor.as_slice().to_vec(),
         }
     }
 
@@ -2396,6 +2457,213 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Failed to extract valid pubkey flag from parameters".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn get_blinding_factor_derives_asset_and_value_factors() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x11; 64]);
+        let hash_prevouts = [0x22; jade_crypto::SHA256_LEN];
+        let expected = jade_crypto::pure_rust::deterministic_blinding_factor(
+            &[0x11; 64],
+            &hash_prevouts,
+            5,
+            jade_crypto::BlindingFactorKind::AssetAndValue,
+        )
+        .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("hash_prevouts")
+            .unwrap()
+            .bytes(&hash_prevouts)
+            .unwrap()
+            .str("output_index")
+            .unwrap()
+            .u8(5)
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("ASSET_AND_VALUE")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("bf"),
+            method: Cow::Borrowed("get_blinding_factor"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: expected.as_slice().to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn get_blinding_factor_uses_registered_multisig_master_key_when_named() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_master_unblinding_key([0; 64]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 1, 1]);
+        payload.push(MULTISIG_MASTER_BLINDING_KEY_SIZE as u8);
+        payload.extend_from_slice(&[0x77; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        payload.push(1);
+        payload.extend_from_slice(&[0; 4]);
+        payload.push(0);
+        payload.extend_from_slice(&[1; BIP32_SERIALIZED_LEN]);
+        payload.push(0);
+        emulator
+            .storage_mut()
+            .set_multisig_registration("liquid-b", &authenticated_record(payload))
+            .unwrap();
+
+        let hash_prevouts = [0x88; jade_crypto::SHA256_LEN];
+        let mut padded_key = [0u8; 64];
+        padded_key[32..64].copy_from_slice(&[0x77; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        let expected = jade_crypto::pure_rust::deterministic_blinding_factor(
+            &padded_key,
+            &hash_prevouts,
+            9,
+            jade_crypto::BlindingFactorKind::Asset,
+        )
+        .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("hash_prevouts")
+            .unwrap()
+            .bytes(&hash_prevouts)
+            .unwrap()
+            .str("output_index")
+            .unwrap()
+            .u8(9)
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("ASSET")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("liquid-b")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("bf"),
+            method: Cow::Borrowed("get_blinding_factor"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: expected.as_slice().to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn raw_v1_get_blinding_factor_returns_bytes() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x33; 64]);
+        let hash_prevouts = [0x44; jade_crypto::SHA256_LEN];
+
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("b")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_blinding_factor")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(3)
+            .unwrap()
+            .str("hash_prevouts")
+            .unwrap()
+            .bytes(&hash_prevouts)
+            .unwrap()
+            .str("output_index")
+            .unwrap()
+            .u8(2)
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("VALUE")
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut result = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "b"),
+                "result" => result = Some(decoder.bytes().unwrap()),
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(result.map(|bytes| bytes.len()), Some(32));
+    }
+
+    #[test]
+    fn get_blinding_factor_rejects_bad_parameters() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("bf"),
+            method: Cow::Borrowed("get_blinding_factor"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("hash_prevouts")
+            .unwrap()
+            .bytes(&[0x44; jade_crypto::SHA256_LEN])
+            .unwrap()
+            .str("output_index")
+            .unwrap()
+            .u8(2)
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("BOGUS")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("bf"),
+            method: Cow::Borrowed("get_blinding_factor"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Invalid blinding factor type - must be either 'ASSET', 'VALUE' or 'ASSET_AND_VALUE'".to_string(),
             }
         );
     }

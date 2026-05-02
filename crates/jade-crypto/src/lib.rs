@@ -63,9 +63,31 @@ pub trait Bip85RsaCompatibility {
     ) -> Result<alloc::vec::Vec<u8>, Self::Error>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindingFactorKind {
+    Asset,
+    Value,
+    AssetAndValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindingFactorBytes {
+    bytes: [u8; SHA256_LEN * 2],
+    len: usize,
+}
+
+impl BlindingFactorBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
-    use super::{EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN};
+    use super::{
+        BlindingFactorBytes, BlindingFactorKind, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN,
+        SHA256_LEN,
+    };
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -113,6 +135,50 @@ pub mod pure_rust {
         let ecdh_hash = Sha256::digest(shared_point.as_bytes());
         let nonce_hash = Sha256::digest(ecdh_hash.as_slice());
         nonce_hash.as_slice().try_into().ok()
+    }
+
+    pub fn deterministic_blinding_factor(
+        master_unblinding_key: &[u8; 64],
+        hash_prevouts: &[u8; SHA256_LEN],
+        output_index: u32,
+        kind: BlindingFactorKind,
+    ) -> Option<BlindingFactorBytes> {
+        let mut mac = HmacSha256::new_from_slice(&master_unblinding_key[32..64]).ok()?;
+        mac.update(hash_prevouts);
+        let base = mac.finalize().into_bytes();
+
+        let mut output = BlindingFactorBytes {
+            bytes: [0; SHA256_LEN * 2],
+            len: 0,
+        };
+        let mut message = [0u8, b'B', b'F', 0, 0, 0, 0];
+        message[3..7].copy_from_slice(&output_index.to_be_bytes());
+
+        if matches!(
+            kind,
+            BlindingFactorKind::Asset | BlindingFactorKind::AssetAndValue
+        ) {
+            message[0] = b'A';
+            let mut mac = HmacSha256::new_from_slice(base.as_slice()).ok()?;
+            mac.update(&message);
+            output.bytes[output.len..output.len + SHA256_LEN]
+                .copy_from_slice(mac.finalize().into_bytes().as_slice());
+            output.len += SHA256_LEN;
+        }
+
+        if matches!(
+            kind,
+            BlindingFactorKind::Value | BlindingFactorKind::AssetAndValue
+        ) {
+            message[0] = b'V';
+            let mut mac = HmacSha256::new_from_slice(base.as_slice()).ok()?;
+            mac.update(&message);
+            output.bytes[output.len..output.len + SHA256_LEN]
+                .copy_from_slice(mac.finalize().into_bytes().as_slice());
+            output.len += SHA256_LEN;
+        }
+
+        Some(output)
     }
 }
 
@@ -168,6 +234,57 @@ mod tests {
         assert_eq!(
             pure_rust::ecdh_nonce_hash(&private_key, &peer_public_key),
             None
+        );
+    }
+
+    #[test]
+    fn deterministic_blinding_factor_matches_wally_hmac_layout() {
+        let master = [0x11; 64];
+        let hash_prevouts = [0x22; SHA256_LEN];
+
+        assert_eq!(
+            pure_rust::deterministic_blinding_factor(
+                &master,
+                &hash_prevouts,
+                5,
+                BlindingFactorKind::Asset
+            )
+            .unwrap()
+            .as_slice(),
+            &[
+                0xc8, 0xa0, 0xa1, 0x77, 0x26, 0xfb, 0xcc, 0xa8, 0x0f, 0x97, 0xd5, 0x65, 0x5b, 0xc0,
+                0xd0, 0xf5, 0x97, 0xbe, 0x99, 0xe2, 0xd4, 0xb4, 0xcf, 0xec, 0x95, 0xfa, 0x7b, 0x70,
+                0x9b, 0x20, 0xbc, 0xdc,
+            ]
+        );
+
+        assert_eq!(
+            pure_rust::deterministic_blinding_factor(
+                &master,
+                &hash_prevouts,
+                5,
+                BlindingFactorKind::Value
+            )
+            .unwrap()
+            .as_slice(),
+            &[
+                0xe4, 0x53, 0xd4, 0xd9, 0x71, 0xbf, 0x08, 0x87, 0x69, 0xf0, 0x58, 0x08, 0xc9, 0x35,
+                0xd5, 0x26, 0x2e, 0xbc, 0xbb, 0xc0, 0xe1, 0xe7, 0x6a, 0x9e, 0x17, 0xde, 0xfb, 0x5a,
+                0xf1, 0xa4, 0x85, 0x1b,
+            ]
+        );
+
+        assert_eq!(
+            pure_rust::deterministic_blinding_factor(
+                &master,
+                &hash_prevouts,
+                5,
+                BlindingFactorKind::AssetAndValue
+            )
+            .unwrap()
+            .as_slice()
+            .len(),
+            SHA256_LEN * 2
         );
     }
 }
