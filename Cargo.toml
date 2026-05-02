@@ -18,7 +18,7 @@ repository = "https://github.com/Blockstream/Jade"
 rust-version = "1.81"
 
 [workspace.dependencies]
-aes = { version = "0.9", default-features = false }
+aes = { version = "0.8", default-features = false }
 base58ck = { version = "0.1", default-features = false }
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 bip32 = { version = "0.5", default-features = false, features = ["alloc", "secp256k1"] }

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [features]
 default = []
 pure-rust-curves = [
+    "dep:aes",
     "dep:base58ck",
     "dep:bech32",
     "dep:bip32",
@@ -18,6 +19,7 @@ pure-rust-curves = [
 ]
 
 [dependencies]
+aes = { workspace = true, optional = true }
 base58ck = { workspace = true, optional = true }
 bech32 = { workspace = true, optional = true }
 bip32 = { workspace = true, optional = true }

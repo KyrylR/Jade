@@ -116,6 +116,12 @@ pub struct IdentitySignature {
     pub signature: [u8; 65],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bip85EncryptedEntropy {
+    pub pubkey: [u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    pub encrypted: alloc::vec::Vec<u8>,
+}
+
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
     if !matches!(seed.len(), 16 | 32 | 64) {
         return None;
@@ -141,10 +147,12 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
     use super::{
-        BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind, IdentityKeyType,
-        SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN,
-        SHA256_LEN,
+        Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
+        IdentityKeyType, SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN,
+        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN,
     };
+    use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
+    use aes::{Aes256, Block};
     use alloc::string::String;
     use alloc::vec::Vec;
     use hmac::{Hmac, KeyInit, Mac};
@@ -232,6 +240,30 @@ pub mod pure_rust {
         let mut mac = HmacSha512::new_from_slice(b"bip-entropy-from-k").ok()?;
         mac.update(private_key.to_bytes().as_ref());
         Some(mac.finalize().into_bytes()[..entropy_len].to_vec())
+    }
+
+    pub fn bip85_bip39_encrypted_entropy_from_seed(
+        seed: &[u8],
+        nwords: usize,
+        index: u32,
+        host_pubkey: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        ephemeral_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        iv: &[u8; 16],
+    ) -> Option<Bip85EncryptedEntropy> {
+        let entropy = bip85_bip39_entropy_from_seed(seed, nwords, index)?;
+        let ephemeral_pubkey = public_key_from_private_key(ephemeral_private_key)?;
+        let encrypted = wally_aes_cbc_with_ecdh_key_encrypt(
+            ephemeral_private_key,
+            iv,
+            &entropy,
+            host_pubkey,
+            b"bip85_bip39_entropy",
+        )?;
+
+        Some(Bip85EncryptedEntropy {
+            pubkey: ephemeral_pubkey,
+            encrypted,
+        })
     }
 
     pub fn identity_public_key_from_seed(
@@ -546,6 +578,77 @@ pub mod pure_rust {
         output.copy_from_slice(&digest);
         output
     }
+
+    fn wally_aes_cbc_with_ecdh_key_encrypt(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        iv: &[u8; 16],
+        payload: &[u8],
+        peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        label: &[u8],
+    ) -> Option<Vec<u8>> {
+        if payload.is_empty() || label.is_empty() {
+            return None;
+        }
+
+        let secret = secp256k1_ecdh_secret(private_key, peer_public_key)?;
+        let mut mac = HmacSha512::new_from_slice(&secret).ok()?;
+        mac.update(label);
+        let keys = mac.finalize().into_bytes();
+        let enc_key = &keys[..32];
+        let hmac_key = &keys[32..64];
+
+        let cipher = Aes256::new_from_slice(enc_key).ok()?;
+        let mut previous = *iv;
+        let mut output = Vec::with_capacity(16 + ((payload.len() / 16) + 1) * 16 + 32);
+        output.extend_from_slice(iv);
+
+        let full_blocks = payload.len() / 16;
+        for block_index in 0..full_blocks {
+            let mut xored = [0u8; 16];
+            xored.copy_from_slice(&payload[block_index * 16..block_index * 16 + 16]);
+            for (byte, previous_byte) in xored.iter_mut().zip(previous) {
+                *byte ^= previous_byte;
+            }
+            let mut block = Block::default();
+            block.copy_from_slice(&xored);
+            cipher.encrypt_block(&mut block);
+            previous.copy_from_slice(&block);
+            output.extend_from_slice(&block);
+        }
+
+        let remainder = payload.len() % 16;
+        let padding = (16 - remainder) as u8;
+        let mut final_block = [padding; 16];
+        final_block[..remainder].copy_from_slice(&payload[full_blocks * 16..]);
+        for (byte, previous_byte) in final_block.iter_mut().zip(previous) {
+            *byte ^= previous_byte;
+        }
+        let mut block = Block::default();
+        block.copy_from_slice(&final_block);
+        cipher.encrypt_block(&mut block);
+        output.extend_from_slice(&block);
+
+        let mut hmac = HmacSha256::new_from_slice(hmac_key).ok()?;
+        hmac.update(&output);
+        output.extend_from_slice(&hmac.finalize().into_bytes());
+        Some(output)
+    }
+
+    fn secp256k1_ecdh_secret(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<[u8; SHA256_LEN]> {
+        let secret = SecretKey::from_slice(private_key).ok()?;
+        let peer = PublicKey::from_sec1_bytes(peer_public_key).ok()?;
+        let shared_point = (ProjectivePoint::from(*peer.as_affine())
+            * secret.to_nonzero_scalar().as_ref())
+        .to_affine()
+        .to_encoded_point(true);
+        Sha256::digest(shared_point.as_bytes())
+            .as_slice()
+            .try_into()
+            .ok()
+    }
 }
 
 #[cfg(all(test, feature = "pure-rust-curves"))]
@@ -711,6 +814,40 @@ mod tests {
             pure_rust::bip85_bip39_entropy_from_seed(&seed, 12, 0x8000_0000),
             None
         );
+    }
+
+    #[test]
+    fn bip85_bip39_encrypted_entropy_uses_wally_envelope_shape() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+        let host_pubkey =
+            decode_hex_33("03e581be89d1ef8ce11d60746d08e4f8aedf934d1d861dd436042ee2e3b16db918");
+        let ephemeral_private_key =
+            decode_hex_32("0b6b3dc90d203d854100110788ac87d43aa00620c9cdb361b281b09022ef4b53");
+        let iv = [
+            0xbd, 0x5d, 0x47, 0x24, 0x24, 0x38, 0x80, 0x73, 0x8e, 0x7e, 0x8b, 0x0c, 0x02, 0x65,
+            0x87, 0x00,
+        ];
+
+        let encrypted = pure_rust::bip85_bip39_encrypted_entropy_from_seed(
+            &seed,
+            12,
+            0,
+            &host_pubkey,
+            &ephemeral_private_key,
+            &iv,
+        )
+        .unwrap();
+
+        assert_eq!(
+            encrypted.pubkey,
+            decode_hex_33("03ff06999ad61c0f3a733b93fc1e6b75ecfb1439b326e840de590a56454f0eeb0d")
+        );
+        assert_eq!(encrypted.encrypted.len(), 80);
+        assert_eq!(&encrypted.encrypted[..16], &iv);
     }
 
     #[test]
@@ -946,6 +1083,16 @@ mod tests {
     fn decode_hex_65(input: &str) -> [u8; 65] {
         assert_eq!(input.len(), 130);
         let mut output = [0u8; 65];
+        let bytes = input.as_bytes();
+        for (index, output_byte) in output.iter_mut().enumerate() {
+            *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
+        }
+        output
+    }
+
+    fn decode_hex_33(input: &str) -> [u8; 33] {
+        assert_eq!(input.len(), 66);
+        let mut output = [0u8; 33];
         let bytes = input.as_bytes();
         for (index, output_byte) in output.iter_mut().enumerate() {
             *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);

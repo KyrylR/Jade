@@ -152,6 +152,9 @@ impl Emulator {
             Some(MethodClass::Debug) if request.method == "debug_set_mnemonic" => {
                 self.debug_set_mnemonic(request)
             }
+            Some(MethodClass::Debug) if request.method == "get_bip85_bip39_entropy" => {
+                self.bip85_bip39_entropy_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_registered_multisigs" => {
                 self.registered_wallets_result(StorageNamespace::Multisig, "multisig")
             }
@@ -190,6 +193,12 @@ impl Emulator {
             }
             Some(MethodClass::Authenticated) if request.method == "get_blinding_factor" => {
                 self.blinding_factor_result(request)
+            }
+            Some(MethodClass::Authenticated) if request.method == "show_bip85_bip39_entropy" => {
+                match self.bip85_bip39_entropy_data(request) {
+                    Ok(_) => V1Outcome::BoolResult { result: true },
+                    Err(outcome) => outcome,
+                }
             }
             Some(MethodClass::Continuation) if request.method == "ota_data" => {
                 self.handle_ota_data(request)
@@ -869,6 +878,82 @@ impl Emulator {
                 },
             ],
         }
+    }
+
+    fn bip85_bip39_entropy_result(&self, request: &Request<'_>) -> V1Outcome {
+        match self.bip85_bip39_entropy_data(request) {
+            Ok(data) => V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "pubkey".to_string(),
+                        value: OwnedV1Value::Bytes(data.pubkey.to_vec()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "encrypted".to_string(),
+                        value: OwnedV1Value::Bytes(data.encrypted),
+                    },
+                ],
+            },
+            Err(outcome) => outcome,
+        }
+    }
+
+    fn bip85_bip39_entropy_data(
+        &self,
+        request: &Request<'_>,
+    ) -> Result<jade_crypto::Bip85EncryptedEntropy, V1Outcome> {
+        let Some(params) = request.params() else {
+            return Err(V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            });
+        };
+        let nwords = match params.u64("num_words") {
+            Ok(Some(12)) => 12,
+            Ok(Some(24)) => 24,
+            Ok(_) | Err(_) => {
+                return Err(bad_parameters(
+                    "Failed to fetch valid number of words from message",
+                ));
+            }
+        };
+        let index = match params.u64("index") {
+            Ok(Some(index)) if index <= 0x7fff_ffff => index as u32,
+            Ok(_) | Err(_) => {
+                return Err(bad_parameters("Failed to fetch valid index from message"));
+            }
+        };
+        let host_pubkey = match params.bytes("pubkey") {
+            Ok(Some(bytes)) => {
+                match <&[u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN]>::try_from(bytes) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Err(bad_parameters("Failed to fetch valid pubkey from message"));
+                    }
+                }
+            }
+            Ok(None) | Err(_) => {
+                return Err(bad_parameters("Failed to fetch valid pubkey from message"));
+            }
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return Err(V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to calculate bip85 entropy from parameters".to_string(),
+            });
+        };
+        jade_crypto::pure_rust::bip85_bip39_encrypted_entropy_from_seed(
+            seed,
+            nwords,
+            index,
+            host_pubkey,
+            &self.platform.bip85_ephemeral_private_key,
+            &self.platform.bip85_iv,
+        )
+        .ok_or_else(|| V1Outcome::Reject {
+            code: ErrorCode::InternalError,
+            message: "Failed to encrypt bip85 entropy".to_string(),
+        })
     }
 
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -1639,6 +1724,8 @@ pub struct HostPlatform {
     epoch: Option<u64>,
     wallet_seed: Option<Vec<u8>>,
     master_unblinding_key: [u8; 64],
+    bip85_ephemeral_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
+    bip85_iv: [u8; 16],
     confirm_export_blinding_key: bool,
 }
 
@@ -1650,6 +1737,15 @@ impl Default for HostPlatform {
             epoch: None,
             wallet_seed: None,
             master_unblinding_key: [0; 64],
+            bip85_ephemeral_private_key: [
+                0x0b, 0x6b, 0x3d, 0xc9, 0x0d, 0x20, 0x3d, 0x85, 0x41, 0x00, 0x11, 0x07, 0x88, 0xac,
+                0x87, 0xd4, 0x3a, 0xa0, 0x06, 0x20, 0xc9, 0xcd, 0xb3, 0x61, 0xb2, 0x81, 0xb0, 0x90,
+                0x22, 0xef, 0x4b, 0x53,
+            ],
+            bip85_iv: [
+                0xbd, 0x5d, 0x47, 0x24, 0x24, 0x38, 0x80, 0x73, 0x8e, 0x7e, 0x8b, 0x0c, 0x02, 0x65,
+                0x87, 0x00,
+            ],
             confirm_export_blinding_key: false,
         }
     }
@@ -3021,6 +3117,113 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn get_bip85_bip39_entropy_returns_encrypted_reply() {
+        let mut emulator = Emulator::new();
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(mnemonic.to_seed("").to_vec());
+
+        let host_pubkey =
+            decode_hex::<33>("03e581be89d1ef8ce11d60746d08e4f8aedf934d1d861dd436042ee2e3b16db918");
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("num_words")
+            .unwrap()
+            .u64(12)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .str("pubkey")
+            .unwrap()
+            .bytes(&host_pubkey)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_bip85_bip39_entropy"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "pubkey".to_string(),
+                        value: OwnedV1Value::Bytes(
+                            decode_hex::<33>(
+                                "03ff06999ad61c0f3a733b93fc1e6b75ecfb1439b326e840de590a56454f0eeb0d"
+                            )
+                            .to_vec()
+                        ),
+                    },
+                    OwnedResultMapEntry {
+                        key: "encrypted".to_string(),
+                        value: OwnedV1Value::Bytes(vec![
+                            0xbd, 0x5d, 0x47, 0x24, 0x24, 0x38, 0x80, 0x73, 0x8e, 0x7e, 0x8b,
+                            0x0c, 0x02, 0x65, 0x87, 0x00, 0xa9, 0x05, 0x2e, 0xdf, 0xad, 0xb5,
+                            0x0f, 0xf7, 0xa8, 0x42, 0x69, 0x69, 0x8a, 0x08, 0xd3, 0x35, 0x8f,
+                            0xb4, 0x06, 0xe8, 0xfa, 0xd7, 0xac, 0x1e, 0x90, 0xb0, 0x82, 0x6f,
+                            0xcd, 0xc8, 0xfd, 0xd3, 0xb8, 0x55, 0x68, 0xd9, 0x58, 0x5d, 0xf6,
+                            0xe4, 0x1c, 0x87, 0x7b, 0x11, 0x9f, 0xd5, 0xdb, 0x72, 0x6b, 0x21,
+                            0x70, 0xdf, 0xf8, 0x66, 0x99, 0xe7, 0x58, 0x5e, 0x5a, 0x35, 0x39,
+                            0xbe, 0x5d, 0x4f,
+                        ]),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn show_bip85_bip39_entropy_returns_ok_after_generating_payload() {
+        let mut emulator = Emulator::new();
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(mnemonic.to_seed("").to_vec());
+
+        let host_pubkey =
+            decode_hex::<33>("03e581be89d1ef8ce11d60746d08e4f8aedf934d1d861dd436042ee2e3b16db918");
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("num_words")
+            .unwrap()
+            .u64(24)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .str("pubkey")
+            .unwrap()
+            .bytes(&host_pubkey)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("show_bip85_bip39_entropy"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
         );
     }
 
