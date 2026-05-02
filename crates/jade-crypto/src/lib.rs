@@ -814,22 +814,34 @@ pub mod pure_rust {
 
         let mut pos = 5;
         let global = parsed_psbt_map(psbt, &mut pos)?;
-        let tx_version = global
-            .single_value(0x02)
-            .and_then(le_u32)
-            .ok_or(PsbtSignError::Unsupported)?;
-        let lock_time = global.single_value(0x03).and_then(le_u32).unwrap_or(0);
-        let input_count = global
-            .single_value(0x04)
-            .and_then(compact_size_value)
-            .ok_or(PsbtSignError::Unsupported)?;
-        let output_count = global
-            .single_value(0x05)
-            .and_then(compact_size_value)
-            .ok_or(PsbtSignError::Unsupported)?;
-        if global.single_value(0x00).is_some() {
-            return Err(PsbtSignError::Unsupported);
-        }
+        let unsigned_tx_view = global
+            .single_value(0x00)
+            .map(|tx| bitcoin_unsigned_tx_view(tx).ok_or(PsbtSignError::Invalid))
+            .transpose()?;
+        let (tx_version, lock_time, input_count, output_count) =
+            if let Some(view) = &unsigned_tx_view {
+                (
+                    view.version,
+                    view.lock_time,
+                    view.inputs.len(),
+                    view.outputs.len(),
+                )
+            } else {
+                let tx_version = global
+                    .single_value(0x02)
+                    .and_then(le_u32)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                let lock_time = global.single_value(0x03).and_then(le_u32).unwrap_or(0);
+                let input_count = global
+                    .single_value(0x04)
+                    .and_then(compact_size_value)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                let output_count = global
+                    .single_value(0x05)
+                    .and_then(compact_size_value)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                (tx_version, lock_time, input_count, output_count)
+            };
 
         let mut inputs = Vec::with_capacity(input_count);
         for _ in 0..input_count {
@@ -844,48 +856,69 @@ pub mod pure_rust {
         }
 
         let mut tx_outputs = Vec::with_capacity(outputs.len());
-        for output in &outputs {
-            let amount = output
-                .single_value(0x03)
-                .and_then(le_u64)
-                .ok_or(PsbtSignError::Unsupported)?;
-            let script = output
-                .single_value(0x04)
-                .ok_or(PsbtSignError::Unsupported)?;
-            tx_outputs.push(TxOutputView { amount, script });
+        if let Some(view) = &unsigned_tx_view {
+            tx_outputs.extend_from_slice(&view.outputs);
+        } else {
+            for output in &outputs {
+                let amount = output
+                    .single_value(0x03)
+                    .and_then(le_u64)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                let script = output
+                    .single_value(0x04)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                tx_outputs.push(TxOutputView { amount, script });
+            }
         }
 
         let mut tx_inputs = Vec::with_capacity(inputs.len());
         let mut prev_scripts = Vec::with_capacity(inputs.len());
-        for input in &inputs {
-            let prev_tx = input.single_value(0x00).ok_or(PsbtSignError::Unsupported)?;
-            let prev_txid = input
-                .single_value(0x0e)
-                .and_then(|value| <&[u8; SHA256_LEN]>::try_from(value).ok())
-                .ok_or(PsbtSignError::Unsupported)?;
-            let prev_vout = input
-                .single_value(0x0f)
-                .and_then(le_u32)
-                .ok_or(PsbtSignError::Unsupported)?;
-            let sequence = input
-                .single_value(0x10)
-                .and_then(le_u32)
-                .unwrap_or(u32::MAX);
-            let sighash = input.single_value(0x03).and_then(le_u32).unwrap_or(1);
-            if sighash != 1 {
-                return Err(PsbtSignError::Unsupported);
+        if let Some(view) = &unsigned_tx_view {
+            tx_inputs.extend_from_slice(&view.inputs);
+            for (input, tx_input) in inputs.iter().zip(&view.inputs) {
+                let sighash = input.single_value(0x03).and_then(le_u32).unwrap_or(1);
+                if sighash != 1 {
+                    return Err(PsbtSignError::Unsupported);
+                }
+                let prev_tx = input.single_value(0x00).ok_or(PsbtSignError::Unsupported)?;
+                if &double_sha256(prev_tx) != tx_input.prev_txid {
+                    return Err(PsbtSignError::Invalid);
+                }
+                let prev_script = bitcoin_tx_output_script(prev_tx, tx_input.prev_vout as usize)
+                    .ok_or(PsbtSignError::Invalid)?;
+                prev_scripts.push(prev_script);
             }
-            if &double_sha256(prev_tx) != prev_txid {
-                return Err(PsbtSignError::Invalid);
+        } else {
+            for input in &inputs {
+                let prev_tx = input.single_value(0x00).ok_or(PsbtSignError::Unsupported)?;
+                let prev_txid = input
+                    .single_value(0x0e)
+                    .and_then(|value| <&[u8; SHA256_LEN]>::try_from(value).ok())
+                    .ok_or(PsbtSignError::Unsupported)?;
+                let prev_vout = input
+                    .single_value(0x0f)
+                    .and_then(le_u32)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                let sequence = input
+                    .single_value(0x10)
+                    .and_then(le_u32)
+                    .unwrap_or(u32::MAX);
+                let sighash = input.single_value(0x03).and_then(le_u32).unwrap_or(1);
+                if sighash != 1 {
+                    return Err(PsbtSignError::Unsupported);
+                }
+                if &double_sha256(prev_tx) != prev_txid {
+                    return Err(PsbtSignError::Invalid);
+                }
+                let prev_script = bitcoin_tx_output_script(prev_tx, prev_vout as usize)
+                    .ok_or(PsbtSignError::Invalid)?;
+                tx_inputs.push(TxInputView {
+                    prev_txid,
+                    prev_vout,
+                    sequence,
+                });
+                prev_scripts.push(prev_script);
             }
-            let prev_script = bitcoin_tx_output_script(prev_tx, prev_vout as usize)
-                .ok_or(PsbtSignError::Invalid)?;
-            tx_inputs.push(TxInputView {
-                prev_txid,
-                prev_vout,
-                sequence,
-            });
-            prev_scripts.push(prev_script);
         }
 
         let mut signatures = Vec::new();
@@ -979,12 +1012,21 @@ pub mod pure_rust {
         }
     }
 
+    struct BitcoinTxView<'a> {
+        version: u32,
+        lock_time: u32,
+        inputs: Vec<TxInputView<'a>>,
+        outputs: Vec<TxOutputView<'a>>,
+    }
+
+    #[derive(Clone, Copy)]
     struct TxInputView<'a> {
         prev_txid: &'a [u8; SHA256_LEN],
         prev_vout: u32,
         sequence: u32,
     }
 
+    #[derive(Clone, Copy)]
     struct TxOutputView<'a> {
         amount: u64,
         script: &'a [u8],
@@ -1071,6 +1113,51 @@ pub mod pure_rust {
     fn double_sha256(bytes: &[u8]) -> [u8; SHA256_LEN] {
         let first = Sha256::digest(bytes);
         Sha256::digest(first).into()
+    }
+
+    fn bitcoin_unsigned_tx_view(tx: &[u8]) -> Option<BitcoinTxView<'_>> {
+        let mut pos = 0;
+        let version = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+        let input_count = super::read_compact_size_opt(tx, &mut pos)?;
+        if input_count == 0 {
+            return None;
+        }
+
+        let mut inputs = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            let prev_txid =
+                <&[u8; SHA256_LEN]>::try_from(super::read_exact_opt(tx, &mut pos, SHA256_LEN)?)
+                    .ok()?;
+            let prev_vout = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
+            if script_len != 0 {
+                return None;
+            }
+            super::read_exact_opt(tx, &mut pos, script_len)?;
+            let sequence = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+            inputs.push(TxInputView {
+                prev_txid,
+                prev_vout,
+                sequence,
+            });
+        }
+
+        let output_count = super::read_compact_size_opt(tx, &mut pos)?;
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            let amount = le_u64(super::read_exact_opt(tx, &mut pos, 8)?)?;
+            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
+            let script = super::read_exact_opt(tx, &mut pos, script_len)?;
+            outputs.push(TxOutputView { amount, script });
+        }
+        let lock_time = le_u32(super::read_exact_opt(tx, &mut pos, 4)?)?;
+
+        (pos == tx.len()).then_some(BitcoinTxView {
+            version,
+            lock_time,
+            inputs,
+            outputs,
+        })
     }
 
     fn bitcoin_tx_output_script(tx: &[u8], output_index: usize) -> Option<&[u8]> {
