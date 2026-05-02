@@ -65,12 +65,13 @@ pub trait Bip85RsaCompatibility {
 
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
-    use super::{EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN};
+    use super::{EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN};
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::{ProjectivePoint, PublicKey, SecretKey};
     pub use p256;
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
 
     type HmacSha256 = Hmac<Sha256>;
 
@@ -97,6 +98,22 @@ pub mod pure_rust {
         let public_key = secret.public_key();
         public_key.to_encoded_point(true).as_bytes().try_into().ok()
     }
+
+    pub fn ecdh_nonce_hash(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<[u8; SHA256_LEN]> {
+        let secret = SecretKey::from_slice(private_key).ok()?;
+        let peer = PublicKey::from_sec1_bytes(peer_public_key).ok()?;
+        let shared_point = (ProjectivePoint::from(*peer.as_affine())
+            * secret.to_nonzero_scalar().as_ref())
+        .to_affine();
+        let shared_point = shared_point.to_encoded_point(true);
+
+        let ecdh_hash = Sha256::digest(shared_point.as_bytes());
+        let nonce_hash = Sha256::digest(ecdh_hash.as_slice());
+        nonce_hash.as_slice().try_into().ok()
+    }
 }
 
 #[cfg(all(test, feature = "pure-rust-curves"))]
@@ -122,6 +139,34 @@ mod tests {
     fn slip77_rejects_empty_scripts() {
         assert_eq!(
             pure_rust::slip77_blinding_private_key(&[0x11; 64], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn ecdh_nonce_hash_matches_libsecp_default_hash_then_wally_hash() {
+        let mut private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        private_key[EC_PRIVATE_KEY_LEN - 1] = 1;
+        let peer_public_key = pure_rust::public_key_from_private_key(&private_key).unwrap();
+
+        assert_eq!(
+            pure_rust::ecdh_nonce_hash(&private_key, &peer_public_key).unwrap(),
+            [
+                0xb1, 0xcd, 0x0a, 0x4e, 0xb6, 0xd1, 0xce, 0xa5, 0xeb, 0x28, 0x8f, 0xb4, 0x47, 0x4a,
+                0xc4, 0x03, 0xea, 0xb0, 0x44, 0x00, 0x4c, 0xc4, 0x8f, 0x12, 0xbc, 0xb4, 0xca, 0x83,
+                0x46, 0xd4, 0x87, 0xe1,
+            ]
+        );
+    }
+
+    #[test]
+    fn ecdh_nonce_hash_rejects_invalid_inputs() {
+        let mut private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        private_key[EC_PRIVATE_KEY_LEN - 1] = 1;
+        let peer_public_key = [0u8; EC_PUBLIC_KEY_COMPRESSED_LEN];
+
+        assert_eq!(
+            pure_rust::ecdh_nonce_hash(&private_key, &peer_public_key),
             None
         );
     }

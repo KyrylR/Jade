@@ -152,6 +152,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_blinding_key" => {
                 self.blinding_key_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_shared_nonce" => {
+                self.shared_nonce_result(request)
+            }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
@@ -575,6 +578,92 @@ impl Emulator {
 
         V1Outcome::BytesResult {
             result: public_key.to_vec(),
+        }
+    }
+
+    fn shared_nonce_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let script = match params.bytes("script") {
+            Ok(Some(script)) if !script.is_empty() => script,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract script from parameters");
+            }
+        };
+        let their_pubkey = match params.bytes("their_pubkey") {
+            Ok(Some(pubkey)) if pubkey.len() == jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN => {
+                let mut bytes = [0u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN];
+                bytes.copy_from_slice(pubkey);
+                bytes
+            }
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract their_pubkey from parameters");
+            }
+        };
+        let include_pubkey = if params.contains("include_pubkey").unwrap_or(false) {
+            match params.bool("include_pubkey") {
+                Ok(Some(include_pubkey)) => include_pubkey,
+                Ok(None) | Err(_) => {
+                    return bad_parameters("Failed to extract valid pubkey flag from parameters");
+                }
+            }
+        } else {
+            false
+        };
+
+        let master_unblinding_key = match self.master_unblinding_key_for_params(params) {
+            Ok(key) => key,
+            Err(outcome) => return outcome,
+        };
+        let Some(private_key) =
+            jade_crypto::pure_rust::slip77_blinding_private_key(&master_unblinding_key, script)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to compute hashed shared nonce value for the parameters"
+                    .to_string(),
+            };
+        };
+        let Some(shared_nonce) =
+            jade_crypto::pure_rust::ecdh_nonce_hash(&private_key, &their_pubkey)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to compute hashed shared nonce value for the parameters"
+                    .to_string(),
+            };
+        };
+
+        if include_pubkey {
+            let Some(blinding_key) =
+                jade_crypto::pure_rust::public_key_from_private_key(&private_key)
+            else {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to compute hashed shared nonce value for the parameters"
+                        .to_string(),
+                };
+            };
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "shared_nonce".to_string(),
+                        value: OwnedV1Value::Bytes(shared_nonce.to_vec()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "blinding_key".to_string(),
+                        value: OwnedV1Value::Bytes(blinding_key.to_vec()),
+                    },
+                ],
+            }
+        } else {
+            V1Outcome::BytesResult {
+                result: shared_nonce.to_vec(),
+            }
         }
     }
 
@@ -2094,6 +2183,219 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "No blinding key for multisig record".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn get_shared_nonce_derives_nonce_from_host_master_key() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x44; 64]);
+        let script = b"\x00\x14script";
+        let mut their_private_key = [0u8; jade_crypto::EC_PRIVATE_KEY_LEN];
+        their_private_key[jade_crypto::EC_PRIVATE_KEY_LEN - 1] = 1;
+        let their_pubkey =
+            jade_crypto::pure_rust::public_key_from_private_key(&their_private_key).unwrap();
+        let our_private =
+            jade_crypto::pure_rust::slip77_blinding_private_key(&[0x44; 64], script).unwrap();
+        let expected_nonce =
+            jade_crypto::pure_rust::ecdh_nonce_hash(&our_private, &their_pubkey).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("their_pubkey")
+            .unwrap()
+            .bytes(&their_pubkey)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("nonce"),
+            method: Cow::Borrowed("get_shared_nonce"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: expected_nonce.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn get_shared_nonce_can_include_our_blinding_public_key() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x55; 64]);
+        let script = b"\x00\x14script";
+        let mut their_private_key = [0u8; jade_crypto::EC_PRIVATE_KEY_LEN];
+        their_private_key[jade_crypto::EC_PRIVATE_KEY_LEN - 1] = 2;
+        let their_pubkey =
+            jade_crypto::pure_rust::public_key_from_private_key(&their_private_key).unwrap();
+        let our_private =
+            jade_crypto::pure_rust::slip77_blinding_private_key(&[0x55; 64], script).unwrap();
+        let expected_nonce =
+            jade_crypto::pure_rust::ecdh_nonce_hash(&our_private, &their_pubkey).unwrap();
+        let expected_blinding_key =
+            jade_crypto::pure_rust::public_key_from_private_key(&our_private).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("their_pubkey")
+            .unwrap()
+            .bytes(&their_pubkey)
+            .unwrap()
+            .str("include_pubkey")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("nonce"),
+            method: Cow::Borrowed("get_shared_nonce"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "shared_nonce".to_string(),
+                        value: OwnedV1Value::Bytes(expected_nonce.to_vec())
+                    },
+                    OwnedResultMapEntry {
+                        key: "blinding_key".to_string(),
+                        value: OwnedV1Value::Bytes(expected_blinding_key.to_vec())
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn raw_v1_get_shared_nonce_include_pubkey_returns_result_map() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x66; 64]);
+        let script = b"\x00\x14script";
+        let mut their_private_key = [0u8; jade_crypto::EC_PRIVATE_KEY_LEN];
+        their_private_key[jade_crypto::EC_PRIVATE_KEY_LEN - 1] = 3;
+        let their_pubkey =
+            jade_crypto::pure_rust::public_key_from_private_key(&their_private_key).unwrap();
+
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("n")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_shared_nonce")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(3)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("their_pubkey")
+            .unwrap()
+            .bytes(&their_pubkey)
+            .unwrap()
+            .str("include_pubkey")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut shared_nonce = None;
+        let mut blinding_key = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "n"),
+                "result" => {
+                    assert_eq!(decoder.map().unwrap(), Some(2));
+                    for _ in 0..2 {
+                        match decoder.str().unwrap() {
+                            "shared_nonce" => shared_nonce = Some(decoder.bytes().unwrap()),
+                            "blinding_key" => blinding_key = Some(decoder.bytes().unwrap()),
+                            _ => decoder.skip().unwrap(),
+                        }
+                    }
+                }
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(shared_nonce.map(|bytes| bytes.len()), Some(32));
+        assert_eq!(blinding_key.map(|bytes| bytes.len()), Some(33));
+    }
+
+    #[test]
+    fn get_shared_nonce_rejects_bad_parameters() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("nonce"),
+            method: Cow::Borrowed("get_shared_nonce"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(b"\x00\x14script")
+            .unwrap()
+            .str("their_pubkey")
+            .unwrap()
+            .bytes(&[0u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN])
+            .unwrap()
+            .str("include_pubkey")
+            .unwrap()
+            .u8(1)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("nonce"),
+            method: Cow::Borrowed("get_shared_nonce"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid pubkey flag from parameters".to_string(),
             }
         );
     }
