@@ -262,6 +262,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_blinding_factor" => {
                 self.blinding_factor_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_commitments" => {
+                self.commitments_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "show_bip85_bip39_entropy" => {
                 match self.bip85_bip39_entropy_data(request) {
                     Ok(_) => V1Outcome::BoolResult { result: true },
@@ -2536,6 +2539,75 @@ impl Emulator {
 
         V1Outcome::BytesResult {
             result: blinding_factor.as_slice().to_vec(),
+        }
+    }
+
+    fn commitments_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let _asset_id = match params.bytes("asset_id") {
+            Ok(Some(asset_id)) if asset_id.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(asset_id);
+                bytes
+            }
+            Ok(_) | Err(_) => return bad_parameters("Failed to extract asset_id from parameters"),
+        };
+        let _value = match params.u64("value") {
+            Ok(Some(value)) => value,
+            Ok(None) | Err(_) => return bad_parameters("Failed to extract value from parameters"),
+        };
+        let hash_prevouts = match params.bytes("hash_prevouts") {
+            Ok(Some(hash_prevouts)) if hash_prevouts.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(hash_prevouts);
+                bytes
+            }
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract hash_prevouts from parameters");
+            }
+        };
+        let output_index = match params.u64("output_index") {
+            Ok(Some(index)) if index <= u32::MAX as u64 => index as u32,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract output index from parameters")
+            }
+        };
+        let vbf = match cbor_map_bytes_or_null(params.raw(), "vbf") {
+            Ok(Some(vbf)) if vbf.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(vbf);
+                Some(bytes)
+            }
+            Ok(Some(_)) | Err(()) => {
+                return bad_parameters("Failed to extract vbf from parameters")
+            }
+            Ok(None) => None,
+        };
+        let master_unblinding_key = match self.master_unblinding_key_for_params(params) {
+            Ok(key) => key,
+            Err(outcome) => return outcome,
+        };
+        let kind = if vbf.is_some() {
+            jade_crypto::BlindingFactorKind::Asset
+        } else {
+            jade_crypto::BlindingFactorKind::AssetAndValue
+        };
+        let Some(_blinding_factor) = jade_crypto::pure_rust::deterministic_blinding_factor(
+            &master_unblinding_key,
+            &hash_prevouts,
+            output_index,
+            kind,
+        ) else {
+            return bad_parameters("Failed to compute abf/vbf from the parameters");
+        };
+
+        V1Outcome::DeferredToCore {
+            method: "get_commitments commitments".to_string(),
         }
     }
 
@@ -11096,6 +11168,102 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Invalid blinding factor type - must be either 'ASSET', 'VALUE' or 'ASSET_AND_VALUE'".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn get_commitments_validates_inputs_before_zkp_defer() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x99; 64]);
+        let asset_id = [0x11; jade_crypto::SHA256_LEN];
+        let hash_prevouts = [0x22; jade_crypto::SHA256_LEN];
+        let vbf = [0x33; jade_crypto::SHA256_LEN];
+
+        for maybe_vbf in [None, Some(&vbf[..])] {
+            let mut params = Vec::new();
+            let field_count = if maybe_vbf.is_some() { 5 } else { 4 };
+            let mut encoder = minicbor::Encoder::new(&mut params);
+            encoder
+                .map(field_count)
+                .unwrap()
+                .str("asset_id")
+                .unwrap()
+                .bytes(&asset_id)
+                .unwrap()
+                .str("value")
+                .unwrap()
+                .u64(9_000_000)
+                .unwrap()
+                .str("hash_prevouts")
+                .unwrap()
+                .bytes(&hash_prevouts)
+                .unwrap()
+                .str("output_index")
+                .unwrap()
+                .u8(1)
+                .unwrap();
+            if let Some(vbf) = maybe_vbf {
+                encoder.str("vbf").unwrap().bytes(vbf).unwrap();
+            }
+            let request = Request {
+                id: Cow::Borrowed("commitments"),
+                method: Cow::Borrowed("get_commitments"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::DeferredToCore {
+                    method: "get_commitments commitments".to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn get_commitments_rejects_bad_parameters_before_zkp_defer() {
+        let mut emulator = Emulator::new();
+        let asset_id = [0x11; jade_crypto::SHA256_LEN];
+        let hash_prevouts = [0x22; jade_crypto::SHA256_LEN];
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(5)
+            .unwrap()
+            .str("asset_id")
+            .unwrap()
+            .bytes(&asset_id)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u64(9_000_000)
+            .unwrap()
+            .str("hash_prevouts")
+            .unwrap()
+            .bytes(&hash_prevouts)
+            .unwrap()
+            .str("output_index")
+            .unwrap()
+            .u8(1)
+            .unwrap()
+            .str("vbf")
+            .unwrap()
+            .bytes(&[0x33; jade_crypto::SHA256_LEN - 1])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("commitments"),
+            method: Cow::Borrowed("get_commitments"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract vbf from parameters".to_string()
             }
         );
     }

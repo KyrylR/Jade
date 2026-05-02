@@ -101,7 +101,10 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   multisig confidential and unconfidential addresses. Liquid Taproot remains
   deferred because Elements uses a different taproot tweak.
 - Liquid key helpers: master blinding key export, script blinding key, shared
-  nonce, and deterministic blinding factors.
+  nonce, and deterministic blinding factors. `get_commitments` now performs
+  v1-compatible request validation and deterministic ABF/VBF derivation before
+  deferring the final asset-generator/value-commitment construction, which
+  remains blocked on an audited pure-Rust Elements/ZKP commitment backend.
 - PSBT/PSET signing front door: Rust now validates PSBT vs. PSET envelope
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
   no-op PSBT/PSET payloads unchanged when there is nothing to sign or wallet
