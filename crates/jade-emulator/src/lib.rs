@@ -4,14 +4,14 @@ use std::string::String;
 use std::vec::Vec;
 
 use jade_core::{
-    CoreError, CoreResult, CoreState, NetworkRestriction, OperationState, Platform,
-    VersionDebugInfo, VersionInfo, WalletLifecycle,
+    bip32_path::MAX_PATH_LEN, CoreError, CoreResult, CoreState, NetworkRestriction, OperationState,
+    Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
 };
 use jade_protocol_v1::{
     decode_request, encode_bool_result, encode_bytes_result, encode_error_response,
-    encode_map_result, encode_owned_map_result, encode_uint_result, method_spec, ErrorCode,
-    ErrorResponse, MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry,
-    V1Value,
+    encode_map_result, encode_owned_map_result, encode_text_result, encode_uint_result,
+    method_spec, ErrorCode, ErrorResponse, MethodClass, OwnedResultMapEntry, OwnedV1Value, Request,
+    ResultMapEntry, V1Value,
 };
 use jade_storage::{
     key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
@@ -150,6 +150,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptor" => {
                 self.registered_descriptor_details(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_xpub" => {
+                self.xpub_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
                 self.master_blinding_key_result(request)
             }
@@ -180,6 +183,7 @@ impl Emulator {
                 }
                 V1Outcome::VersionInfo { info } => encode_version_info_result(&request.id, &info),
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
+                V1Outcome::TextResult { result } => encode_text_result(&request.id, &result),
                 V1Outcome::BytesResult { result } => encode_bytes_result(&request.id, &result),
                 V1Outcome::EmptyMapResult => encode_map_result(&request.id, &[]),
                 V1Outcome::OwnedMapResult { entries } => {
@@ -547,6 +551,45 @@ impl Emulator {
         V1Outcome::BytesResult {
             result: self.platform.master_blinding_key().to_vec(),
         }
+    }
+
+    fn xpub_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        let prefix = match params.str("network") {
+            Ok(Some(network)) => match xpub_prefix_for_network(network) {
+                Some(prefix) => prefix,
+                None => return bad_parameters("Failed to extract valid network from parameters"),
+            },
+            Ok(None) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters");
+            }
+        };
+        let path = match params.u32_array("path", MAX_PATH_LEN) {
+            Ok(Some(path)) => path,
+            Ok(None) | Err(_) => {
+                return bad_parameters("Failed to extract valid path from parameters");
+            }
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Cannot get xpub for path".to_string(),
+            };
+        };
+        let Some(xpub) = jade_crypto::pure_rust::xpub_from_seed(seed, &path, prefix) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Cannot get xpub for path".to_string(),
+            };
+        };
+
+        V1Outcome::TextResult { result: xpub }
     }
 
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -960,6 +1003,16 @@ fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Opti
     params.bytes(field).ok().flatten()
 }
 
+fn xpub_prefix_for_network(network: &str) -> Option<jade_crypto::XpubPrefix> {
+    match network {
+        "mainnet" | "liquid" => Some(jade_crypto::XpubPrefix::Main),
+        "testnet" | "testnet-liquid" | "localtest" | "localtest-liquid" => {
+            Some(jade_crypto::XpubPrefix::Test)
+        }
+        _ => None,
+    }
+}
+
 fn valid_pinserver_url(url: &str) -> bool {
     (url.len() > "http://".len() && url.starts_with("http://"))
         || (url.len() > "https://".len() && url.starts_with("https://"))
@@ -1357,6 +1410,7 @@ pub enum V1Outcome {
     ImmediatePing { activity: jade_core::OperationState },
     VersionInfo { info: Box<VersionInfo<'static>> },
     BoolResult { result: bool },
+    TextResult { result: String },
     BytesResult { result: Vec<u8> },
     EmptyMapResult,
     OwnedMapResult { entries: Vec<OwnedResultMapEntry> },
@@ -1521,6 +1575,237 @@ mod tests {
         }
 
         assert_eq!(result_len, Some(0));
+    }
+
+    #[test]
+    fn get_xpub_derives_root_and_child_public_keys() {
+        let mut emulator = Emulator::new();
+        let seed = vec![
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        emulator.platform_mut().set_debug_wallet_seed(seed.clone());
+
+        let mut root_params = Vec::new();
+        minicbor::Encoder::new(&mut root_params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let root_request = Request {
+            id: Cow::Borrowed("x"),
+            method: Cow::Borrowed("get_xpub"),
+            params: Some(&root_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&root_request),
+            V1Outcome::TextResult {
+                result: "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8".to_string()
+            }
+        );
+
+        let mut child_params = Vec::new();
+        minicbor::Encoder::new(&mut child_params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("liquid")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap();
+        let child_request = Request {
+            id: Cow::Borrowed("x"),
+            method: Cow::Borrowed("get_xpub"),
+            params: Some(&child_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&child_request),
+            V1Outcome::TextResult {
+                result: "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_xpub_uses_test_prefix_for_test_and_local_networks() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x11; jade_crypto::SHA512_LEN]);
+
+        for network in ["testnet", "testnet-liquid", "localtest", "localtest-liquid"] {
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(2)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(network)
+                .unwrap()
+                .str("path")
+                .unwrap()
+                .array(1)
+                .unwrap()
+                .u32(0x8000_0054)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("x"),
+                method: Cow::Borrowed("get_xpub"),
+                params: Some(&params),
+            };
+
+            let V1Outcome::TextResult { result } = emulator.handle_v1_request(&request) else {
+                panic!("expected xpub string for {network}");
+            };
+            assert!(result.starts_with("tpub"), "{network} returned {result}");
+        }
+    }
+
+    #[test]
+    fn raw_v1_get_xpub_returns_string_result() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x22; jade_crypto::SHA512_LEN]);
+
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("x")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_xpub")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut result = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "x"),
+                "result" => result = Some(decoder.str().unwrap()),
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert!(result.unwrap().starts_with("xpub"));
+    }
+
+    #[test]
+    fn get_xpub_rejects_invalid_inputs() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("x"),
+            method: Cow::Borrowed("get_xpub"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("unknown")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("x"),
+            method: Cow::Borrowed("get_xpub"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid network from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("x"),
+            method: Cow::Borrowed("get_xpub"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid path from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("x"),
+            method: Cow::Borrowed("get_xpub"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Cannot get xpub for path".to_string(),
+            }
+        );
     }
 
     #[test]

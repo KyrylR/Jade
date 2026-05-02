@@ -8,9 +8,10 @@ rust-version.workspace = true
 
 [features]
 default = []
-pure-rust-curves = ["dep:k256", "dep:p256"]
+pure-rust-curves = ["dep:bip32", "dep:k256", "dep:p256"]
 
 [dependencies]
+bip32 = { workspace = true, optional = true }
 hmac.workspace = true
 k256 = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }

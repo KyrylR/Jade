@@ -83,6 +83,12 @@ impl BlindingFactorBytes {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpubPrefix {
+    Main,
+    Test,
+}
+
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
     if !matches!(seed.len(), 16 | 32 | 64) {
         return None;
@@ -108,9 +114,10 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
     use super::{
-        BlindingFactorBytes, BlindingFactorKind, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN,
-        SHA256_LEN,
+        BlindingFactorBytes, BlindingFactorKind, XpubPrefix, EC_PRIVATE_KEY_LEN,
+        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN,
     };
+    use alloc::string::String;
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -119,6 +126,24 @@ pub mod pure_rust {
     use sha2::{Digest, Sha256};
 
     type HmacSha256 = Hmac<Sha256>;
+
+    pub fn xpub_from_seed(seed: &[u8], path: &[u32], prefix: XpubPrefix) -> Option<String> {
+        let mut derivation_path = bip32::DerivationPath::default();
+        for value in path {
+            let hardened = value & bip32::ChildNumber::HARDENED_FLAG != 0;
+            let child =
+                bip32::ChildNumber::new(value & !bip32::ChildNumber::HARDENED_FLAG, hardened)
+                    .ok()?;
+            derivation_path.push(child);
+        }
+
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        let prefix = match prefix {
+            XpubPrefix::Main => bip32::Prefix::XPUB,
+            XpubPrefix::Test => bip32::Prefix::TPUB,
+        };
+        Some(private_key.public_key().to_string(prefix))
+    }
 
     pub fn slip77_blinding_private_key(
         master_unblinding_key: &[u8; 64],
@@ -244,6 +269,28 @@ mod tests {
         assert_eq!(
             pure_rust::slip77_blinding_private_key(&[0x11; 64], &[]),
             None
+        );
+    }
+
+    #[test]
+    fn xpub_from_seed_matches_bip32_vector_and_test_prefix() {
+        let seed = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+
+        assert_eq!(
+            pure_rust::xpub_from_seed(&seed, &[], XpubPrefix::Main).unwrap(),
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"
+        );
+        assert_eq!(
+            pure_rust::xpub_from_seed(&seed, &[0x8000_0000], XpubPrefix::Main).unwrap(),
+            "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw"
+        );
+        assert!(
+            pure_rust::xpub_from_seed(&seed, &[0x8000_0000], XpubPrefix::Test)
+                .unwrap()
+                .starts_with("tpub")
         );
     }
 
