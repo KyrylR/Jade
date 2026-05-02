@@ -5534,6 +5534,135 @@ mod tests {
     }
 
     #[test]
+    fn sign_tx_staged_flow_signs_anti_exfil_legacy_p2pkh_inputs() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/txn_legacy_ae.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let input_txs: Vec<_> = fixture_hex_values(fixture, "input_tx")
+            .into_iter()
+            .map(decode_hex_vec)
+            .collect();
+        let scripts: Vec<_> = fixture_hex_values(fixture, "script")
+            .into_iter()
+            .map(decode_hex_vec)
+            .collect();
+        let expected = fixture_expected_output_signatures(fixture);
+        assert_eq!(input_txs.len(), 3);
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(expected.len(), 4);
+
+        let start_params = sign_tx_start_params(&txn, 3, true);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let first_host_commitment =
+            decode_hex("adac3ae3f3934fa2ed2475849588fba68c34a01dcc421e80abcf635a23f06fbd");
+        let first_input_params = sign_tx_input_params_with_ae(
+            false,
+            &[2147483692, 0, 1, 2],
+            &scripts[0],
+            None,
+            Some(&input_txs[0]),
+            &first_host_commitment,
+        );
+        let first_input_request = Request {
+            id: Cow::Borrowed("input-0"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&first_input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&first_input_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[0])
+            }
+        );
+
+        let unsigned_input_params = sign_tx_unsigned_input_params(false, None, Some(&input_txs[1]));
+        let unsigned_input_request = Request {
+            id: Cow::Borrowed("input-1"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&unsigned_input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&unsigned_input_request),
+            V1Outcome::BytesResult { result: Vec::new() }
+        );
+
+        let second_host_commitment =
+            decode_hex("d8af4e5415461fb586a40c8c0a6cecda6a66adb19bf7cf27f7a40d468b97576f");
+        let second_input_params = sign_tx_input_params_with_ae(
+            false,
+            &[2147483692, 0, 2, 5],
+            &scripts[1],
+            None,
+            Some(&input_txs[2]),
+            &second_host_commitment,
+        );
+        let second_input_request = Request {
+            id: Cow::Borrowed("input-2"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&second_input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&second_input_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[2])
+            }
+        );
+
+        let first_host_entropy =
+            decode_hex("49aa539ecf1ee2713379e736ed8937e79cb44bcdb5f0115228002274862e429f");
+        let first_signature_params = get_signature_params_with_entropy(&first_host_entropy);
+        let first_signature_request = Request {
+            id: Cow::Borrowed("sig-0"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&first_signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&first_signature_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[1])
+            }
+        );
+
+        let unsigned_signature_params = get_signature_params();
+        let unsigned_signature_request = Request {
+            id: Cow::Borrowed("sig-1"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&unsigned_signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&unsigned_signature_request),
+            V1Outcome::BytesResult { result: Vec::new() }
+        );
+
+        let second_host_entropy =
+            decode_hex("ba30dcf11df43b3dc1c78e34f013de047a1c2752bf089c62534eefcd48021a1b");
+        let second_signature_params = get_signature_params_with_entropy(&second_host_entropy);
+        let second_signature_request = Request {
+            id: Cow::Borrowed("sig-2"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&second_signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&second_signature_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[3])
+            }
+        );
+    }
+
+    #[test]
     fn sign_tx_legacy_flow_extracts_witness_amounts_from_input_tx() {
         for (fixture, paths) in [
             (

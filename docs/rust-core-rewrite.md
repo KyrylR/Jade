@@ -125,7 +125,8 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   grinding compatible with libwally. Taproot key-path `sign_tx` signs
   SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures. Non-Taproot Bitcoin
   anti-exfil `sign_tx` now returns signer commitments from `tx_input` and DER
-  signatures from `get_signature`, matching the P2WSH anti-exfil fixture.
+  signatures from `get_signature`, matching the P2WSH and multi-input legacy
+  P2PKH anti-exfil fixtures, including empty responses for pathless inputs.
   PSBT anti-exfil, Taproot anti-exfil, registered/generic multisig policy
   validation, and Liquid `sign_liquid_tx` remain explicit defers.
 
