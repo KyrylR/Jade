@@ -173,6 +173,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_identity_pubkey" => {
                 self.identity_pubkey_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_identity_shared_key" => {
+                self.identity_shared_key_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
                 self.master_blinding_key_result(request)
             }
@@ -743,6 +746,64 @@ impl Emulator {
 
         V1Outcome::BytesResult {
             result: pubkey.to_vec(),
+        }
+    }
+
+    fn identity_shared_key_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let identity = match params.str("identity") {
+            Ok(Some(identity)) if valid_identity(identity) => identity,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid identity from parameters");
+            }
+        };
+        match params.str("curve") {
+            Ok(Some("nist256p1")) => {}
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid curve name from parameters");
+            }
+        }
+        let index = match params.u64("index") {
+            Ok(Some(index)) if index <= 0x7fff_ffff => index as u32,
+            Ok(None) => 0,
+            Ok(Some(_)) | Err(_) => {
+                return bad_parameters("Failed to extract valid index from parameters");
+            }
+        };
+        let their_pubkey = match params.bytes("their_pubkey") {
+            Ok(Some(bytes)) => match <&[u8; 65]>::try_from(bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => return bad_parameters("Failed to extract valid pubkey from parameters"),
+            },
+            Ok(None) | Err(_) => {
+                return bad_parameters("Failed to extract valid pubkey from parameters")
+            }
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            };
+        };
+        let Some(shared_key) = jade_crypto::pure_rust::identity_shared_key_from_seed(
+            seed,
+            identity,
+            index,
+            their_pubkey,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to get identity pubkey".to_string(),
+            };
+        };
+
+        V1Outcome::BytesResult {
+            result: shared_key.to_vec(),
         }
     }
 
@@ -2780,6 +2841,57 @@ mod tests {
                 "{key_type}"
             );
         }
+    }
+
+    #[test]
+    fn get_identity_shared_key_derives_slip17_ecdh_secret() {
+        let mut emulator = Emulator::new();
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(mnemonic.to_seed("").to_vec());
+
+        let their_pubkey = decode_hex::<65>(
+            "04248befa95e9dbcf0a2ef7cf6957651ee25a168355590c4c84a6a8601758ca230d397bcba67b4676c3f2711b59083fff9157c16899da6d4ed76f8eaf57a100fa8",
+        );
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("identity")
+            .unwrap()
+            .str("ssh://satoshi@bitcoin.org")
+            .unwrap()
+            .str("curve")
+            .unwrap()
+            .str("nist256p1")
+            .unwrap()
+            .str("their_pubkey")
+            .unwrap()
+            .bytes(&their_pubkey)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(47)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_identity_shared_key"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: decode_hex::<32>(
+                    "de7c569bea8fd78f724671e2b645e3debb58af1c869c5c0a3a901ff2b9413ffa"
+                )
+                .to_vec(),
+            }
+        );
     }
 
     #[test]

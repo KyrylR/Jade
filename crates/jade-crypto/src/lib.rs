@@ -146,7 +146,10 @@ pub mod pure_rust {
     use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
-    use p256::{FieldBytes as P256FieldBytes, Scalar as P256Scalar, SecretKey as P256SecretKey};
+    use p256::{
+        FieldBytes as P256FieldBytes, ProjectivePoint as P256ProjectivePoint,
+        PublicKey as P256PublicKey, Scalar as P256Scalar, SecretKey as P256SecretKey,
+    };
     use sha2::{Digest, Sha256, Sha512};
 
     type HmacSha256 = Hmac<Sha256>;
@@ -235,6 +238,23 @@ pub mod pure_rust {
             .as_bytes()
             .try_into()
             .ok()
+    }
+
+    pub fn identity_shared_key_from_seed(
+        seed: &[u8],
+        identity: &str,
+        index: u32,
+        their_pubkey: &[u8; 65],
+    ) -> Option<[u8; SHA256_LEN]> {
+        let private_key =
+            identity_private_key_from_seed(seed, identity, index, IdentityKeyType::Slip17)?;
+        let secret = P256SecretKey::from_slice(&private_key).ok()?;
+        let peer = P256PublicKey::from_sec1_bytes(their_pubkey).ok()?;
+        let shared_point = (P256ProjectivePoint::from(*peer.as_affine())
+            * secret.to_nonzero_scalar().as_ref())
+        .to_affine();
+        let encoded = shared_point.to_encoded_point(false);
+        encoded.as_bytes()[1..1 + SHA256_LEN].try_into().ok()
     }
 
     pub fn bitcoin_singlesig_address_from_seed(
@@ -669,6 +689,24 @@ mod tests {
     }
 
     #[test]
+    fn identity_shared_key_matches_jade_fixture() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+        let identity = "ssh://satoshi@bitcoin.org";
+        let slip17_pubkey = decode_hex_65(
+            "04248befa95e9dbcf0a2ef7cf6957651ee25a168355590c4c84a6a8601758ca230d397bcba67b4676c3f2711b59083fff9157c16899da6d4ed76f8eaf57a100fa8",
+        );
+
+        assert_eq!(
+            pure_rust::identity_shared_key_from_seed(&seed, identity, 47, &slip17_pubkey).unwrap(),
+            decode_hex_32("de7c569bea8fd78f724671e2b645e3debb58af1c869c5c0a3a901ff2b9413ffa")
+        );
+    }
+
+    #[test]
     fn identity_public_key_rejects_empty_identity_and_oversized_index() {
         let seed = [0x11; SHA512_LEN];
 
@@ -801,6 +839,16 @@ mod tests {
     fn decode_hex_65(input: &str) -> [u8; 65] {
         assert_eq!(input.len(), 130);
         let mut output = [0u8; 65];
+        let bytes = input.as_bytes();
+        for (index, output_byte) in output.iter_mut().enumerate() {
+            *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
+        }
+        output
+    }
+
+    fn decode_hex_32(input: &str) -> [u8; 32] {
+        assert_eq!(input.len(), 64);
+        let mut output = [0u8; 32];
         let bytes = input.as_bytes();
         for (index, output_byte) in output.iter_mut().enumerate() {
             *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
