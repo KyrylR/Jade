@@ -110,6 +110,12 @@ pub enum IdentityKeyType {
     Slip17,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentitySignature {
+    pub pubkey: [u8; 65],
+    pub signature: [u8; 65],
+}
+
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
     if !matches!(seed.len(), 16 | 32 | 64) {
         return None;
@@ -147,6 +153,10 @@ pub mod pure_rust {
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
     use p256::{
+        ecdsa::{
+            signature::hazmat::PrehashSigner, Signature as P256Signature,
+            SigningKey as P256SigningKey,
+        },
         FieldBytes as P256FieldBytes, ProjectivePoint as P256ProjectivePoint,
         PublicKey as P256PublicKey, Scalar as P256Scalar, SecretKey as P256SecretKey,
     };
@@ -238,6 +248,46 @@ pub mod pure_rust {
             .as_bytes()
             .try_into()
             .ok()
+    }
+
+    pub fn sign_identity_from_seed(
+        seed: &[u8],
+        identity: &str,
+        index: u32,
+        challenge: &[u8],
+    ) -> Option<super::IdentitySignature> {
+        if challenge.is_empty() {
+            return None;
+        }
+
+        let private_key =
+            identity_private_key_from_seed(seed, identity, index, IdentityKeyType::Slip13)?;
+        let secret = P256SecretKey::from_slice(&private_key).ok()?;
+        let public_key = secret.public_key();
+        let pubkey = public_key
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .ok()?;
+
+        let signing_key = P256SigningKey::from_slice(&private_key).ok()?;
+        let ssh_challenge_hash;
+        let prehash = if identity.starts_with("ssh://") {
+            ssh_challenge_hash = Sha256::digest(challenge);
+            ssh_challenge_hash.as_ref()
+        } else {
+            challenge
+        };
+        let signature: P256Signature = signing_key.sign_prehash(prehash).ok()?;
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature_bytes = signature.to_bytes();
+        let mut output_signature = [0u8; 65];
+        output_signature[1..].copy_from_slice(signature_bytes.as_ref());
+
+        Some(super::IdentitySignature {
+            pubkey,
+            signature: output_signature,
+        })
     }
 
     pub fn identity_shared_key_from_seed(
@@ -704,6 +754,63 @@ mod tests {
             pure_rust::identity_shared_key_from_seed(&seed, identity, 47, &slip17_pubkey).unwrap(),
             decode_hex_32("de7c569bea8fd78f724671e2b645e3debb58af1c869c5c0a3a901ff2b9413ffa")
         );
+    }
+
+    #[test]
+    fn identity_signatures_match_jade_fixtures() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+
+        for (challenge, identity, index, signature, pubkey) in [
+            (
+                "cd8552569d6e4509266ef137584d1e62c7579b5b8ed69bbafa4b864c6521e7c2",
+                "ssh://satoshi@bitcoin.org",
+                47,
+                "005122cebabb852cdd32103b602662afa88e54c0c0c1b38d7099c64dcd49efe908288114e66ed2d8c82f23a70b769a4db723173ec53840c08aafb840d3f09a18d3",
+                "0473f21a3da3d0e96fc2189f81dd826658c3d76b2d55bd1da349bc6c3573b13ae4d564710ca0bf84b81c6850e916cb94ae9c397b550589da476ace7aee39ebcb37",
+            ),
+            (
+                "c16e1456df150491c50722a9d02fa04c74ef065a94f1936f7db029f71138c239",
+                "ssh://jade@jadepin.blockstream.com",
+                112,
+                "00d0472ffa6a6b0075b71a60c7abd3faf9f6d49b7bb86bace344e23c68b888ebc273d48b62b4af70f2ad1ca213f6886e26d74d31cfbbd7f4ac917af4d243939813",
+                "04a88f160249fd794bdb12fc56896e8dac6bf5e72e33960e2a7d11252f6a93ef28fa183f3eca7ac84aa0d2e1488f281dbe4af394fcbeda3ab368e7fe98fc25f16f",
+            ),
+            (
+                "ff732d6499071333f13170d2184054b6dffc1296ca43cb1599a68cea65071e6f",
+                "ssh://someuser@github.com",
+                0,
+                "0013372b354ff22cbc2d5d1731d7764567bac1ee99fb92eada9c190b7a4e6b47a42ef117610a85995d9c94bb537e6ca03b3692202de949ee2b69238a20dd1440c2",
+                "04406cebcd21fe37c081c4c3a17df7d238e6ce93272d39d792f08f2651a511ec79760593520019b224f7784e648296d8762804b6937aded7ab807690177e4c8f7e",
+            ),
+            (
+                "bcfc224438bd07742c4a3ad6db530e3f071f93645728e9f69eaee21c2f4ed54a",
+                "gpg://GreenAddress <greenaddress@blockstream.io>",
+                16,
+                "007a9e6f1d2b4f14185b1046d70a1b56ecde775b3fc0ad3f9d6f408eb0c6d9f320510ffeff560ba8a0ae9d7bb1c8ddd14f84cf58ceca62803a813e9ab7f30f9765",
+                "045158eadf95d518871eb8b1ca5e363d389ba2af83a4b26d66259399ab7da7ed73facfd38891624126075573294e5bedc9fc8909df88c2a78ec1c153eeeb709bc1",
+            ),
+            (
+                "fa94545d4f18e4cc4655c87869fc8a790a07eb58a3e5b599ab9f7da6d8ab5061",
+                "gpg://Jade <jade@blockstream.com>",
+                0,
+                "000118565f7363337ad72a1c497a1e1de5d336a99b09af8c49b36518e925a0ca517dafffb2e95dc777c4d7df504ced12fd668f81a11d14d30033831df1434b59d7",
+                "041127ef35e4690ff035e13ebab340ab3fa2327c0409bbed3dbf03b8932777d929bd8ade43e3ebceb9fc74c23a32cd0e380d9b529a70ee0e83763e0c7af5f0bb1f",
+            ),
+        ] {
+            let signed = pure_rust::sign_identity_from_seed(
+                &seed,
+                identity,
+                index,
+                &decode_hex_32(challenge),
+            )
+            .unwrap();
+            assert_eq!(signed.signature, decode_hex_65(signature), "{identity}");
+            assert_eq!(signed.pubkey, decode_hex_65(pubkey), "{identity}");
+        }
     }
 
     #[test]

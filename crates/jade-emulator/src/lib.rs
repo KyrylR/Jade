@@ -176,6 +176,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_identity_shared_key" => {
                 self.identity_shared_key_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "sign_identity" => {
+                self.sign_identity_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
                 self.master_blinding_key_result(request)
             }
@@ -804,6 +807,67 @@ impl Emulator {
 
         V1Outcome::BytesResult {
             result: shared_key.to_vec(),
+        }
+    }
+
+    fn sign_identity_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let identity = match params.str("identity") {
+            Ok(Some(identity)) if valid_identity(identity) => identity,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid identity from parameters");
+            }
+        };
+        match params.str("curve") {
+            Ok(Some("nist256p1")) => {}
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid curve name from parameters");
+            }
+        }
+        let index = match params.u64("index") {
+            Ok(Some(index)) if index <= 0x7fff_ffff => index as u32,
+            Ok(None) => 0,
+            Ok(Some(_)) | Err(_) => {
+                return bad_parameters("Failed to extract valid index from parameters");
+            }
+        };
+        let challenge = match params.bytes("challenge") {
+            Ok(Some(challenge)) if !challenge.is_empty() => challenge,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid challenge from parameters");
+            }
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            };
+        };
+        let Some(signature) =
+            jade_crypto::pure_rust::sign_identity_from_seed(seed, identity, index, challenge)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to sign identity".to_string(),
+            };
+        };
+
+        V1Outcome::OwnedMapResult {
+            entries: vec![
+                OwnedResultMapEntry {
+                    key: "signature".to_string(),
+                    value: OwnedV1Value::Bytes(signature.signature.to_vec()),
+                },
+                OwnedResultMapEntry {
+                    key: "pubkey".to_string(),
+                    value: OwnedV1Value::Bytes(signature.pubkey.to_vec()),
+                },
+            ],
         }
     }
 
@@ -2890,6 +2954,72 @@ mod tests {
                     "de7c569bea8fd78f724671e2b645e3debb58af1c869c5c0a3a901ff2b9413ffa"
                 )
                 .to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_identity_returns_jade_signature_and_slip13_pubkey() {
+        let mut emulator = Emulator::new();
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(mnemonic.to_seed("").to_vec());
+
+        let challenge =
+            decode_hex::<32>("cd8552569d6e4509266ef137584d1e62c7579b5b8ed69bbafa4b864c6521e7c2");
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("identity")
+            .unwrap()
+            .str("ssh://satoshi@bitcoin.org")
+            .unwrap()
+            .str("curve")
+            .unwrap()
+            .str("nist256p1")
+            .unwrap()
+            .str("challenge")
+            .unwrap()
+            .bytes(&challenge)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(47)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("sign_identity"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "signature".to_string(),
+                        value: OwnedV1Value::Bytes(
+                            decode_hex::<65>(
+                                "005122cebabb852cdd32103b602662afa88e54c0c0c1b38d7099c64dcd49efe908288114e66ed2d8c82f23a70b769a4db723173ec53840c08aafb840d3f09a18d3"
+                            )
+                            .to_vec()
+                        ),
+                    },
+                    OwnedResultMapEntry {
+                        key: "pubkey".to_string(),
+                        value: OwnedV1Value::Bytes(
+                            decode_hex::<65>(
+                                "0473f21a3da3d0e96fc2189f81dd826658c3d76b2d55bd1da349bc6c3573b13ae4d564710ca0bf84b81c6850e916cb94ae9c397b550589da476ace7aee39ebcb37"
+                            )
+                            .to_vec()
+                        ),
+                    },
+                ],
             }
         );
     }
