@@ -173,6 +173,229 @@ pub enum OtpError {
     TokenTooLong,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsbtEnvelope {
+    Bitcoin,
+    Liquid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsbtScanError {
+    Invalid,
+}
+
+pub fn psbt_envelope(bytes: &[u8]) -> Option<PsbtEnvelope> {
+    if bytes.starts_with(b"psbt\xff") {
+        Some(PsbtEnvelope::Bitcoin)
+    } else if bytes.starts_with(b"pset\xff") {
+        Some(PsbtEnvelope::Liquid)
+    } else {
+        None
+    }
+}
+
+pub fn psbt_needs_wallet_signature(
+    bytes: &[u8],
+    wallet_fingerprint: &[u8; 4],
+) -> Result<bool, PsbtScanError> {
+    let envelope = psbt_envelope(bytes).ok_or(PsbtScanError::Invalid)?;
+    let mut pos = 5;
+    let counts = scan_psbt_global_map(bytes, &mut pos, envelope)?;
+    let input_count = counts.input_count.ok_or(PsbtScanError::Invalid)?;
+    let output_count = counts.output_count.ok_or(PsbtScanError::Invalid)?;
+
+    for _ in 0..input_count {
+        if scan_psbt_input_map(bytes, &mut pos, wallet_fingerprint)? {
+            return Ok(true);
+        }
+    }
+    for _ in 0..output_count {
+        skip_psbt_map(bytes, &mut pos)?;
+    }
+
+    if pos == bytes.len() {
+        Ok(false)
+    } else {
+        Err(PsbtScanError::Invalid)
+    }
+}
+
+#[derive(Default)]
+struct PsbtCounts {
+    input_count: Option<usize>,
+    output_count: Option<usize>,
+}
+
+fn scan_psbt_global_map(
+    bytes: &[u8],
+    pos: &mut usize,
+    envelope: PsbtEnvelope,
+) -> Result<PsbtCounts, PsbtScanError> {
+    let mut counts = PsbtCounts::default();
+
+    loop {
+        let key = read_psbt_key(bytes, pos)?;
+        if key.is_empty() {
+            return Ok(counts);
+        }
+        let value = read_psbt_value(bytes, pos)?;
+        match key[0] {
+            0x00 if envelope == PsbtEnvelope::Bitcoin => {
+                if let Some((inputs, outputs)) = bitcoin_tx_counts(value) {
+                    counts.input_count = Some(inputs);
+                    counts.output_count = Some(outputs);
+                } else {
+                    return Err(PsbtScanError::Invalid);
+                }
+            }
+            0x04 => {
+                counts.input_count = Some(read_single_compact_size_value(value)?);
+            }
+            0x05 => {
+                counts.output_count = Some(read_single_compact_size_value(value)?);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_psbt_input_map(
+    bytes: &[u8],
+    pos: &mut usize,
+    wallet_fingerprint: &[u8; 4],
+) -> Result<bool, PsbtScanError> {
+    let mut signed_pubkeys: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    let mut wallet_pubkeys: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+
+    loop {
+        let key = read_psbt_key(bytes, pos)?;
+        if key.is_empty() {
+            return Ok(wallet_pubkeys
+                .iter()
+                .any(|pubkey| !signed_pubkeys.iter().any(|signed| signed == pubkey)));
+        }
+        let value = read_psbt_value(bytes, pos)?;
+        match key[0] {
+            // PSBT_IN_PARTIAL_SIG. Key data is the signed public key.
+            0x02 => signed_pubkeys.push(&key[1..]),
+            // PSBT_IN_BIP32_DERIVATION. Value starts with the 4-byte master fingerprint.
+            0x06 if value.get(..4) == Some(wallet_fingerprint) => {
+                wallet_pubkeys.push(&key[1..]);
+            }
+            // PSBT_IN_TAP_BIP32_DERIVATION. Taproot signing is a separate milestone,
+            // so any matching taproot derivation must stay on the explicit signing path.
+            0x16 if tap_derivation_matches_fingerprint(value, wallet_fingerprint) => {
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn skip_psbt_map(bytes: &[u8], pos: &mut usize) -> Result<(), PsbtScanError> {
+    loop {
+        let key = read_psbt_key(bytes, pos)?;
+        if key.is_empty() {
+            return Ok(());
+        }
+        let _ = read_psbt_value(bytes, pos)?;
+    }
+}
+
+fn read_psbt_key<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], PsbtScanError> {
+    let len = read_compact_size(bytes, pos)?;
+    read_exact(bytes, pos, len)
+}
+
+fn read_psbt_value<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], PsbtScanError> {
+    let len = read_compact_size(bytes, pos)?;
+    read_exact(bytes, pos, len)
+}
+
+fn read_single_compact_size_value(value: &[u8]) -> Result<usize, PsbtScanError> {
+    let mut pos = 0;
+    let parsed = read_compact_size(value, &mut pos)?;
+    if pos == value.len() {
+        Ok(parsed)
+    } else {
+        Err(PsbtScanError::Invalid)
+    }
+}
+
+fn read_compact_size(bytes: &[u8], pos: &mut usize) -> Result<usize, PsbtScanError> {
+    let tag = *read_exact(bytes, pos, 1)?
+        .first()
+        .ok_or(PsbtScanError::Invalid)?;
+    match tag {
+        0x00..=0xfc => Ok(tag as usize),
+        0xfd => {
+            let raw = read_exact(bytes, pos, 2)?;
+            Ok(u16::from_le_bytes(raw.try_into().expect("fixed compact size")) as usize)
+        }
+        0xfe => {
+            let raw = read_exact(bytes, pos, 4)?;
+            Ok(u32::from_le_bytes(raw.try_into().expect("fixed compact size")) as usize)
+        }
+        0xff => {
+            let raw = read_exact(bytes, pos, 8)?;
+            let value = u64::from_le_bytes(raw.try_into().expect("fixed compact size"));
+            value.try_into().map_err(|_| PsbtScanError::Invalid)
+        }
+    }
+}
+
+fn read_exact<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], PsbtScanError> {
+    let end = pos.checked_add(len).ok_or(PsbtScanError::Invalid)?;
+    if end > bytes.len() {
+        return Err(PsbtScanError::Invalid);
+    }
+    let value = &bytes[*pos..end];
+    *pos = end;
+    Ok(value)
+}
+
+fn bitcoin_tx_counts(tx: &[u8]) -> Option<(usize, usize)> {
+    let mut pos = 0;
+    read_exact_opt(tx, &mut pos, 4)?;
+    let input_count = read_compact_size_opt(tx, &mut pos)?;
+    for _ in 0..input_count {
+        read_exact_opt(tx, &mut pos, 36)?;
+        let script_len = read_compact_size_opt(tx, &mut pos)?;
+        read_exact_opt(tx, &mut pos, script_len)?;
+        read_exact_opt(tx, &mut pos, 4)?;
+    }
+    let output_count = read_compact_size_opt(tx, &mut pos)?;
+    for _ in 0..output_count {
+        read_exact_opt(tx, &mut pos, 8)?;
+        let script_len = read_compact_size_opt(tx, &mut pos)?;
+        read_exact_opt(tx, &mut pos, script_len)?;
+    }
+    read_exact_opt(tx, &mut pos, 4)?;
+    (pos == tx.len()).then_some((input_count, output_count))
+}
+
+fn read_compact_size_opt(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    read_compact_size(bytes, pos).ok()
+}
+
+fn read_exact_opt<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    read_exact(bytes, pos, len).ok()
+}
+
+fn tap_derivation_matches_fingerprint(value: &[u8], wallet_fingerprint: &[u8; 4]) -> bool {
+    let mut pos = 0;
+    let Some(leaf_hashes) = read_compact_size_opt(value, &mut pos) else {
+        return false;
+    };
+    let Some(skip_len) = leaf_hashes.checked_mul(SHA256_LEN) else {
+        return false;
+    };
+    if read_exact_opt(value, &mut pos, skip_len).is_none() {
+        return false;
+    }
+    value.get(pos..pos + 4) == Some(wallet_fingerprint)
+}
+
 impl<'a> OtpUri<'a> {
     pub fn parse(uri: &'a str) -> Result<Self, OtpError> {
         const PREFIX: &str = "otpauth://";

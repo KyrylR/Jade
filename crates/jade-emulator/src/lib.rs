@@ -246,6 +246,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "sign_bip85_digests" => {
                 self.sign_bip85_digests_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "sign_psbt" => {
+                self.sign_psbt_result(request)
+            }
             Some(MethodClass::Continuation) if request.method == "ota_data" => {
                 self.handle_ota_data(request)
             }
@@ -1906,6 +1909,49 @@ impl Emulator {
         }
     }
 
+    fn sign_psbt_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let network_name = match params.str("network") {
+            Ok(Some(network)) if valid_network_name(network) => network,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters");
+            }
+        };
+        let is_liquid = is_liquid_network(network_name);
+        let psbt = match psbt_param_bytes(params) {
+            Ok(psbt) if !psbt.is_empty() => psbt,
+            Ok(_) | Err(()) => return bad_parameters("Failed to extract psbt from parameters"),
+        };
+        match jade_crypto::psbt_envelope(&psbt) {
+            Some(jade_crypto::PsbtEnvelope::Bitcoin) if !is_liquid => {}
+            Some(jade_crypto::PsbtEnvelope::Liquid) if is_liquid => {}
+            Some(_) => return bad_parameters("Network/psbt type mismatch"),
+            None => return bad_parameters("Failed to extract psbt from parameters"),
+        }
+
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::BytesResult { result: psbt };
+        };
+        let Some(fingerprint) = wallet_fingerprint_from_seed(seed) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to inspect psbt signing paths".to_string(),
+            };
+        };
+        match jade_crypto::psbt_needs_wallet_signature(&psbt, &fingerprint) {
+            Ok(false) => V1Outcome::BytesResult { result: psbt },
+            Ok(true) => V1Outcome::DeferredToCore {
+                method: "sign_psbt signing".to_string(),
+            },
+            Err(_) => bad_parameters("Failed to extract psbt from parameters"),
+        }
+    }
+
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -2561,6 +2607,60 @@ fn direct_bytes_params<'a>(request: &Request<'a>) -> Result<&'a [u8], ()> {
         return Err(());
     }
     Ok(bytes)
+}
+
+fn psbt_param_bytes(params: jade_protocol_v1::Params<'_>) -> Result<Vec<u8>, ()> {
+    if let Ok(Some(bytes)) = params.bytes("psbt") {
+        return Ok(bytes.to_vec());
+    }
+    if let Ok(Some(text)) = params.str("psbt") {
+        return base64_decode(text);
+    }
+    Err(())
+}
+
+fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
+    if text.is_empty() || text.len() % 4 != 0 {
+        return Err(());
+    }
+    let mut output = Vec::with_capacity(text.len() / 4 * 3);
+    let num_chunks = text.len() / 4;
+    for (chunk_index, chunk) in text.as_bytes().chunks_exact(4).enumerate() {
+        let mut values = [0u8; 4];
+        let mut padding = 0usize;
+        for (index, byte) in chunk.iter().copied().enumerate() {
+            values[index] = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' if index >= 2 => {
+                    padding += 1;
+                    0
+                }
+                _ => return Err(()),
+            };
+        }
+        if padding > 2
+            || (padding > 0 && chunk[3] != b'=')
+            || (padding > 0 && chunk_index + 1 != num_chunks)
+        {
+            return Err(());
+        }
+        let bits = ((values[0] as u32) << 18)
+            | ((values[1] as u32) << 12)
+            | ((values[2] as u32) << 6)
+            | values[3] as u32;
+        output.push((bits >> 16) as u8);
+        if padding < 2 {
+            output.push((bits >> 8) as u8);
+        }
+        if padding == 0 {
+            output.push(bits as u8);
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4214,6 +4314,21 @@ mod tests {
         )
     }
 
+    fn test_mnemonic_single_sig_seed() -> [u8; 64] {
+        decode_hex(
+            "5eff11cb0a00759be57e20d20d8076b80e8954df54318967116269909b501c10\
+             99c27239c6e1cc1e9211a9b8157f150d58fc3f88ba79fd7c1515f3f317732337",
+        )
+    }
+
+    fn fixture_psbt_base64(fixture: &str) -> &str {
+        let marker = "\"psbt\": \"";
+        let start = fixture.find(marker).unwrap() + marker.len();
+        let rest = &fixture[start..];
+        let end = rest.find('"').unwrap();
+        &rest[..end]
+    }
+
     fn decode_xpub(input: &str) -> [u8; BIP32_SERIALIZED_LEN] {
         let bytes = base58ck::decode_check(input).unwrap();
         bytes.try_into().unwrap()
@@ -4359,18 +4474,154 @@ mod tests {
     }
 
     #[test]
-    fn signing_methods_are_deferred() {
+    fn transaction_signing_methods_are_deferred() {
         let mut emulator = Emulator::new();
         let request = Request {
             id: Cow::Borrowed("2"),
-            method: Cow::Borrowed("sign_psbt"),
+            method: Cow::Borrowed("sign_tx"),
             params: None,
         };
 
         assert_eq!(
             emulator.handle_v1_request(&request),
             V1Outcome::DeferredToCore {
-                method: "sign_psbt".to_string()
+                method: "sign_tx".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sign_psbt_returns_noop_psbt_when_no_wallet_input_matches() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let psbt = fixture_psbt_base64(include_str!("../../../test_data/psbt_ss_not_us.json"));
+        let expected = base64_decode(psbt).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: expected }
+        );
+    }
+
+    #[test]
+    fn sign_psbt_returns_already_signed_wallet_psbt_unchanged() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let psbt = fixture_psbt_base64(include_str!(
+            "../../../test_data/psbt_ss_p2wpkh_already_signed.json"
+        ));
+        let expected = base64_decode(psbt).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: expected }
+        );
+    }
+
+    #[test]
+    fn sign_psbt_defers_when_wallet_signature_is_missing() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let psbt = fixture_psbt_base64(include_str!("../../../test_data/psbt_ss_p2pkh_v2.json"));
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "sign_psbt signing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sign_psbt_rejects_network_type_mismatch() {
+        let mut emulator = Emulator::new();
+        let psbt = fixture_psbt_base64(include_str!(
+            "../../../test_data/psbt_tm_wrong_network_type.json"
+        ));
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("liquid")
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Network/psbt type mismatch".to_string()
             }
         );
     }

@@ -98,6 +98,12 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   deferred because Elements uses a different taproot tweak.
 - Liquid key helpers: master blinding key export, script blinding key, shared
   nonce, and deterministic blinding factors.
+- PSBT/PSET signing front door: Rust now validates PSBT vs. PSET envelope
+  compatibility, scans BIP32 derivations for wallet-owned inputs, returns
+  no-op PSBT/PSET payloads unchanged when there is nothing to sign or wallet
+  inputs are already signed, and defers only when new signatures must be
+  produced. Full sighash/signature insertion remains in the transaction-signing
+  milestone.
 
 ## First Parity Gates
 
