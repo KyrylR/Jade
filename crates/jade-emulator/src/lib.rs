@@ -127,6 +127,12 @@ impl Emulator {
                 self.state.logout();
                 V1Outcome::BoolResult { result: true }
             }
+            Some(MethodClass::PreAuth) if request.method == "register_attestation" => {
+                self.register_attestation_result(request)
+            }
+            Some(MethodClass::PreAuth) if request.method == "sign_attestation" => {
+                self.sign_attestation_result(request)
+            }
             Some(MethodClass::PreAuth) if request.method == "cancel" => V1Outcome::NoReply,
             Some(MethodClass::PreAuth) if request.method == "ota" => self.start_ota(request, false),
             Some(MethodClass::PreAuth) if request.method == "ota_delta" => {
@@ -223,6 +229,12 @@ impl Emulator {
                     Ok(_) => V1Outcome::BoolResult { result: true },
                     Err(outcome) => outcome,
                 }
+            }
+            Some(MethodClass::Authenticated) if request.method == "get_bip85_pubkey" => {
+                self.bip85_rsa_pubkey_result(request)
+            }
+            Some(MethodClass::Authenticated) if request.method == "sign_bip85_digests" => {
+                self.sign_bip85_digests_result(request)
             }
             Some(MethodClass::Continuation) if request.method == "ota_data" => {
                 self.handle_ota_data(request)
@@ -1753,6 +1765,55 @@ impl Emulator {
         })
     }
 
+    fn bip85_rsa_pubkey_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        if let Err(message) = parse_bip85_rsa_key_params(params) {
+            return bad_parameters(message);
+        }
+
+        V1Outcome::DeferredToCore {
+            method: "get_bip85_pubkey RSA generation".to_string(),
+        }
+    }
+
+    fn sign_bip85_digests_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let key = match parse_bip85_rsa_key_params(params) {
+            Ok(key) => key,
+            Err(message) => return bad_parameters(message),
+        };
+        let digests = match cbor_map_field(params.raw(), "digests").and_then(decode_digest_array) {
+            Ok(digests) if !digests.is_empty() => digests,
+            Ok(_) | Err(()) => {
+                return bad_parameters("Failed to extract digests from parameters");
+            }
+        };
+        let max_digests = if key.key_bits <= 2048 {
+            8
+        } else if key.key_bits < 4096 {
+            6
+        } else {
+            4
+        };
+        if digests.len() > max_digests {
+            return bad_parameters("Unsupported number of digests");
+        }
+
+        V1Outcome::DeferredToCore {
+            method: "sign_bip85_digests RSA generation".to_string(),
+        }
+    }
+
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -2193,6 +2254,34 @@ impl Emulator {
         }
 
         V1Outcome::BoolResult { result: true }
+    }
+
+    fn register_attestation_result(&self, request: &Request<'_>) -> V1Outcome {
+        if request.params().is_none() {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        }
+
+        V1Outcome::Reject {
+            code: ErrorCode::InternalError,
+            message: "Attestation not supported".to_string(),
+        }
+    }
+
+    fn sign_attestation_result(&self, request: &Request<'_>) -> V1Outcome {
+        if request.params().is_none() {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        }
+
+        V1Outcome::Reject {
+            code: ErrorCode::InternalError,
+            message: "Attestation not supported".to_string(),
+        }
     }
 
     fn auth_user_result(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -2723,6 +2812,55 @@ fn cbor_u32_array(raw: &[u8], max_len: usize) -> Result<Vec<u32>, ()> {
     } else {
         Err(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bip85RsaKeyParams {
+    key_bits: u32,
+}
+
+fn parse_bip85_rsa_key_params(
+    params: jade_protocol_v1::Params<'_>,
+) -> Result<Bip85RsaKeyParams, &'static str> {
+    match params.str("key_type") {
+        Ok(Some("RSA")) => {}
+        Ok(_) | Err(_) => return Err("Cannot extract valid key_type from parameters"),
+    }
+    let key_bits = match params.u64("key_bits") {
+        Ok(Some(key_bits)) if valid_rsa_generation_key_bits(key_bits) => key_bits as u32,
+        Ok(_) | Err(_) => return Err("Failed to fetch valid key length from message"),
+    };
+    match params.u64("index") {
+        Ok(Some(index)) if index <= 0x7fff_ffff => {}
+        Ok(_) | Err(_) => return Err("Failed to fetch valid index from message"),
+    };
+
+    Ok(Bip85RsaKeyParams { key_bits })
+}
+
+fn decode_digest_array(
+    digests_raw: Option<&[u8]>,
+) -> Result<Vec<[u8; jade_crypto::SHA256_LEN]>, ()> {
+    let digests_raw = digests_raw.ok_or(())?;
+    let mut decoder = Decoder::new(digests_raw);
+    let Some(len) = decoder.array().map_err(|_| ())? else {
+        return Err(());
+    };
+    if len == 0 {
+        return Err(());
+    }
+
+    let mut digests = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let bytes = decoder.bytes().map_err(|_| ())?;
+        let digest: [u8; jade_crypto::SHA256_LEN] = bytes.try_into().map_err(|_| ())?;
+        digests.push(digest);
+    }
+    if decoder.position() != digests_raw.len() {
+        return Err(());
+    }
+
+    Ok(digests)
 }
 
 fn decode_registration_signers(
@@ -3447,6 +3585,10 @@ fn valid_compressed_secp256k1_pubkey(pubkey: &[u8]) -> bool {
 
 fn valid_rsa_key_bits(key_bits: u64) -> bool {
     matches!(key_bits, 1024 | 2048 | 3072 | 4096 | 8192)
+}
+
+fn valid_rsa_generation_key_bits(key_bits: u64) -> bool {
+    matches!(key_bits, 1024 | 2048 | 3072 | 4096)
 }
 
 fn multisig_signer_entries(signer: &MultisigSignerDetails) -> Vec<OwnedResultMapEntry> {
@@ -5954,6 +6096,227 @@ mod tests {
     }
 
     #[test]
+    fn bip85_rsa_pubkey_validates_key_parameters_before_core_generation() {
+        let mut emulator = Emulator::new();
+
+        let request = Request {
+            id: Cow::Borrowed("rsa"),
+            method: Cow::Borrowed("get_bip85_pubkey"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let invalid_cases = [
+            (
+                {
+                    let mut params = Vec::new();
+                    minicbor::Encoder::new(&mut params)
+                        .map(1)
+                        .unwrap()
+                        .str("key_type")
+                        .unwrap()
+                        .str("bad")
+                        .unwrap();
+                    params
+                },
+                "Cannot extract valid key_type from parameters",
+            ),
+            (
+                {
+                    let mut params = Vec::new();
+                    minicbor::Encoder::new(&mut params)
+                        .map(2)
+                        .unwrap()
+                        .str("key_type")
+                        .unwrap()
+                        .str("RSA")
+                        .unwrap()
+                        .str("key_bits")
+                        .unwrap()
+                        .u64(8192)
+                        .unwrap();
+                    params
+                },
+                "Failed to fetch valid key length from message",
+            ),
+            (
+                {
+                    let mut params = Vec::new();
+                    minicbor::Encoder::new(&mut params)
+                        .map(2)
+                        .unwrap()
+                        .str("key_type")
+                        .unwrap()
+                        .str("RSA")
+                        .unwrap()
+                        .str("key_bits")
+                        .unwrap()
+                        .u64(2048)
+                        .unwrap();
+                    params
+                },
+                "Failed to fetch valid index from message",
+            ),
+        ];
+
+        for (params, expected) in invalid_cases {
+            let request = Request {
+                id: Cow::Borrowed("rsa"),
+                method: Cow::Borrowed("get_bip85_pubkey"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: expected.to_string(),
+                }
+            );
+        }
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("key_type")
+            .unwrap()
+            .str("RSA")
+            .unwrap()
+            .str("key_bits")
+            .unwrap()
+            .u64(4096)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("rsa"),
+            method: Cow::Borrowed("get_bip85_pubkey"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "get_bip85_pubkey RSA generation".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_bip85_digests_validates_digest_arrays_before_core_generation() {
+        let mut emulator = Emulator::new();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("key_type")
+            .unwrap()
+            .str("RSA")
+            .unwrap()
+            .str("key_bits")
+            .unwrap()
+            .u64(2048)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("rsa"),
+            method: Cow::Borrowed("sign_bip85_digests"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract digests from parameters".to_string(),
+            }
+        );
+
+        let digest = [0xab; jade_crypto::SHA256_LEN];
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(4)
+            .unwrap()
+            .str("key_type")
+            .unwrap()
+            .str("RSA")
+            .unwrap()
+            .str("key_bits")
+            .unwrap()
+            .u64(4096)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .str("digests")
+            .unwrap()
+            .array(5)
+            .unwrap();
+        for _ in 0..5 {
+            encoder.bytes(&digest).unwrap();
+        }
+        let request = Request {
+            id: Cow::Borrowed("rsa"),
+            method: Cow::Borrowed("sign_bip85_digests"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Unsupported number of digests".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(4)
+            .unwrap()
+            .str("key_type")
+            .unwrap()
+            .str("RSA")
+            .unwrap()
+            .str("key_bits")
+            .unwrap()
+            .u64(3072)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .str("digests")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .bytes(&digest)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("rsa"),
+            method: Cow::Borrowed("sign_bip85_digests"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "sign_bip85_digests RSA generation".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn get_identity_pubkey_rejects_invalid_inputs() {
         let mut emulator = Emulator::new();
         emulator
@@ -7443,6 +7806,41 @@ mod tests {
             V1Outcome::BoolResult { result: false }
         );
         assert_eq!(emulator.state.wallet, WalletLifecycle::Uninit);
+    }
+
+    #[test]
+    fn attestation_methods_are_explicit_platform_boundaries_on_host() {
+        let mut emulator = Emulator::new();
+
+        for method in ["register_attestation", "sign_attestation"] {
+            let request = Request {
+                id: Cow::Borrowed("att"),
+                method: Cow::Borrowed(method),
+                params: None,
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: "Expecting parameters map".to_string(),
+                }
+            );
+
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params).map(0).unwrap();
+            let request = Request {
+                id: Cow::Borrowed("att"),
+                method: Cow::Borrowed(method),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Attestation not supported".to_string(),
+                }
+            );
+        }
     }
 
     #[test]
