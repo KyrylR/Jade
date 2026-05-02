@@ -3360,6 +3360,9 @@ fn parse_bitcoin_tx_input_params(
     } else {
         None
     };
+    if ae_host_commitment.is_some() && script.as_deref().is_some_and(is_taproot_script_pubkey) {
+        return Err("Invalid non-empty taproot host commitment");
+    }
 
     Ok(BitcoinTxInputParams {
         path,
@@ -5093,6 +5096,26 @@ mod tests {
         input_tx: Option<&[u8]>,
         ae_host_commitment: &[u8; jade_crypto::SHA256_LEN],
     ) -> Vec<u8> {
+        sign_tx_input_params_with_ae_sighash(
+            is_witness,
+            path,
+            script,
+            1,
+            satoshi,
+            input_tx,
+            ae_host_commitment,
+        )
+    }
+
+    fn sign_tx_input_params_with_ae_sighash(
+        is_witness: bool,
+        path: &[u32],
+        script: &[u8],
+        sighash: u64,
+        satoshi: Option<u64>,
+        input_tx: Option<&[u8]>,
+        ae_host_commitment: &[u8; jade_crypto::SHA256_LEN],
+    ) -> Vec<u8> {
         let field_count = 5 + u64::from(satoshi.is_some()) + u64::from(input_tx.is_some());
         let mut params = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut params);
@@ -5117,7 +5140,7 @@ mod tests {
             .unwrap()
             .str("sighash")
             .unwrap()
-            .u64(1)
+            .u64(sighash)
             .unwrap()
             .str("ae_host_commitment")
             .unwrap()
@@ -5924,6 +5947,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sign_tx_staged_flow_rejects_non_empty_taproot_anti_exfil_commitment() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let fixture = include_str!("../../../test_data/tx_ss_bad_ae_p2tr_1.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let script = decode_hex_vec(fixture_hex_values(fixture, "script")[0]);
+        let input_tx = decode_hex_vec(fixture_hex_values(fixture, "input_tx")[0]);
+        let host_commitment =
+            decode_hex("4dc3fdadce5758c96c1a31fb8b4cbae97c89e70dd2bae33a78e6b7463d3122f9");
+
+        let start_params = sign_tx_start_params(&txn, 1, true);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let input_params = sign_tx_input_params_with_ae_sighash(
+            true,
+            &[2_147_483_734, 2_147_483_649, 2_147_483_648, 0, 1],
+            &script,
+            0,
+            None,
+            Some(&input_tx),
+            &host_commitment,
+        );
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Invalid non-empty taproot host commitment".to_string()
+            }
+        );
     }
 
     #[test]

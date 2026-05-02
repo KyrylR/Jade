@@ -123,12 +123,14 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   behavior for unowned inputs and signs Green 2-of-2, Green 2-of-3, CSV, and
   multi-input Green multisig witness-script fixtures, including low-R ECDSA
   grinding compatible with libwally. Taproot key-path `sign_tx` signs
-  SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures. Non-Taproot Bitcoin
-  anti-exfil `sign_tx` now returns signer commitments from `tx_input` and DER
-  signatures from `get_signature`, matching the P2WSH and multi-input legacy
-  P2PKH anti-exfil fixtures, including empty responses for pathless inputs.
-  PSBT anti-exfil, Taproot anti-exfil, registered/generic multisig policy
-  validation, and Liquid `sign_liquid_tx` remain explicit defers.
+  SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures, and rejects non-empty
+  Taproot anti-exfil host commitments with the v1-compatible error. Non-Taproot
+  Bitcoin anti-exfil `sign_tx` now returns signer commitments from `tx_input`
+  and DER signatures from `get_signature`, matching the P2WSH and multi-input
+  legacy P2PKH anti-exfil fixtures, including empty responses for pathless
+  inputs. PSBT anti-exfil, Taproot anti-exfil signing, registered/generic
+  multisig policy validation, and Liquid `sign_liquid_tx` remain explicit
+  defers.
 
 ## First Parity Gates
 
