@@ -272,6 +272,7 @@ dependencies = [
  "jade-core",
  "jade-protocol-v1",
  "jade-protocol-v2",
+ "jade-storage",
  "minicbor",
 ]
 

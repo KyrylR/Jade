@@ -11,11 +11,23 @@ use jade_protocol_v1::{
     encode_uint_result, method_spec, ErrorCode, ErrorResponse, MethodClass, Request,
     ResultMapEntry, V1Value,
 };
+use jade_storage::{JadeStorage, MemoryStorage, StorageLimits, StorageNamespace};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Emulator {
     state: CoreState,
     platform: HostPlatform,
+    storage: JadeStorage<MemoryStorage>,
+}
+
+impl Default for Emulator {
+    fn default() -> Self {
+        Self {
+            state: CoreState::default(),
+            platform: HostPlatform::default(),
+            storage: JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT),
+        }
+    }
 }
 
 impl Emulator {
@@ -25,6 +37,10 @@ impl Emulator {
 
     pub fn platform(&self) -> &HostPlatform {
         &self.platform
+    }
+
+    pub fn storage_mut(&mut self) -> &mut JadeStorage<MemoryStorage> {
+        &mut self.storage
     }
 
     pub fn handle_v1_request(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -92,6 +108,12 @@ impl Emulator {
                 self.state.logout();
                 V1Outcome::BoolResult { result: true }
             }
+            Some(MethodClass::Authenticated) if request.method == "get_registered_multisigs" => {
+                self.registered_wallets_result(StorageNamespace::Multisig, "multisig")
+            }
+            Some(MethodClass::Authenticated) if request.method == "get_registered_descriptors" => {
+                self.registered_wallets_result(StorageNamespace::Descriptor, "descriptor")
+            }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
@@ -110,6 +132,7 @@ impl Emulator {
                 }
                 V1Outcome::VersionInfo { info } => encode_version_info_result(&request.id, &info),
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
+                V1Outcome::EmptyMapResult => encode_map_result(&request.id, &[]),
                 V1Outcome::Reject { code, message } => encode_error_response(&ErrorResponse {
                     id: request.id,
                     code: code as i32,
@@ -131,6 +154,26 @@ impl Emulator {
 
     pub fn ping_v2(&self, id: impl Into<Cow<'static, str>>) -> jade_protocol_v2::Response<'static> {
         self.state.ping_response(id.into())
+    }
+
+    fn registered_wallets_result(
+        &self,
+        namespace: StorageNamespace,
+        wallet_kind: &'static str,
+    ) -> V1Outcome {
+        match self.storage.count(namespace) {
+            Ok(0) => V1Outcome::EmptyMapResult,
+            Ok(_) => V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: format!(
+                    "registered {wallet_kind} summary parser not yet ported to Rust core"
+                ),
+            },
+            Err(_) => V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: format!("failed to load registered {wallet_kind} records"),
+            },
+        }
     }
 }
 
@@ -367,6 +410,7 @@ pub enum V1Outcome {
     ImmediatePing { activity: jade_core::OperationState },
     VersionInfo { info: Box<VersionInfo<'static>> },
     BoolResult { result: bool },
+    EmptyMapResult,
     DeferredToCore { method: String },
     Reject { code: ErrorCode, message: String },
 }
@@ -470,6 +514,79 @@ mod tests {
             emulator.handle_v1_request(&request),
             V1Outcome::DeferredToCore {
                 method: "sign_psbt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn registered_wallet_enumeration_returns_empty_maps() {
+        let mut emulator = Emulator::new();
+
+        for method in ["get_registered_multisigs", "get_registered_descriptors"] {
+            let request = Request {
+                id: Cow::Borrowed("w"),
+                method: Cow::Borrowed(method),
+                params: None,
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::EmptyMapResult
+            );
+        }
+    }
+
+    #[test]
+    fn raw_v1_registered_wallet_enumeration_returns_empty_map() {
+        let mut emulator = Emulator::new();
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(2)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("w")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("get_registered_multisigs")
+            .unwrap();
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut result_len = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "w"),
+                "result" => result_len = decoder.map().unwrap(),
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(result_len, Some(0));
+    }
+
+    #[test]
+    fn registered_wallet_enumeration_rejects_until_summary_parser_is_ported() {
+        let mut emulator = Emulator::new();
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", b"hmac-protected-c-record")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("w"),
+            method: Cow::Borrowed("get_registered_multisigs"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "registered multisig summary parser not yet ported to Rust core"
+                    .to_string()
             }
         );
     }
