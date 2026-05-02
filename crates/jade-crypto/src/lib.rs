@@ -112,6 +112,13 @@ pub enum SinglesigScriptVariant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultisigScriptVariant {
+    P2wsh,
+    P2sh,
+    P2wshP2sh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityKeyType {
     Slip13,
     Slip17,
@@ -488,8 +495,8 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
-        IdentityKeyType, SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN,
-        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
+        IdentityKeyType, MultisigScriptVariant, SinglesigScriptVariant, XpubPrefix,
+        EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
@@ -575,6 +582,70 @@ pub mod pure_rust {
 
         let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
         Some(private_key.public_key().to_bytes())
+    }
+
+    pub fn public_key_from_serialized_xpub_path(
+        xpub: &[u8; 78],
+        path: &[u32],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let mut xpub = serialized_xpub(xpub)?;
+        for value in path {
+            if value & bip32::ChildNumber::HARDENED_FLAG != 0 {
+                return None;
+            }
+            let child = bip32::ChildNumber::new(*value, false).ok()?;
+            xpub = xpub.derive_child(child).ok()?;
+        }
+
+        Some(xpub.to_bytes())
+    }
+
+    pub fn bitcoin_multisig_address_from_xpubs(
+        xpubs: &[[u8; 78]],
+        paths: &[Vec<u32>],
+        network: BitcoinNetwork,
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<String> {
+        if xpubs.len() != paths.len() {
+            return None;
+        }
+
+        let mut pubkeys = Vec::with_capacity(xpubs.len());
+        for (xpub, path) in xpubs.iter().zip(paths.iter()) {
+            pubkeys.push(public_key_from_serialized_xpub_path(xpub, path)?);
+        }
+
+        bitcoin_multisig_address_from_pubkeys(&pubkeys, network, variant, sorted, threshold)
+    }
+
+    pub fn bitcoin_multisig_address_from_pubkeys(
+        pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
+        network: BitcoinNetwork,
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<String> {
+        let multisig_script = multisig_script(pubkeys, sorted, threshold)?;
+        match variant {
+            MultisigScriptVariant::P2wsh => {
+                let script_hash = Sha256::digest(&multisig_script);
+                bech32::segwit::encode_v0(segwit_hrp(network), script_hash.as_ref()).ok()
+            }
+            MultisigScriptVariant::P2sh => {
+                let script_hash = hash160(&multisig_script);
+                p2sh_address(network, &script_hash)
+            }
+            MultisigScriptVariant::P2wshP2sh => {
+                let witness_script_hash = Sha256::digest(&multisig_script);
+                let mut witness_program = [0u8; 34];
+                witness_program[1] = SHA256_LEN as u8;
+                witness_program[2..].copy_from_slice(witness_script_hash.as_ref());
+                let script_hash = hash160(&witness_program);
+                p2sh_address(network, &script_hash)
+            }
+        }
     }
 
     pub fn bip85_bip39_entropy_from_seed(
@@ -902,6 +973,74 @@ pub mod pure_rust {
         let mut output = [0u8; 20];
         output.copy_from_slice(&ripemd);
         output
+    }
+
+    fn p2sh_address(network: BitcoinNetwork, script_hash: &[u8; 20]) -> Option<String> {
+        let mut payload = Vec::with_capacity(21);
+        payload.push(match network {
+            BitcoinNetwork::Main => 0x05,
+            BitcoinNetwork::Test | BitcoinNetwork::Regtest => 0xc4,
+        });
+        payload.extend_from_slice(script_hash);
+        Some(base58ck::encode_check(&payload))
+    }
+
+    fn multisig_script(
+        pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<Vec<u8>> {
+        if pubkeys.is_empty()
+            || pubkeys.len() > 16
+            || threshold == 0
+            || threshold as usize > pubkeys.len()
+            || threshold > 16
+        {
+            return None;
+        }
+
+        let mut pubkeys = pubkeys.to_vec();
+        for pubkey in &pubkeys {
+            k256::PublicKey::from_sec1_bytes(pubkey).ok()?;
+        }
+        if sorted {
+            pubkeys.sort();
+        }
+
+        let pubkey_count = pubkeys.len() as u8;
+        let mut script = Vec::with_capacity(1 + pubkeys.len() * 34 + 2);
+        script.push(op_n(threshold)?);
+        for pubkey in pubkeys {
+            script.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+            script.extend_from_slice(&pubkey);
+        }
+        script.push(op_n(pubkey_count)?);
+        script.push(0xae);
+        Some(script)
+    }
+
+    fn op_n(value: u8) -> Option<u8> {
+        match value {
+            1..=16 => Some(0x50 + value),
+            _ => None,
+        }
+    }
+
+    fn serialized_xpub(bytes: &[u8; 78]) -> Option<bip32::XPub> {
+        let prefix = bip32::Prefix::from_bytes(bytes[..4].try_into().ok()?).ok()?;
+        let attrs = bip32::ExtendedKeyAttrs {
+            depth: bytes[4],
+            parent_fingerprint: bytes[5..9].try_into().ok()?,
+            child_number: bip32::ChildNumber::from_bytes(bytes[9..13].try_into().ok()?),
+            chain_code: bytes[13..45].try_into().ok()?,
+        };
+        let key_bytes = bytes[45..78].try_into().ok()?;
+        let extended = bip32::ExtendedKey {
+            prefix,
+            attrs,
+            key_bytes,
+        };
+        bip32::XPub::try_from(extended).ok()
     }
 
     fn segwit_hrp(network: BitcoinNetwork) -> bech32::Hrp {
@@ -1326,6 +1465,53 @@ mod tests {
     }
 
     #[test]
+    fn bitcoin_multisig_addresses_match_wally_script_shapes() {
+        let xpub = decode_xpub(
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhe\
+             PY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+        );
+        let xpubs = [xpub, xpub];
+        let paths = alloc::vec![alloc::vec![0], alloc::vec![1]];
+
+        assert_eq!(
+            pure_rust::bitcoin_multisig_address_from_xpubs(
+                &xpubs,
+                &paths,
+                BitcoinNetwork::Main,
+                MultisigScriptVariant::P2wsh,
+                false,
+                2,
+            )
+            .unwrap(),
+            "bc1qyjkdrj9rr6uzt46fgr7j7kelx92n0lu99ex2zsxlmlvcsaf3yy3qaxune3"
+        );
+        assert_eq!(
+            pure_rust::bitcoin_multisig_address_from_xpubs(
+                &xpubs,
+                &paths,
+                BitcoinNetwork::Main,
+                MultisigScriptVariant::P2sh,
+                false,
+                2,
+            )
+            .unwrap(),
+            "39M71fsuoh16JaZp7ptvKvYSJeiXmkMue7"
+        );
+        assert_eq!(
+            pure_rust::bitcoin_multisig_address_from_xpubs(
+                &xpubs,
+                &paths,
+                BitcoinNetwork::Test,
+                MultisigScriptVariant::P2wshP2sh,
+                true,
+                2,
+            )
+            .unwrap(),
+            "2NFbXyq2uQHdM15WcETxmTdYTfAsTPuhEkp"
+        );
+    }
+
+    #[test]
     fn bip85_bip39_entropy_matches_jade_python_vectors() {
         let mnemonic = bip39::Mnemonic::parse(
             "fish inner face ginger orchard permit useful method fence kidney chuckle party \
@@ -1711,6 +1897,11 @@ mod tests {
             *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
         }
         output
+    }
+
+    fn decode_xpub(input: &str) -> [u8; 78] {
+        let bytes = base58ck::decode_check(input).unwrap();
+        bytes.try_into().unwrap()
     }
 
     fn hex_nibble(byte: u8) -> u8 {

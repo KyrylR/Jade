@@ -23,7 +23,7 @@ use jade_storage::{
     MultisigVariant, RecordAuthenticator, StorageLimits, StorageNamespace, StorageRecord,
     HMAC_SHA256_LEN,
 };
-use minicbor::Decoder;
+use minicbor::{data::Type, Decoder};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
@@ -681,11 +681,21 @@ impl Emulator {
             return bad_parameters("Confidential addresses only apply to liquid networks");
         }
 
-        if is_liquid
-            || params.contains("multisig_name").unwrap_or(false)
-            || params.contains("descriptor_name").unwrap_or(false)
-            || !params.contains("variant").unwrap_or(false)
-        {
+        if is_liquid || params.contains("descriptor_name").unwrap_or(false) {
+            return V1Outcome::DeferredToCore {
+                method: "get_receive_address".to_string(),
+            };
+        }
+
+        let Some(network) = bitcoin_network_for_name(network_name) else {
+            return V1Outcome::DeferredToCore {
+                method: "get_receive_address".to_string(),
+            };
+        };
+        if params.contains("multisig_name").unwrap_or(false) {
+            return self.receive_multisig_address_result(params, network);
+        }
+        if !params.contains("variant").unwrap_or(false) {
             return V1Outcome::DeferredToCore {
                 method: "get_receive_address".to_string(),
             };
@@ -706,11 +716,6 @@ impl Emulator {
                 return bad_parameters("Failed to extract valid path from parameters");
             }
         };
-        let Some(network) = bitcoin_network_for_name(network_name) else {
-            return V1Outcome::DeferredToCore {
-                method: "get_receive_address".to_string(),
-            };
-        };
         let Some(seed) = self.platform.wallet_seed() else {
             return bad_parameters("Failed to generate valid singlesig script");
         };
@@ -718,6 +723,86 @@ impl Emulator {
             seed, &path, network, variant,
         ) else {
             return bad_parameters("Failed to generate valid singlesig script");
+        };
+
+        V1Outcome::TextResult { result: address }
+    }
+
+    fn receive_multisig_address_result(
+        &self,
+        params: jade_protocol_v1::Params<'_>,
+        network: jade_crypto::BitcoinNetwork,
+    ) -> V1Outcome {
+        let multisig_name = match params.str("multisig_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => return bad_parameters("Invalid multisig name parameter"),
+        };
+
+        let mut record = Vec::new();
+        if self
+            .storage
+            .get_record(
+                StorageRecord::MultisigRegistration {
+                    name: multisig_name,
+                },
+                &mut record,
+            )
+            .is_err()
+        {
+            return bad_parameters("Cannot find named multisig wallet");
+        }
+        let details = match parse_multisig_details(&record, &HostRecordAuthenticator) {
+            Ok(details) => details,
+            Err(_) => return bad_parameters("Cannot de-serialise multisig wallet data"),
+        };
+        let Some(signers) = details.signers.as_ref() else {
+            return bad_parameters("Cannot de-serialise multisig wallet data");
+        };
+        if signers.len() != details.summary.num_signers as usize
+            || details.summary.threshold == 0
+            || details.summary.threshold > details.summary.num_signers
+        {
+            return bad_parameters("Multisig wallet data invalid");
+        }
+
+        let paths = match nested_u32_arrays(
+            params,
+            "paths",
+            jade_storage::MAX_ALLOWED_SIGNERS,
+            MAX_PATH_LEN,
+        ) {
+            Ok(Some(paths)) if !paths.is_empty() => paths,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract signer paths from parameters");
+            }
+        };
+        if paths.len() != signers.len() {
+            return bad_parameters(
+                "Unexpected number of signer paths or invalid path for multisig",
+            );
+        }
+
+        let mut xpubs = Vec::with_capacity(signers.len());
+        let mut effective_paths = Vec::with_capacity(paths.len());
+        for (signer, path) in signers.iter().zip(paths.iter()) {
+            let mut effective_path = Vec::with_capacity(signer.path.len() + path.len());
+            effective_path.extend_from_slice(&signer.path);
+            effective_path.extend_from_slice(path);
+            xpubs.push(signer.xpub);
+            effective_paths.push(effective_path);
+        }
+
+        let Some(address) = jade_crypto::pure_rust::bitcoin_multisig_address_from_xpubs(
+            &xpubs,
+            &effective_paths,
+            network,
+            crypto_multisig_variant(details.summary.variant),
+            details.summary.sorted,
+            details.summary.threshold,
+        ) else {
+            return bad_parameters(
+                "Unexpected number of signer paths or invalid path for multisig",
+            );
         };
 
         V1Outcome::TextResult { result: address }
@@ -1882,6 +1967,68 @@ fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Opti
     params.bytes(field).ok().flatten()
 }
 
+fn nested_u32_arrays(
+    params: jade_protocol_v1::Params<'_>,
+    field: &str,
+    max_outer_len: usize,
+    max_inner_len: usize,
+) -> Result<Option<Vec<Vec<u32>>>, ()> {
+    let mut decoder = Decoder::new(params.raw());
+    let Some(len) = decoder.map().map_err(|_| ())? else {
+        return Err(());
+    };
+
+    for _ in 0..len {
+        match decoder.datatype().map_err(|_| ())? {
+            Type::String => {
+                let key = decoder.str().map_err(|_| ())?;
+                if key != field {
+                    decoder.skip().map_err(|_| ())?;
+                    continue;
+                }
+
+                let Some(outer_len) = decoder.array().map_err(|_| ())? else {
+                    return Err(());
+                };
+                if outer_len as usize > max_outer_len {
+                    return Err(());
+                }
+
+                let mut outer = Vec::with_capacity(outer_len as usize);
+                for _ in 0..outer_len {
+                    let Some(inner_len) = decoder.array().map_err(|_| ())? else {
+                        return Err(());
+                    };
+                    if inner_len == 0 || inner_len as usize > max_inner_len {
+                        return Err(());
+                    }
+
+                    let mut inner = Vec::with_capacity(inner_len as usize);
+                    for _ in 0..inner_len {
+                        inner.push(decoder.u32().map_err(|_| ())?);
+                    }
+                    outer.push(inner);
+                }
+                return Ok(Some(outer));
+            }
+            _ => {
+                decoder.skip().map_err(|_| ())?;
+                decoder.skip().map_err(|_| ())?;
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn crypto_multisig_variant(variant: MultisigVariant) -> jade_crypto::MultisigScriptVariant {
+    match variant {
+        MultisigVariant::P2wsh => jade_crypto::MultisigScriptVariant::P2wsh,
+        MultisigVariant::P2sh => jade_crypto::MultisigScriptVariant::P2sh,
+        MultisigVariant::P2wshP2sh => jade_crypto::MultisigScriptVariant::P2wshP2sh,
+    }
+}
+
 fn valid_identity(identity: &str) -> bool {
     identity.len() < 192
         && ((identity.len() > "ssh://".len() && identity.starts_with("ssh://"))
@@ -2422,6 +2569,11 @@ mod tests {
             "f1d56befd46eddfc31cda129dc76cd4a2b41d2cf86f10a5ccf0787617afa3869\
              967aab0224742ccc002056747ea09b68598ddf79c027c37a7c3ec923004593da",
         )
+    }
+
+    fn decode_xpub(input: &str) -> [u8; BIP32_SERIALIZED_LEN] {
+        let bytes = base58ck::decode_check(input).unwrap();
+        bytes.try_into().unwrap()
     }
 
     #[test]
@@ -3553,6 +3705,153 @@ mod tests {
     }
 
     #[test]
+    fn get_receive_address_derives_registered_multisig_address() {
+        let mut emulator = Emulator::new();
+        let xpub = decode_xpub(
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhe\
+             PY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 0, 2]);
+        payload.push(0);
+        payload.push(2);
+        for signer in 0..2u8 {
+            payload.extend_from_slice(&[signer; 4]);
+            payload.push(0);
+            payload.extend_from_slice(&xpub);
+            payload.push(0);
+        }
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(1)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "bc1qyjkdrj9rr6uzt46fgr7j7kelx92n0lu99ex2zsxlmlvcsaf3yy3qaxune3"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_receive_address_rejects_invalid_registered_multisig_paths() {
+        let mut emulator = Emulator::new();
+        let xpub = decode_xpub(
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhe\
+             PY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 0, 2]);
+        payload.push(0);
+        payload.push(2);
+        for signer in 0..2u8 {
+            payload.extend_from_slice(&[signer; 4]);
+            payload.push(0);
+            payload.extend_from_slice(&xpub);
+            payload.push(0);
+        }
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract signer paths from parameters".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(1)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Unexpected number of signer paths or invalid path for multisig"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
     fn raw_v1_get_receive_address_returns_string_result() {
         let mut emulator = Emulator::new();
         emulator.platform_mut().set_debug_wallet_seed(vec![
@@ -4188,6 +4487,31 @@ mod tests {
             emulator.handle_v1_request(&request),
             V1Outcome::DeferredToCore {
                 method: "get_receive_address".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("missing")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Cannot find named multisig wallet".to_string()
             }
         );
 
