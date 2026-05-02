@@ -1777,8 +1777,9 @@ pub mod pure_rust {
                 .try_sign_prehashed_rfc6979::<k256::sha2::Sha256>(&z, ad)
                 .ok()?;
             let signature = signature.normalize_s().unwrap_or(signature);
-            let der = signature.to_der();
-            if der.as_bytes().len() < 71 {
+            let raw = signature.to_bytes();
+            if raw[0] < 0x80 {
+                let der = signature.to_der();
                 let mut output = der.as_bytes().to_vec();
                 output.push(sighash_type);
                 return Some(output);

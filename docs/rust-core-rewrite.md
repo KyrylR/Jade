@@ -116,9 +116,13 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   the signature from `get_signature`, matching the current client protocol.
   Rust also validates full Bitcoin `input_tx` prevouts by txid, extracts
   witness amounts from them, and matches the multi-input P2WPKH and
-  P2SH-P2WPKH legacy-output fixtures. Taproot key-path `sign_tx` now signs
+  P2SH-P2WPKH legacy-output fixtures. It now preserves the v1 empty-signature
+  behavior for unowned inputs and signs Green 2-of-2, Green 2-of-3, CSV, and
+  multi-input Green multisig witness-script fixtures, including low-R ECDSA
+  grinding compatible with libwally. Taproot key-path `sign_tx` signs
   SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures. Real anti-exfil signatures,
-  multisig `sign_tx`, and Liquid `sign_liquid_tx` remain explicit defers.
+  registered/generic multisig policy validation, and Liquid `sign_liquid_tx`
+  remain explicit defers.
 
 ## First Parity Gates
 

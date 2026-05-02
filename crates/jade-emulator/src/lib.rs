@@ -3136,8 +3136,8 @@ fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Opti
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BitcoinTxInputParams {
-    path: Vec<u32>,
-    script: Vec<u8>,
+    path: Option<Vec<u32>>,
+    script: Option<Vec<u8>>,
     sighash: u32,
     is_witness: bool,
     satoshi: Option<u64>,
@@ -3153,15 +3153,21 @@ fn parse_bitcoin_tx_input_params(
         Ok(None) | Err(_) => return Err("Failed to extract is_witness from parameters"),
     };
     let path = match params.u32_array("path", MAX_PATH_LEN) {
-        Ok(Some(path)) if !path.is_empty() => path,
-        Ok(_) | Err(_) => return Err("Failed to extract path from parameters"),
+        Ok(Some(path)) if !path.is_empty() => Some(path),
+        Ok(Some(_)) | Err(_) => return Err("Failed to extract path from parameters"),
+        Ok(None) => None,
     };
-    let script = match params.bytes("script") {
-        Ok(Some(script)) if !script.is_empty() => script.to_vec(),
-        Ok(_) | Err(_) => return Err("Failed to extract script from parameters"),
+    let script = if path.is_some() {
+        match params.bytes("script") {
+            Ok(Some(script)) if !script.is_empty() => Some(script.to_vec()),
+            Ok(_) | Err(_) => return Err("Failed to extract script from parameters"),
+        }
+    } else {
+        None
     };
     let sighash = match params.u64("sighash") {
         Ok(Some(sighash)) if sighash <= u32::MAX as u64 => sighash as u32,
+        Ok(None) if script.as_deref().is_some_and(is_taproot_script_pubkey) => 0,
         Ok(None) => 1,
         Ok(Some(_)) | Err(_) => return Err("Failed to extract sighash from parameters"),
     };
@@ -3174,13 +3180,17 @@ fn parse_bitcoin_tx_input_params(
         Ok(Some(_)) | Ok(None) => None,
         Err(()) => return Err("Failed to extract input_tx from parameters"),
     };
-    let uses_ae = match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
-        Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
-        Ok(Some(commitment)) if commitment.is_empty() => false,
-        Ok(Some(_)) | Err(()) => {
-            return Err("Failed to extract valid host commitment from parameters")
+    let uses_ae = if path.is_some() {
+        match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
+            Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
+            Ok(Some(commitment)) if commitment.is_empty() => false,
+            Ok(Some(_)) | Err(()) => {
+                return Err("Failed to extract valid host commitment from parameters")
+            }
+            Ok(None) => false,
         }
-        Ok(None) => false,
+    } else {
+        false
     };
 
     Ok(BitcoinTxInputParams {
@@ -3200,7 +3210,9 @@ fn sign_bitcoin_tx_input(
     tx_input_index: usize,
     input: &BitcoinTxInputParams,
 ) -> Result<Vec<u8>, jade_crypto::TxSignError> {
-    let signing_input = bitcoin_tx_sign_input(txn, tx_input_index, input)?;
+    let Some(signing_input) = bitcoin_tx_sign_input(txn, tx_input_index, input)? else {
+        return Ok(Vec::new());
+    };
     let mut signatures =
         jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &[signing_input])?;
     Ok(signatures.remove(0))
@@ -3212,17 +3224,41 @@ fn sign_bitcoin_tx_inputs(
     inputs: &[BitcoinTxInputParams],
 ) -> Result<Vec<Vec<u8>>, jade_crypto::TxSignError> {
     let mut signing_inputs = Vec::with_capacity(inputs.len());
+    let mut signing_indexes = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.iter().enumerate() {
-        signing_inputs.push(bitcoin_tx_sign_input(txn, index, input)?);
+        if let Some(signing_input) = bitcoin_tx_sign_input(txn, index, input)? {
+            signing_indexes.push(index);
+            signing_inputs.push(signing_input);
+        }
     }
-    jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &signing_inputs)
+    if signing_inputs.is_empty() {
+        return Ok(vec![Vec::new(); inputs.len()]);
+    }
+    let signatures =
+        jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &signing_inputs)?;
+    if signatures.len() != signing_indexes.len() {
+        return Err(jade_crypto::TxSignError::Invalid);
+    }
+
+    let mut ordered = vec![Vec::new(); inputs.len()];
+    for (index, signature) in signing_indexes.into_iter().zip(signatures) {
+        ordered[index] = signature;
+    }
+    Ok(ordered)
 }
 
 fn bitcoin_tx_sign_input<'a>(
     txn: &[u8],
     tx_input_index: usize,
     input: &'a BitcoinTxInputParams,
-) -> Result<jade_crypto::pure_rust::BitcoinTxSignInput<'a>, jade_crypto::TxSignError> {
+) -> Result<Option<jade_crypto::pure_rust::BitcoinTxSignInput<'a>>, jade_crypto::TxSignError> {
+    let Some(path) = input.path.as_deref() else {
+        return Ok(None);
+    };
+    let script = input
+        .script
+        .as_deref()
+        .ok_or(jade_crypto::TxSignError::Invalid)?;
     let satoshi = match (input.satoshi, input.input_tx.as_deref()) {
         (Some(satoshi), _) => Some(satoshi),
         (None, Some(input_tx)) => Some(jade_crypto::pure_rust::bitcoin_prevout_amount(
@@ -3232,14 +3268,18 @@ fn bitcoin_tx_sign_input<'a>(
         )?),
         (None, None) => None,
     };
-    Ok(jade_crypto::pure_rust::BitcoinTxSignInput {
+    Ok(Some(jade_crypto::pure_rust::BitcoinTxSignInput {
         tx_input_index,
-        path: &input.path,
-        script_code: &input.script,
+        path,
+        script_code: script,
         sighash: input.sighash,
         is_witness: input.is_witness,
         satoshi,
-    })
+    }))
+}
+
+fn is_taproot_script_pubkey(script: &[u8]) -> bool {
+    script.len() == 34 && script[0] == 0x51 && script[1] == jade_crypto::SHA256_LEN as u8
 }
 
 fn cbor_map_field<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [u8]>, ()> {
@@ -4842,6 +4882,30 @@ mod tests {
         params
     }
 
+    fn sign_tx_unsigned_input_params(
+        is_witness: bool,
+        satoshi: Option<u64>,
+        input_tx: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let field_count = 1 + u64::from(satoshi.is_some()) + u64::from(input_tx.is_some());
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(field_count)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(is_witness)
+            .unwrap();
+        if let Some(satoshi) = satoshi {
+            encoder.str("satoshi").unwrap().u64(satoshi).unwrap();
+        }
+        if let Some(input_tx) = input_tx {
+            encoder.str("input_tx").unwrap().bytes(input_tx).unwrap();
+        }
+        params
+    }
+
     fn decode_xpub(input: &str) -> [u8; BIP32_SERIALIZED_LEN] {
         let bytes = base58ck::decode_check(input).unwrap();
         bytes.try_into().unwrap()
@@ -5204,6 +5268,134 @@ mod tests {
                     }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sign_tx_legacy_flow_returns_empty_for_unowned_inputs() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/txn_segwit_no_signing.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let start_params = sign_tx_start_params(&txn, 1, false);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let input_params = sign_tx_unsigned_input_params(true, Some(2_200_000), None);
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult { result: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn sign_tx_legacy_flow_signs_green_multisig_witness_scripts() {
+        for (fixture, path, satoshi) in [
+            (
+                include_str!("../../../test_data/txn_2of2_change.json"),
+                &[1, 2][..],
+                500_000_000,
+            ),
+            (
+                include_str!("../../../test_data/txn_2of3_change.json"),
+                &[2_147_483_651, 2_147_483_649, 1, 1][..],
+                4_883_121,
+            ),
+            (
+                include_str!("../../../test_data/txn_2of2csv_change.json"),
+                &[1, 1][..],
+                100_000_000,
+            ),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let script = decode_hex_vec(fixture_hex_values(fixture, "script")[0]);
+            let expected = fixture_expected_output_signatures(fixture);
+
+            let start_params = sign_tx_start_params(&txn, 1, false);
+            let start_request = Request {
+                id: Cow::Borrowed("tx"),
+                method: Cow::Borrowed("sign_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            let input_params = sign_tx_input_params(true, path, &script, Some(satoshi), None);
+            let input_request = Request {
+                id: Cow::Borrowed("input"),
+                method: Cow::Borrowed("tx_input"),
+                params: Some(&input_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&input_request),
+                V1Outcome::BytesResult {
+                    result: decode_hex_vec(expected[0])
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn sign_tx_legacy_flow_signs_green_multisig_prevout_transactions() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/txn_segwit_multi_input.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let scripts = fixture_hex_values(fixture, "script");
+        let input_txs = fixture_hex_values(fixture, "input_tx");
+        let expected = fixture_expected_output_signatures(fixture);
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(input_txs.len(), 2);
+        assert_eq!(expected.len(), 2);
+
+        let start_params = sign_tx_start_params(&txn, expected.len() as u64, false);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        for index in 0..expected.len() {
+            let script = decode_hex_vec(scripts[index]);
+            let input_tx = decode_hex_vec(input_txs[index]);
+            let input_params = sign_tx_input_params(true, &[1, 1], &script, None, Some(&input_tx));
+            let input_request = Request {
+                id: Cow::Borrowed("input"),
+                method: Cow::Borrowed("tx_input"),
+                params: Some(&input_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&input_request),
+                V1Outcome::BytesResult {
+                    result: decode_hex_vec(expected[index])
+                }
+            );
         }
     }
 
