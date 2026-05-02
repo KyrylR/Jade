@@ -149,7 +149,7 @@ pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
         IdentityKeyType, SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN,
-        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN,
+        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
@@ -251,13 +251,75 @@ pub mod pure_rust {
         iv: &[u8; 16],
     ) -> Option<Bip85EncryptedEntropy> {
         let entropy = bip85_bip39_entropy_from_seed(seed, nwords, index)?;
+        bip85_encrypted_entropy(
+            &entropy,
+            b"bip85_bip39_entropy",
+            host_pubkey,
+            ephemeral_private_key,
+            iv,
+        )
+    }
+
+    pub fn bip85_rsa_entropy_from_seed(
+        seed: &[u8],
+        key_bits: u32,
+        index: u32,
+    ) -> Option<[u8; SHA512_LEN]> {
+        if key_bits > 0x7fff_ffff || index > 0x7fff_ffff {
+            return None;
+        }
+
+        let path = [
+            bip32::ChildNumber::HARDENED_FLAG | 83_696_968,
+            bip32::ChildNumber::HARDENED_FLAG | 828_365,
+            bip32::ChildNumber::HARDENED_FLAG | key_bits,
+            bip32::ChildNumber::HARDENED_FLAG | index,
+        ];
+        let mut derivation_path = bip32::DerivationPath::default();
+        for value in path {
+            let child =
+                bip32::ChildNumber::new(value & !bip32::ChildNumber::HARDENED_FLAG, true).ok()?;
+            derivation_path.push(child);
+        }
+
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        let mut mac = HmacSha512::new_from_slice(b"bip-entropy-from-k").ok()?;
+        mac.update(private_key.to_bytes().as_ref());
+        mac.finalize().into_bytes().as_slice().try_into().ok()
+    }
+
+    pub fn bip85_rsa_encrypted_entropy_from_seed(
+        seed: &[u8],
+        key_bits: u32,
+        index: u32,
+        host_pubkey: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        ephemeral_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        iv: &[u8; 16],
+    ) -> Option<Bip85EncryptedEntropy> {
+        let entropy = bip85_rsa_entropy_from_seed(seed, key_bits, index)?;
+        bip85_encrypted_entropy(
+            &entropy,
+            b"bip85_rsa_entropy",
+            host_pubkey,
+            ephemeral_private_key,
+            iv,
+        )
+    }
+
+    fn bip85_encrypted_entropy(
+        entropy: &[u8],
+        label: &[u8],
+        host_pubkey: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        ephemeral_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        iv: &[u8; 16],
+    ) -> Option<Bip85EncryptedEntropy> {
         let ephemeral_pubkey = public_key_from_private_key(ephemeral_private_key)?;
         let encrypted = wally_aes_cbc_with_ecdh_key_encrypt(
             ephemeral_private_key,
             iv,
-            &entropy,
+            entropy,
             host_pubkey,
-            b"bip85_bip39_entropy",
+            label,
         )?;
 
         Some(Bip85EncryptedEntropy {
@@ -851,6 +913,40 @@ mod tests {
     }
 
     #[test]
+    fn bip85_rsa_entropy_matches_jade_python_vectors() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "fish inner face ginger orchard permit useful method fence kidney chuckle party \
+             favorite sunset draw limb science crane oval letter slot invite sadness banana",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+
+        for (key_bits, index, expected) in [
+            (
+                1024,
+                0,
+                "45954a1a1b82976d9cf16ded12d304abaff7c6786f0556ef38335ec447116074e12ad6857334958b69a3aaf56d9dac5fab9ff515b031887b859dd08a7a806e42",
+            ),
+            (
+                4096,
+                1,
+                "99e120fc417959b4145bbfc7dede19622c4223466b63866a3b1ac4bdac2344ad85ecacd930a98c8d9ffc918803e873d6b351a6b003ee2e58d9f73f4e97342338",
+            ),
+            (
+                8192,
+                0,
+                "0cbc707c69602095287624e78aaae4ab8048fa8b5407dadf87a6a0abd9162cabb618900bcec641053edda87e412a93344a4d14a0c2e22ba9af9759a9114f8f20",
+            ),
+        ] {
+            assert_eq!(
+                pure_rust::bip85_rsa_entropy_from_seed(&seed, key_bits, index).unwrap(),
+                decode_hex_64(expected),
+                "{key_bits}/{index}"
+            );
+        }
+    }
+
+    #[test]
     fn identity_public_keys_match_jade_fixtures() {
         let mnemonic = bip39::Mnemonic::parse(
             "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
@@ -1083,6 +1179,16 @@ mod tests {
     fn decode_hex_65(input: &str) -> [u8; 65] {
         assert_eq!(input.len(), 130);
         let mut output = [0u8; 65];
+        let bytes = input.as_bytes();
+        for (index, output_byte) in output.iter_mut().enumerate() {
+            *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
+        }
+        output
+    }
+
+    fn decode_hex_64(input: &str) -> [u8; 64] {
+        assert_eq!(input.len(), 128);
+        let mut output = [0u8; 64];
         let bytes = input.as_bytes();
         for (index, output_byte) in output.iter_mut().enumerate() {
             *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);

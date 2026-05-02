@@ -155,6 +155,9 @@ impl Emulator {
             Some(MethodClass::Debug) if request.method == "get_bip85_bip39_entropy" => {
                 self.bip85_bip39_entropy_result(request)
             }
+            Some(MethodClass::Debug) if request.method == "get_bip85_rsa_entropy" => {
+                self.bip85_rsa_entropy_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_registered_multisigs" => {
                 self.registered_wallets_result(StorageNamespace::Multisig, "multisig")
             }
@@ -956,6 +959,81 @@ impl Emulator {
         })
     }
 
+    fn bip85_rsa_entropy_result(&self, request: &Request<'_>) -> V1Outcome {
+        match self.bip85_rsa_entropy_data(request) {
+            Ok(data) => V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "pubkey".to_string(),
+                        value: OwnedV1Value::Bytes(data.pubkey.to_vec()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "encrypted".to_string(),
+                        value: OwnedV1Value::Bytes(data.encrypted),
+                    },
+                ],
+            },
+            Err(outcome) => outcome,
+        }
+    }
+
+    fn bip85_rsa_entropy_data(
+        &self,
+        request: &Request<'_>,
+    ) -> Result<jade_crypto::Bip85EncryptedEntropy, V1Outcome> {
+        let Some(params) = request.params() else {
+            return Err(V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            });
+        };
+        let key_bits = match params.u64("key_bits") {
+            Ok(Some(key_bits)) if valid_rsa_key_bits(key_bits) => key_bits as u32,
+            Ok(_) | Err(_) => {
+                return Err(bad_parameters(
+                    "Failed to fetch valid number of key_bits from message",
+                ));
+            }
+        };
+        let index = match params.u64("index") {
+            Ok(Some(index)) if index <= 0x7fff_ffff => index as u32,
+            Ok(_) | Err(_) => {
+                return Err(bad_parameters("Failed to fetch valid index from message"));
+            }
+        };
+        let host_pubkey = match params.bytes("pubkey") {
+            Ok(Some(bytes)) => {
+                match <&[u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN]>::try_from(bytes) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Err(bad_parameters("Failed to fetch valid pubkey from message"));
+                    }
+                }
+            }
+            Ok(None) | Err(_) => {
+                return Err(bad_parameters("Failed to fetch valid pubkey from message"));
+            }
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return Err(V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to calculate bip85 entropy from parameters".to_string(),
+            });
+        };
+        jade_crypto::pure_rust::bip85_rsa_encrypted_entropy_from_seed(
+            seed,
+            key_bits,
+            index,
+            host_pubkey,
+            &self.platform.bip85_ephemeral_private_key,
+            &self.platform.bip85_iv,
+        )
+        .ok_or_else(|| V1Outcome::Reject {
+            code: ErrorCode::InternalError,
+            message: "Failed to encrypt bip85 entropy".to_string(),
+        })
+    }
+
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -1579,6 +1657,10 @@ fn valid_compressed_secp256k1_pubkey(pubkey: &[u8]) -> bool {
     pubkey.len() == jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN
         && matches!(pubkey.first(), Some(0x02 | 0x03))
         && jade_crypto::pure_rust::k256::PublicKey::from_sec1_bytes(pubkey).is_ok()
+}
+
+fn valid_rsa_key_bits(key_bits: u64) -> bool {
+    matches!(key_bits, 1024 | 2048 | 3072 | 4096 | 8192)
 }
 
 fn multisig_signer_entries(signer: &MultisigSignerDetails) -> Vec<OwnedResultMapEntry> {
@@ -3224,6 +3306,70 @@ mod tests {
         assert_eq!(
             emulator.handle_v1_request(&request),
             V1Outcome::BoolResult { result: true }
+        );
+    }
+
+    #[test]
+    fn get_bip85_rsa_entropy_returns_encrypted_reply() {
+        let mut emulator = Emulator::new();
+        let mnemonic = bip39::Mnemonic::parse(
+            "fish inner face ginger orchard permit useful method fence kidney chuckle party \
+             favorite sunset draw limb science crane oval letter slot invite sadness banana",
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(mnemonic.to_seed("").to_vec());
+
+        let host_pubkey =
+            decode_hex::<33>("03e581be89d1ef8ce11d60746d08e4f8aedf934d1d861dd436042ee2e3b16db918");
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("key_bits")
+            .unwrap()
+            .u64(1024)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .str("pubkey")
+            .unwrap()
+            .bytes(&host_pubkey)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_bip85_rsa_entropy"),
+            params: Some(&params),
+        };
+
+        let V1Outcome::OwnedMapResult { entries } = emulator.handle_v1_request(&request) else {
+            panic!("expected encrypted entropy map");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "pubkey");
+        assert_eq!(
+            entries[0].value,
+            OwnedV1Value::Bytes(
+                decode_hex::<33>(
+                    "03ff06999ad61c0f3a733b93fc1e6b75ecfb1439b326e840de590a56454f0eeb0d"
+                )
+                .to_vec()
+            )
+        );
+        assert_eq!(entries[1].key, "encrypted");
+        let OwnedV1Value::Bytes(encrypted) = &entries[1].value else {
+            panic!("expected encrypted bytes");
+        };
+        assert_eq!(encrypted.len(), 128);
+        assert_eq!(
+            &encrypted[..16],
+            &[
+                0xbd, 0x5d, 0x47, 0x24, 0x24, 0x38, 0x80, 0x73, 0x8e, 0x7e, 0x8b, 0x0c, 0x02, 0x65,
+                0x87, 0x00,
+            ]
         );
     }
 
