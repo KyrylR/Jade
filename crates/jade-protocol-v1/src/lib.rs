@@ -319,6 +319,10 @@ impl<'a> Request<'a> {
         validate_id(&self.id)?;
         validate_method(&self.method)
     }
+
+    pub fn params(&self) -> Option<Params<'a>> {
+        self.params.map(Params)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +330,70 @@ pub struct ErrorResponse<'a> {
     pub id: Cow<'a, str>,
     pub code: i32,
     pub message: Cow<'a, str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Params<'a>(&'a [u8]);
+
+impl<'a> Params<'a> {
+    pub fn raw(self) -> &'a [u8] {
+        self.0
+    }
+
+    pub fn bool(self, field: &str) -> Result<Option<bool>, ValidationError> {
+        self.find_field(field, |decoder| {
+            decoder.bool().map_err(ValidationError::from)
+        })
+    }
+
+    pub fn u64(self, field: &str) -> Result<Option<u64>, ValidationError> {
+        self.find_field(field, |decoder| {
+            decoder.u64().map_err(ValidationError::from)
+        })
+    }
+
+    pub fn str(self, field: &str) -> Result<Option<&'a str>, ValidationError> {
+        self.find_field(field, |decoder| {
+            decoder.str().map_err(ValidationError::from)
+        })
+    }
+
+    pub fn bytes(self, field: &str) -> Result<Option<&'a [u8]>, ValidationError> {
+        self.find_field(field, |decoder| {
+            decoder.bytes().map_err(ValidationError::from)
+        })
+    }
+
+    fn find_field<T>(
+        self,
+        field: &str,
+        decode: impl FnOnce(&mut Decoder<'a>) -> Result<T, ValidationError>,
+    ) -> Result<Option<T>, ValidationError> {
+        let mut decoder = Decoder::new(self.0);
+        let Some(len) = decoder.map()? else {
+            return Err(ValidationError::MalformedCbor);
+        };
+
+        let mut decode = Some(decode);
+        for _ in 0..len {
+            match decoder.datatype()? {
+                Type::String => {
+                    let key = decoder.str()?;
+                    if key == field {
+                        return decode.take().expect("decode closure used once")(&mut decoder)
+                            .map(Some);
+                    }
+                    decoder.skip()?;
+                }
+                _ => {
+                    decoder.skip()?;
+                    decoder.skip()?;
+                }
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -533,6 +601,26 @@ mod tests {
             request.params.unwrap(),
             &[0xa1, 0x6b, b'n', b'o', b'n', b'b', b'l', b'o', b'c', b'k', b'i', b'n', b'g', 0xf5]
         );
+        assert_eq!(
+            request.params().unwrap().bool("nonblocking"),
+            Ok(Some(true))
+        );
+    }
+
+    #[test]
+    fn reads_typed_params_fields() {
+        let params = Params(&[
+            0xa4, 0x65, b'e', b'p', b'o', b'c', b'h', 0x1a, 0x65, 0x53, 0xf1, 0x00, 0x67, b'n',
+            b'e', b't', b'w', b'o', b'r', b'k', 0x67, b't', b'e', b's', b't', b'n', b'e', b't',
+            0x66, b'b', b'i', b'n', b'a', b'r', b'y', 0x42, 0xab, 0xcd, 0x64, b'f', b'l', b'a',
+            b'g', 0xf4,
+        ]);
+
+        assert_eq!(params.u64("epoch"), Ok(Some(1_700_000_000)));
+        assert_eq!(params.str("network"), Ok(Some("testnet")));
+        assert_eq!(params.bytes("binary"), Ok(Some(&[0xab, 0xcd][..])));
+        assert_eq!(params.bool("flag"), Ok(Some(false)));
+        assert_eq!(params.u64("missing"), Ok(None));
     }
 
     #[test]
