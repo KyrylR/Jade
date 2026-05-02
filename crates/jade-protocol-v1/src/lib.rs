@@ -378,6 +378,27 @@ impl<'a> Params<'a> {
         })
     }
 
+    pub fn u32_array(
+        self,
+        field: &str,
+        max_len: usize,
+    ) -> Result<Option<Vec<u32>>, ValidationError> {
+        self.find_field(field, |decoder| {
+            let Some(len) = decoder.array()? else {
+                return Err(ValidationError::MalformedCbor);
+            };
+            if len as usize > max_len {
+                return Err(ValidationError::ArrayTooLong);
+            }
+
+            let mut values = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                values.push(decoder.u32()?);
+            }
+            Ok(values)
+        })
+    }
+
     fn find_field<T>(
         self,
         field: &str,
@@ -421,6 +442,7 @@ pub enum ValidationError {
     TrailingData,
     MissingId,
     MissingMethod,
+    ArrayTooLong,
 }
 
 impl From<minicbor::decode::Error> for ValidationError {
@@ -595,6 +617,7 @@ pub fn validate_method(method: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn all_catalog_methods_fit_v1_wire_limits() {
@@ -668,6 +691,23 @@ mod tests {
         assert_eq!(params.bytes("binary"), Ok(Some(&[0xab, 0xcd][..])));
         assert_eq!(params.bool("flag"), Ok(Some(false)));
         assert_eq!(params.u64("missing"), Ok(None));
+    }
+
+    #[test]
+    fn reads_bounded_u32_path_arrays() {
+        let params = Params(&[
+            0xa1, 0x64, b'p', b'a', b't', b'h', 0x83, 0x1a, 0x80, 0x00, 0x00, 0x54, 0x1a, 0x80,
+            0x00, 0x00, 0x00, 0x00,
+        ]);
+
+        assert_eq!(
+            params.u32_array("path", 3),
+            Ok(Some(vec![0x8000_0054, 0x8000_0000, 0]))
+        );
+        assert_eq!(
+            params.u32_array("path", 2),
+            Err(ValidationError::ArrayTooLong)
+        );
     }
 
     #[test]
