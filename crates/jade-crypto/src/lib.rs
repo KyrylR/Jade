@@ -2164,33 +2164,45 @@ pub mod pure_rust {
         let mut cursor = 0;
 
         for (input_index, input) in inputs.iter().enumerate() {
-            let mut matching = signatures
+            let mut matching: Vec<&PsbtSignature> = signatures
                 .iter()
                 .filter(|signature| signature.input_index == input_index)
-                .peekable();
-            if matching.peek().is_none() {
+                .collect();
+            if matching.is_empty() {
                 continue;
             }
+            matching.sort_by(|left, right| left.key.cmp(&right.key));
 
-            let insert_offset = input
-                .entries
-                .iter()
-                .filter(|entry| matches!(entry.key.first().copied(), Some(0x00 | 0x01 | 0x03)))
-                .map(|entry| entry.end)
-                .next_back()
-                .unwrap_or(input.content_start);
-            if insert_offset < cursor || insert_offset > input.end || insert_offset > psbt.len() {
-                return Err(PsbtSignError::Invalid);
-            }
-
-            output.extend_from_slice(&psbt[cursor..insert_offset]);
+            let mut inserts = Vec::with_capacity(matching.len());
             for signature in matching {
+                let insert_offset = input
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.key < signature.key.as_slice())
+                    .map(|entry| entry.end)
+                    .next_back()
+                    .unwrap_or(input.content_start);
+                inserts.push((insert_offset, signature));
+            }
+            inserts.sort_by(|(left_offset, left), (right_offset, right)| {
+                left_offset
+                    .cmp(right_offset)
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+
+            for (insert_offset, signature) in inserts {
+                if insert_offset < cursor || insert_offset > input.end || insert_offset > psbt.len()
+                {
+                    return Err(PsbtSignError::Invalid);
+                }
+
+                output.extend_from_slice(&psbt[cursor..insert_offset]);
                 push_compact_size(&mut output, signature.key.len());
                 output.extend_from_slice(&signature.key);
                 push_compact_size(&mut output, signature.signature.len());
                 output.extend_from_slice(&signature.signature);
+                cursor = insert_offset;
             }
-            cursor = insert_offset;
         }
 
         output.extend_from_slice(&psbt[cursor..]);

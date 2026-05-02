@@ -6601,6 +6601,8 @@ mod tests {
         for fixture in [
             include_str!("../../../test_data/psbt_tm_green_multisig_2of2csv.json"),
             include_str!("../../../test_data/psbt_tm_green_multisig_2of3.json"),
+            include_str!("../../../test_data/psbt_tm_multisig_segwit_many_inputs.json"),
+            include_str!("../../../test_data/psbt_tm_multisig_segwit_many_inputs_2.json"),
         ] {
             let mut emulator = Emulator::new();
             emulator
