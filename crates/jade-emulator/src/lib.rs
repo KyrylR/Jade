@@ -135,6 +135,9 @@ impl Emulator {
             Some(MethodClass::PreAuth) if request.method == "update_pinserver" => {
                 self.update_pinserver(request)
             }
+            Some(MethodClass::PreAuth) if request.method == "auth_user" => {
+                self.auth_user_result(request)
+            }
             Some(MethodClass::Debug) if request.method == "debug_clean_reset" => {
                 match self.storage.debug_clean_reset() {
                     Ok(()) => {
@@ -2190,6 +2193,44 @@ impl Emulator {
         }
 
         V1Outcome::BoolResult { result: true }
+    }
+
+    fn auth_user_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        match params.str("network") {
+            Ok(Some(network)) if valid_network_name(network) => {}
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters");
+            }
+        }
+        if params.contains("epoch").unwrap_or(false) {
+            let epoch = match params.u64("epoch") {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) | Err(_) => {
+                    return bad_parameters("Failed to extract valid epoch value from parameters");
+                }
+            };
+            if let Err(err) = self.state.set_epoch(&mut self.platform, epoch) {
+                return reject_core_error(err);
+            }
+        }
+        let _suppress_pin_change_confirmation =
+            optional_bool(params, "suppress_pin_change_confirmation");
+
+        if self.platform.wallet_seed().is_some() {
+            if self.state.wallet != WalletLifecycle::Temporary {
+                self.state.wallet = WalletLifecycle::Ready;
+            }
+            V1Outcome::BoolResult { result: true }
+        } else {
+            V1Outcome::BoolResult { result: false }
+        }
     }
 
     fn debug_set_mnemonic(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -7270,6 +7311,138 @@ mod tests {
             [0xa2, 0x62, b'i', b'd', 0x61, b't', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
         );
         assert_eq!(emulator.platform().epoch(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn auth_user_rejects_bad_parameters() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("auth"),
+            method: Cow::Borrowed("auth_user"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("notanetwork")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("auth"),
+            method: Cow::Borrowed("auth_user"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid network from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("epoch")
+            .unwrap()
+            .str("notanumber")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("auth"),
+            method: Cow::Borrowed("auth_user"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid epoch value from parameters".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn auth_user_updates_epoch_and_unlocks_host_wallet() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        emulator.state.wallet = WalletLifecycle::Locked;
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("epoch")
+            .unwrap()
+            .u64(1_700_000_123)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("auth"),
+            method: Cow::Borrowed("auth_user"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.platform().epoch(), Some(1_700_000_123));
+        assert_eq!(emulator.state.wallet, WalletLifecycle::Ready);
+    }
+
+    #[test]
+    fn auth_user_preserves_temporary_wallet_and_fails_without_keys() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        emulator.state.wallet = WalletLifecycle::Temporary;
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("auth"),
+            method: Cow::Borrowed("auth_user"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.state.wallet, WalletLifecycle::Temporary);
+
+        let mut emulator = Emulator::new();
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: false }
+        );
+        assert_eq!(emulator.state.wallet, WalletLifecycle::Uninit);
     }
 
     #[test]
