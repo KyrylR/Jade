@@ -612,9 +612,11 @@ impl Emulator {
         };
 
         if params.contains("multisig_file").unwrap_or(false) {
-            return V1Outcome::DeferredToCore {
-                method: "register_multisig_file".to_string(),
+            let multisig_file = match params.str("multisig_file") {
+                Ok(Some(multisig_file)) if !multisig_file.is_empty() => multisig_file,
+                Ok(_) | Err(_) => return bad_parameters("Invalid multisig file data"),
             };
+            return self.register_multisig_file_result(multisig_file);
         }
 
         let network = match params.str("network") {
@@ -670,22 +672,51 @@ impl Emulator {
                 }
             };
 
-        if signers.len() > jade_storage::MAX_ALLOWED_SIGNERS {
-            return bad_parameters("Invalid multisig co-signers");
-        }
-        if threshold as usize > signers.len() {
-            return bad_parameters("Invalid multisig threshold");
-        }
-        if !self.validate_registration_signers(&signers, network) {
-            return bad_parameters("Failed to validate co-signers");
-        }
-
-        let record = match multisig_registration_record(
+        let registration = ParsedMultisigFile {
+            name: multisig_name.to_string(),
             variant,
             sorted,
             threshold,
             master_blinding_key,
-            &signers,
+            signers,
+        };
+
+        self.persist_multisig_registration(&registration, network)
+    }
+
+    fn register_multisig_file_result(&mut self, multisig_file: &str) -> V1Outcome {
+        let network = jade_crypto::BitcoinNetwork::Main;
+        let parsed = match parse_multisig_file(multisig_file, network) {
+            Ok(parsed) => parsed,
+            Err(message) => return bad_parameters(message),
+        };
+
+        self.persist_multisig_registration(&parsed, network)
+    }
+
+    fn persist_multisig_registration(
+        &mut self,
+        registration: &ParsedMultisigFile,
+        network: jade_crypto::BitcoinNetwork,
+    ) -> V1Outcome {
+        let multisig_name = registration.name.as_str();
+        let signers = registration.signers.as_slice();
+        if signers.len() > jade_storage::MAX_ALLOWED_SIGNERS {
+            return bad_parameters("Invalid multisig co-signers");
+        }
+        if registration.threshold as usize > signers.len() {
+            return bad_parameters("Invalid multisig threshold");
+        }
+        if !self.validate_registration_signers(signers, network) {
+            return bad_parameters("Failed to validate co-signers");
+        }
+
+        let record = match multisig_registration_record(
+            registration.variant,
+            registration.sorted,
+            registration.threshold,
+            registration.master_blinding_key,
+            signers,
         ) {
             Some(record) => record,
             None => {
@@ -2310,6 +2341,235 @@ fn direct_bytes_params<'a>(request: &Request<'a>) -> Result<&'a [u8], ()> {
     Ok(bytes)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedMultisigFile {
+    name: String,
+    variant: MultisigVariant,
+    sorted: bool,
+    threshold: u8,
+    master_blinding_key: Option<[u8; jade_storage::MULTISIG_MASTER_BLINDING_KEY_SIZE]>,
+    signers: Vec<MultisigSignerDetails>,
+}
+
+const MULTISIG_FILE_FIELD_NAME: u8 = 0x01;
+const MULTISIG_FILE_FIELD_POLICY: u8 = 0x02;
+const MULTISIG_FILE_FIELD_FORMAT: u8 = 0x04;
+const MULTISIG_FILE_FIELD_SORTED: u8 = 0x08;
+const MULTISIG_FILE_FIELD_BLINDING_KEY: u8 = 0x10;
+const MULTISIG_FILE_FIELD_DERIVATION: u8 = 0x20;
+const MULTISIG_FILE_REQUIRED_FIELDS: u8 = MULTISIG_FILE_FIELD_NAME
+    | MULTISIG_FILE_FIELD_POLICY
+    | MULTISIG_FILE_FIELD_FORMAT
+    | MULTISIG_FILE_FIELD_DERIVATION;
+
+fn parse_multisig_file(
+    multisig_file: &str,
+    network: jade_crypto::BitcoinNetwork,
+) -> Result<ParsedMultisigFile, &'static str> {
+    let mut fields_read = 0u8;
+    let mut name = String::new();
+    let mut variant = None;
+    let mut sorted = true;
+    let mut threshold = 0u8;
+    let mut expected_signers = 0usize;
+    let mut master_blinding_key = None;
+    let mut derivation = Vec::new();
+    let mut signers = Vec::new();
+
+    for line in multisig_file.split('\n') {
+        if line.is_empty() || line.as_bytes().first() == Some(&b'#') {
+            continue;
+        }
+
+        let (field, value) = split_multisig_file_line(line)?;
+        if field.eq_ignore_ascii_case("Name") {
+            if fields_read & MULTISIG_FILE_FIELD_NAME != 0 {
+                return Err("Invalid multisig file");
+            }
+            name = parse_multisig_file_name(value)?;
+            fields_read |= MULTISIG_FILE_FIELD_NAME;
+        } else if field.eq_ignore_ascii_case("Policy") {
+            if fields_read & MULTISIG_FILE_FIELD_POLICY != 0 {
+                return Err("Invalid multisig file");
+            }
+            (threshold, expected_signers) = parse_multisig_file_policy(value)?;
+            fields_read |= MULTISIG_FILE_FIELD_POLICY;
+        } else if field.eq_ignore_ascii_case("Format") {
+            if fields_read & MULTISIG_FILE_FIELD_FORMAT != 0 {
+                return Err("Invalid multisig file");
+            }
+            variant = Some(parse_multisig_file_format(value)?);
+            fields_read |= MULTISIG_FILE_FIELD_FORMAT;
+        } else if field.eq_ignore_ascii_case("Sorted") {
+            if fields_read & MULTISIG_FILE_FIELD_SORTED != 0 {
+                return Err("Invalid multisig file");
+            }
+            sorted = parse_multisig_file_sorted(value)?;
+            fields_read |= MULTISIG_FILE_FIELD_SORTED;
+        } else if field.eq_ignore_ascii_case("BlindingKey") {
+            if fields_read & MULTISIG_FILE_FIELD_BLINDING_KEY != 0 {
+                return Err("Invalid multisig file");
+            }
+            master_blinding_key = Some(
+                decode_hex_fixed::<{ jade_storage::MULTISIG_MASTER_BLINDING_KEY_SIZE }>(value)
+                    .ok_or("Invalid master blinding key")?,
+            );
+            fields_read |= MULTISIG_FILE_FIELD_BLINDING_KEY;
+        } else if field.eq_ignore_ascii_case("Derivation") {
+            derivation = JadeDerivationPath::parse(value)
+                .map_err(|_| "Invalid derivation path")?
+                .to_u32_vec();
+            fields_read |= MULTISIG_FILE_FIELD_DERIVATION;
+        } else if field.len() == 8 {
+            if fields_read & MULTISIG_FILE_REQUIRED_FIELDS != MULTISIG_FILE_REQUIRED_FIELDS {
+                return Err("Insufficient information records");
+            }
+            if signers.len() >= expected_signers || expected_signers == 0 {
+                return Err("Invalid number of signers");
+            }
+            let fingerprint = decode_hex_fixed::<4>(field).ok_or("Invalid signer fingerprint")?;
+            let xpub = parse_multisig_file_xpub(value, network).ok_or("Invalid signer xpub")?;
+            signers.push(MultisigSignerDetails {
+                fingerprint,
+                derivation: derivation.clone(),
+                xpub,
+                path: Vec::new(),
+            });
+        } else {
+            return Err("Invalid multisig file");
+        }
+    }
+
+    if fields_read & MULTISIG_FILE_REQUIRED_FIELDS != MULTISIG_FILE_REQUIRED_FIELDS {
+        return Err("Insufficient information records");
+    }
+    if signers.len() != expected_signers || expected_signers == 0 {
+        return Err("Invalid number of signers");
+    }
+
+    Ok(ParsedMultisigFile {
+        name,
+        variant: variant.ok_or("Insufficient information records")?,
+        sorted,
+        threshold,
+        master_blinding_key,
+        signers,
+    })
+}
+
+fn split_multisig_file_line(line: &str) -> Result<(&str, &str), &'static str> {
+    let Some(delimiter) = line.as_bytes().iter().position(|byte| *byte == b':') else {
+        return Err("Invalid multisig file");
+    };
+    if delimiter == 0 {
+        return Err("Invalid multisig file");
+    }
+
+    let mut value_start = delimiter + 1;
+    while value_start < line.len() && line.as_bytes()[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+    let value = &line[value_start..];
+    if value.is_empty() || value.len() >= 128 {
+        return Err("Invalid multisig file");
+    }
+
+    Ok((&line[..delimiter], value))
+}
+
+fn parse_multisig_file_name(value: &str) -> Result<String, &'static str> {
+    let mut sanitized = Vec::with_capacity(value.len().min(jade_storage::MAX_KEY_NAME_LEN));
+    for byte in value
+        .as_bytes()
+        .iter()
+        .copied()
+        .take(jade_storage::MAX_KEY_NAME_LEN)
+    {
+        sanitized.push(if byte.is_ascii_whitespace() {
+            b'_'
+        } else {
+            byte
+        });
+    }
+    let name = String::from_utf8(sanitized).map_err(|_| "Invalid multisig name")?;
+    if key_name_valid(&name) {
+        Ok(name)
+    } else {
+        Err("Invalid multisig name")
+    }
+}
+
+fn parse_multisig_file_policy(value: &str) -> Result<(u8, usize), &'static str> {
+    let parts: Vec<&str> = value.split(' ').collect();
+    if parts.len() != 3 || !parts[1].eq_ignore_ascii_case("of") {
+        return Err("Invalid multisig policy");
+    }
+    let threshold = parse_decimal_u64(parts[0]).ok_or("Invalid multisig policy")?;
+    let signers = parse_decimal_u64(parts[2]).ok_or("Invalid multisig policy")?;
+    if threshold == 0
+        || signers == 0
+        || threshold > signers
+        || signers > jade_storage::MAX_ALLOWED_SIGNERS as u64
+    {
+        return Err("Invalid multisig policy");
+    }
+    Ok((threshold as u8, signers as usize))
+}
+
+fn parse_multisig_file_format(value: &str) -> Result<MultisigVariant, &'static str> {
+    if value.eq_ignore_ascii_case("P2WSH") {
+        Ok(MultisigVariant::P2wsh)
+    } else if value.eq_ignore_ascii_case("P2SH") {
+        Ok(MultisigVariant::P2sh)
+    } else if value.eq_ignore_ascii_case("P2WSH-P2SH") || value.eq_ignore_ascii_case("P2SH-P2WSH") {
+        Ok(MultisigVariant::P2wshP2sh)
+    } else {
+        Err("Invalid multisig format")
+    }
+}
+
+fn parse_multisig_file_sorted(value: &str) -> Result<bool, &'static str> {
+    if value.eq_ignore_ascii_case("TRUE") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("FALSE") {
+        Ok(false)
+    } else {
+        Err("Invalid sorted flag")
+    }
+}
+
+fn parse_multisig_file_xpub(
+    value: &str,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<[u8; jade_storage::BIP32_SERIALIZED_LEN]> {
+    let mut xpub: [u8; jade_storage::BIP32_SERIALIZED_LEN] =
+        base58ck::decode_check(value).ok()?.try_into().ok()?;
+    xpub[..4].copy_from_slice(&xpub_version_bytes(network));
+    Some(xpub)
+}
+
+fn xpub_version_bytes(network: jade_crypto::BitcoinNetwork) -> [u8; 4] {
+    match network {
+        jade_crypto::BitcoinNetwork::Main => 0x0488_b21eu32.to_be_bytes(),
+        jade_crypto::BitcoinNetwork::Test | jade_crypto::BitcoinNetwork::Regtest => {
+            0x0435_87cfu32.to_be_bytes()
+        }
+    }
+}
+
+fn decode_hex_fixed<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let high = hex_nibble_value(value.as_bytes()[index * 2])?;
+        let low = hex_nibble_value(value.as_bytes()[index * 2 + 1])?;
+        *byte = (high << 4) | low;
+    }
+    Some(out)
+}
+
 fn optional_bool(params: jade_protocol_v1::Params<'_>, field: &str) -> bool {
     params.bool(field).ok().flatten().unwrap_or(false)
 }
@@ -3661,6 +3921,32 @@ mod tests {
     fn decode_xpub(input: &str) -> [u8; BIP32_SERIALIZED_LEN] {
         let bytes = base58ck::decode_check(input).unwrap();
         bytes.try_into().unwrap()
+    }
+
+    fn register_multisig_file(emulator: &mut Emulator, multisig_file: &str) -> V1Outcome {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("multisig_file")
+            .unwrap()
+            .str(multisig_file)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("mf"),
+            method: Cow::Borrowed("register_multisig"),
+            params: Some(&params),
+        };
+        emulator.handle_v1_request(&request)
+    }
+
+    fn stored_multisig_details(emulator: &Emulator, name: &str) -> MultisigDetails {
+        let mut record = Vec::new();
+        emulator
+            .storage
+            .get_record(StorageRecord::MultisigRegistration { name }, &mut record)
+            .unwrap();
+        parse_multisig_details(&record, &HostRecordAuthenticator).unwrap()
     }
 
     #[test]
@@ -6368,6 +6654,146 @@ mod tests {
             emulator.handle_v1_request(&request),
             V1Outcome::TextResult { result: expected }
         );
+    }
+
+    #[test]
+    fn register_multisig_file_persists_fixture_records() {
+        let fixtures = [
+            (
+                include_str!("../../../test_data/multisig_file_jade.dat"),
+                "Jade_File_Test",
+                MultisigVariant::P2wsh,
+                false,
+                1,
+                2,
+                Some(decode_hex::<32>(
+                    "3172ae4169b206645a52df2ef79dff7a8c23412e6c0f129ef92e3ec570c5e2d1",
+                )),
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_bw.dat"),
+                "Jade_File_Test",
+                MultisigVariant::P2wsh,
+                true,
+                1,
+                3,
+                None,
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_p2sh-p2wsh.dat"),
+                "Test_17characte",
+                MultisigVariant::P2wshP2sh,
+                false,
+                2,
+                2,
+                None,
+            ),
+        ];
+
+        for (file, name, variant, sorted, threshold, num_signers, master_blinding_key) in fixtures {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+            assert_eq!(
+                register_multisig_file(&mut emulator, file),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            let details = stored_multisig_details(&emulator, name);
+            assert_eq!(details.summary.variant, variant);
+            assert_eq!(details.summary.sorted, sorted);
+            assert_eq!(details.summary.threshold, threshold);
+            assert_eq!(details.summary.num_signers, num_signers);
+            assert_eq!(details.summary.master_blinding_key, master_blinding_key);
+            assert_eq!(
+                details.signers.as_ref().unwrap().len(),
+                num_signers as usize
+            );
+            assert!(details.signers.as_ref().unwrap().iter().all(|signer| {
+                valid_serialized_xpub_for_network(&signer.xpub, jade_crypto::BitcoinNetwork::Main)
+            }));
+        }
+    }
+
+    #[test]
+    fn register_multisig_file_roundtrips_exported_record() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+        assert_eq!(
+            register_multisig_file(
+                &mut emulator,
+                include_str!("../../../test_data/multisig_file_sparrow.dat")
+            ),
+            V1Outcome::BoolResult { result: true }
+        );
+        let first = stored_multisig_details(&emulator, "Jade_File_Test");
+        let exported = multisig_export_file("Roundtrip_File", &first).unwrap();
+
+        assert_eq!(
+            register_multisig_file(&mut emulator, &exported),
+            V1Outcome::BoolResult { result: true }
+        );
+        let second = stored_multisig_details(&emulator, "Roundtrip_File");
+        assert_eq!(first.summary, second.summary);
+        assert_eq!(first.signers, second.signers);
+    }
+
+    #[test]
+    fn register_multisig_file_rejects_fixture_errors() {
+        let fixtures = [
+            (
+                include_str!("../../../test_data/multisig_bad_file_derivation.dat"),
+                "Invalid derivation path",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_duplicate_field1.dat"),
+                "Invalid multisig file",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_field_missing1.dat"),
+                "Insufficient information records",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_format.dat"),
+                "Invalid multisig format",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_not_in.dat"),
+                "Failed to validate co-signers",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_policy.dat"),
+                "Invalid multisig policy",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_signers1.dat"),
+                "Invalid number of signers",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_sorted.dat"),
+                "Invalid sorted flag",
+            ),
+        ];
+
+        for (file, expected_error) in fixtures {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+            assert_eq!(
+                register_multisig_file(&mut emulator, file),
+                V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: expected_error.to_string(),
+                }
+            );
+        }
     }
 
     #[test]
