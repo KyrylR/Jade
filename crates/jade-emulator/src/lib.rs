@@ -1,19 +1,30 @@
 use std::borrow::Cow;
+use std::boxed::Box;
+use std::vec::Vec;
 
-use jade_core::{CoreState, OperationState};
+use jade_core::{
+    CoreError, CoreResult, CoreState, NetworkRestriction, OperationState, Platform,
+    VersionDebugInfo, VersionInfo,
+};
 use jade_protocol_v1::{
-    decode_request, encode_bool_result, encode_error_response, encode_uint_result, method_spec,
-    ErrorCode, ErrorResponse, MethodClass, Request,
+    decode_request, encode_bool_result, encode_error_response, encode_map_result,
+    encode_uint_result, method_spec, ErrorCode, ErrorResponse, MethodClass, Request,
+    ResultMapEntry, V1Value,
 };
 
 #[derive(Debug, Default)]
 pub struct Emulator {
     state: CoreState,
+    platform: HostPlatform,
 }
 
 impl Emulator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn platform(&self) -> &HostPlatform {
+        &self.platform
     }
 
     pub fn handle_v1_request(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -28,6 +39,55 @@ impl Emulator {
             Some(MethodClass::Immediate) if request.method == "ping" => V1Outcome::ImmediatePing {
                 activity: self.state.operation,
             },
+            Some(MethodClass::PreAuth) if request.method == "get_version_info" => {
+                V1Outcome::VersionInfo {
+                    info: Box::new(self.state.version_info(&self.platform).into_static()),
+                }
+            }
+            Some(MethodClass::PreAuth) if request.method == "add_entropy" => {
+                let Some(params) = request.params() else {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::BadParameters,
+                        message: "Expecting parameters map".to_string(),
+                    };
+                };
+                let entropy = match params.bytes("entropy") {
+                    Ok(Some(entropy)) if !entropy.is_empty() => entropy,
+                    Ok(_) | Err(_) => {
+                        return V1Outcome::Reject {
+                            code: ErrorCode::BadParameters,
+                            message: "Failed to extract valid entropy bytes from parameters"
+                                .to_string(),
+                        };
+                    }
+                };
+                match self.state.add_entropy(&mut self.platform, entropy) {
+                    Ok(()) => V1Outcome::BoolResult { result: true },
+                    Err(err) => reject_core_error(err),
+                }
+            }
+            Some(MethodClass::PreAuth) if request.method == "set_epoch" => {
+                let Some(params) = request.params() else {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::BadParameters,
+                        message: "Expecting parameters map".to_string(),
+                    };
+                };
+                let epoch = match params.u64("epoch") {
+                    Ok(Some(epoch)) => epoch,
+                    Ok(None) | Err(_) => {
+                        return V1Outcome::Reject {
+                            code: ErrorCode::BadParameters,
+                            message: "Failed to extract valid epoch value from parameters"
+                                .to_string(),
+                        };
+                    }
+                };
+                match self.state.set_epoch(&mut self.platform, epoch) {
+                    Ok(()) => V1Outcome::BoolResult { result: true },
+                    Err(err) => reject_core_error(err),
+                }
+            }
             Some(MethodClass::PreAuth) if request.method == "logout" => {
                 self.state.logout();
                 V1Outcome::BoolResult { result: true }
@@ -48,6 +108,7 @@ impl Emulator {
                 V1Outcome::ImmediatePing { activity } => {
                     encode_uint_result(&request.id, v1_activity_code(activity))
                 }
+                V1Outcome::VersionInfo { info } => encode_version_info_result(&request.id, &info),
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
                 V1Outcome::Reject { code, message } => encode_error_response(&ErrorResponse {
                     id: request.id,
@@ -73,6 +134,75 @@ impl Emulator {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPlatform {
+    version: Cow<'static, str>,
+    entropy_bytes_received: usize,
+    epoch: Option<u64>,
+}
+
+impl Default for HostPlatform {
+    fn default() -> Self {
+        Self {
+            version: Cow::Borrowed("rust-emulator"),
+            entropy_bytes_received: 0,
+            epoch: None,
+        }
+    }
+}
+
+impl HostPlatform {
+    pub fn entropy_bytes_received(&self) -> usize {
+        self.entropy_bytes_received
+    }
+
+    pub fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+}
+
+impl Platform for HostPlatform {
+    fn version_info<'a>(&'a self, state: &CoreState) -> VersionInfo<'a> {
+        VersionInfo {
+            jade_version: Cow::Borrowed(self.version.as_ref()),
+            jade_ota_max_chunk: 4096,
+            jade_config: Cow::Borrowed("HOST"),
+            board_type: Cow::Borrowed("HOST"),
+            jade_features: Cow::Borrowed("DEBUG,RUST"),
+            idf_version: Cow::Borrowed("host"),
+            chip_features: Cow::Borrowed("00000000"),
+            efusemac: Cow::Borrowed("000000000000"),
+            attestation_initialised: false,
+            battery_status: 0,
+            battery_millivolts: 0,
+            battery_charging: false,
+            jade_state: state.wallet.into(),
+            jade_networks: NetworkRestriction::All,
+            jade_has_pin: false,
+            debug: Some(VersionDebugInfo {
+                nvs_entries_used: 0,
+                nvs_entries_free: 0,
+                free_heap: 0,
+                free_dram: 0,
+                largest_dram: 0,
+                free_spiram: 0,
+                largest_spiram: 0,
+                gcov: false,
+            }),
+        }
+    }
+
+    fn add_entropy(&mut self, entropy: &[u8]) -> CoreResult<()> {
+        self.entropy_bytes_received += entropy.len();
+        Ok(())
+    }
+
+    fn set_epoch(&mut self, epoch: u64) -> CoreResult<()> {
+        self.epoch = Some(epoch);
+        Ok(())
+    }
+}
+
 fn v1_activity_code(activity: OperationState) -> u64 {
     match activity {
         OperationState::Idle => 0,
@@ -83,9 +213,159 @@ fn v1_activity_code(activity: OperationState) -> u64 {
     }
 }
 
+fn reject_core_error(err: CoreError) -> V1Outcome {
+    let (code, message) = match err {
+        CoreError::InvalidRequest => (ErrorCode::InvalidRequest, "invalid request"),
+        CoreError::UnknownMethod => (ErrorCode::UnknownMethod, "unknown method"),
+        CoreError::BadParameters => (ErrorCode::BadParameters, "bad parameters"),
+        CoreError::InternalError => (ErrorCode::InternalError, "internal error"),
+        CoreError::HardwareLocked => (ErrorCode::HardwareLocked, "hardware locked"),
+        CoreError::OutOfMemory => (ErrorCode::InternalError, "out of memory"),
+        CoreError::Deferred(method) => (ErrorCode::InternalError, method),
+        CoreError::Unsupported(feature) => (ErrorCode::InternalError, feature),
+    };
+    V1Outcome::Reject {
+        code,
+        message: message.to_string(),
+    }
+}
+
+fn encode_version_info_result(id: &str, info: &VersionInfo<'_>) -> Vec<u8> {
+    let mut entries = Vec::with_capacity(info.v1_field_count());
+    entries.extend_from_slice(&[
+        ResultMapEntry {
+            key: "JADE_VERSION",
+            value: V1Value::Text(info.jade_version.as_ref()),
+        },
+        ResultMapEntry {
+            key: "JADE_OTA_MAX_CHUNK",
+            value: V1Value::U64(info.jade_ota_max_chunk),
+        },
+        ResultMapEntry {
+            key: "JADE_CONFIG",
+            value: V1Value::Text(info.jade_config.as_ref()),
+        },
+        ResultMapEntry {
+            key: "BOARD_TYPE",
+            value: V1Value::Text(info.board_type.as_ref()),
+        },
+        ResultMapEntry {
+            key: "JADE_FEATURES",
+            value: V1Value::Text(info.jade_features.as_ref()),
+        },
+        ResultMapEntry {
+            key: "IDF_VERSION",
+            value: V1Value::Text(info.idf_version.as_ref()),
+        },
+        ResultMapEntry {
+            key: "CHIP_FEATURES",
+            value: V1Value::Text(info.chip_features.as_ref()),
+        },
+        ResultMapEntry {
+            key: "EFUSEMAC",
+            value: V1Value::Text(info.efusemac.as_ref()),
+        },
+        ResultMapEntry {
+            key: "ATTESTATION_INITIALISED",
+            value: V1Value::Bool(info.attestation_initialised),
+        },
+        ResultMapEntry {
+            key: "BATTERY_STATUS",
+            value: V1Value::U64(info.battery_status),
+        },
+        ResultMapEntry {
+            key: "BATTERY_MILLIVOLTS",
+            value: V1Value::U64(info.battery_millivolts),
+        },
+        ResultMapEntry {
+            key: "BATTERY_CHARGING",
+            value: V1Value::Bool(info.battery_charging),
+        },
+        ResultMapEntry {
+            key: "JADE_STATE",
+            value: V1Value::Text(info.jade_state.as_v1_str()),
+        },
+        ResultMapEntry {
+            key: "JADE_NETWORKS",
+            value: V1Value::Text(info.jade_networks.as_v1_str()),
+        },
+        ResultMapEntry {
+            key: "JADE_HAS_PIN",
+            value: V1Value::Bool(info.jade_has_pin),
+        },
+    ]);
+
+    if let Some(debug) = info.debug {
+        entries.extend_from_slice(&[
+            ResultMapEntry {
+                key: "JADE_NVS_ENTRIES_USED",
+                value: V1Value::U64(debug.nvs_entries_used),
+            },
+            ResultMapEntry {
+                key: "JADE_NVS_ENTRIES_FREE",
+                value: V1Value::U64(debug.nvs_entries_free),
+            },
+            ResultMapEntry {
+                key: "JADE_FREE_HEAP",
+                value: V1Value::U64(debug.free_heap),
+            },
+            ResultMapEntry {
+                key: "JADE_FREE_DRAM",
+                value: V1Value::U64(debug.free_dram),
+            },
+            ResultMapEntry {
+                key: "JADE_LARGEST_DRAM",
+                value: V1Value::U64(debug.largest_dram),
+            },
+            ResultMapEntry {
+                key: "JADE_FREE_SPIRAM",
+                value: V1Value::U64(debug.free_spiram),
+            },
+            ResultMapEntry {
+                key: "JADE_LARGEST_SPIRAM",
+                value: V1Value::U64(debug.largest_spiram),
+            },
+            ResultMapEntry {
+                key: "GCOV",
+                value: V1Value::Bool(debug.gcov),
+            },
+        ]);
+    }
+
+    encode_map_result(id, &entries)
+}
+
+trait StaticVersionInfo {
+    fn into_static(self) -> VersionInfo<'static>;
+}
+
+impl StaticVersionInfo for VersionInfo<'_> {
+    fn into_static(self) -> VersionInfo<'static> {
+        VersionInfo {
+            jade_version: Cow::Owned(self.jade_version.into_owned()),
+            jade_ota_max_chunk: self.jade_ota_max_chunk,
+            jade_config: Cow::Owned(self.jade_config.into_owned()),
+            board_type: Cow::Owned(self.board_type.into_owned()),
+            jade_features: Cow::Owned(self.jade_features.into_owned()),
+            idf_version: Cow::Owned(self.idf_version.into_owned()),
+            chip_features: Cow::Owned(self.chip_features.into_owned()),
+            efusemac: Cow::Owned(self.efusemac.into_owned()),
+            attestation_initialised: self.attestation_initialised,
+            battery_status: self.battery_status,
+            battery_millivolts: self.battery_millivolts,
+            battery_charging: self.battery_charging,
+            jade_state: self.jade_state,
+            jade_networks: self.jade_networks,
+            jade_has_pin: self.jade_has_pin,
+            debug: self.debug,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V1Outcome {
     ImmediatePing { activity: jade_core::OperationState },
+    VersionInfo { info: Box<VersionInfo<'static>> },
     BoolResult { result: bool },
     DeferredToCore { method: String },
     Reject { code: ErrorCode, message: String },
@@ -94,6 +374,7 @@ pub enum V1Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minicbor::Decoder;
 
     #[test]
     fn ping_is_immediate() {
@@ -125,6 +406,58 @@ mod tests {
     }
 
     #[test]
+    fn get_version_info_returns_debug_compatible_map() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("v"),
+            method: Cow::Borrowed("get_version_info"),
+            params: None,
+        };
+
+        let V1Outcome::VersionInfo { info } = emulator.handle_v1_request(&request) else {
+            panic!("expected version info response");
+        };
+        assert_eq!(info.v1_field_count(), 23);
+        assert_eq!(info.jade_state.as_v1_str(), "UNINIT");
+    }
+
+    #[test]
+    fn raw_v1_get_version_info_returns_public_fields() {
+        let mut emulator = Emulator::new();
+        let request = [
+            0xa2, 0x62, b'i', b'd', 0x61, b'v', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x70,
+            b'g', b'e', b't', b'_', b'v', b'e', b'r', b's', b'i', b'o', b'n', b'_', b'i', b'n',
+            b'f', b'o',
+        ];
+
+        let response = emulator.handle_v1_cbor(&request);
+        let mut decoder = Decoder::new(&response);
+        let mut result_len = None;
+        let mut state = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        for _ in 0..2 {
+            match decoder.str().unwrap() {
+                "id" => assert_eq!(decoder.str().unwrap(), "v"),
+                "result" => {
+                    let len = decoder.map().unwrap();
+                    result_len = len.map(|value| value as usize);
+                    for _ in 0..len.unwrap() {
+                        match decoder.str().unwrap() {
+                            "JADE_STATE" => state = Some(decoder.str().unwrap()),
+                            _ => decoder.skip().unwrap(),
+                        }
+                    }
+                }
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        assert_eq!(result_len, Some(23));
+        assert_eq!(state, Some("UNINIT"));
+    }
+
+    #[test]
     fn signing_methods_are_deferred() {
         let mut emulator = Emulator::new();
         let request = Request {
@@ -139,6 +472,57 @@ mod tests {
                 method: "sign_psbt".to_string()
             }
         );
+    }
+
+    #[test]
+    fn add_entropy_updates_host_platform_rng_boundary() {
+        let mut emulator = Emulator::new();
+        let request = [
+            0xa3, 0x62, b'i', b'd', 0x61, b'e', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x6b,
+            b'a', b'd', b'd', b'_', b'e', b'n', b't', b'r', b'o', b'p', b'y', 0x66, b'p', b'a',
+            b'r', b'a', b'm', b's', 0xa1, 0x67, b'e', b'n', b't', b'r', b'o', b'p', b'y', 0x45,
+            b'n', b'o', b'i', b's', b'e',
+        ];
+
+        assert_eq!(
+            emulator.handle_v1_cbor(&request),
+            [0xa2, 0x62, b'i', b'd', 0x61, b'e', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
+        );
+        assert_eq!(emulator.platform().entropy_bytes_received(), 5);
+    }
+
+    #[test]
+    fn add_entropy_rejects_missing_params() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("e"),
+            method: Cow::Borrowed("add_entropy"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn set_epoch_updates_host_platform_clock_boundary() {
+        let mut emulator = Emulator::new();
+        let request = [
+            0xa3, 0x62, b'i', b'd', 0x61, b't', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x69,
+            b's', b'e', b't', b'_', b'e', b'p', b'o', b'c', b'h', 0x66, b'p', b'a', b'r', b'a',
+            b'm', b's', 0xa1, 0x65, b'e', b'p', b'o', b'c', b'h', 0x1a, 0x65, 0x53, 0xf1, 0x00,
+        ];
+
+        assert_eq!(
+            emulator.handle_v1_cbor(&request),
+            [0xa2, 0x62, b'i', b'd', 0x61, b't', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
+        );
+        assert_eq!(emulator.platform().epoch(), Some(1_700_000_000));
     }
 
     #[test]

@@ -333,6 +333,20 @@ pub struct ErrorResponse<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultMapEntry<'a> {
+    pub key: &'a str,
+    pub value: V1Value<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Value<'a> {
+    Bool(bool),
+    U64(u64),
+    Text(&'a str),
+    Bytes(&'a [u8]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params<'a>(&'a [u8]);
 
 impl<'a> Params<'a> {
@@ -522,6 +536,39 @@ pub fn encode_bool_result(id: &str, result: bool) -> Vec<u8> {
     output
 }
 
+pub fn encode_map_result(id: &str, entries: &[ResultMapEntry<'_>]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.map(entries.len() as u64))
+        .expect("Vec-backed CBOR encoding is infallible");
+
+    for entry in entries {
+        encoder
+            .str(entry.key)
+            .expect("Vec-backed CBOR encoding is infallible");
+        match entry.value {
+            V1Value::Bool(value) => encoder
+                .bool(value)
+                .expect("Vec-backed CBOR encoding is infallible"),
+            V1Value::U64(value) => encoder
+                .u64(value)
+                .expect("Vec-backed CBOR encoding is infallible"),
+            V1Value::Text(value) => encoder
+                .str(value)
+                .expect("Vec-backed CBOR encoding is infallible"),
+            V1Value::Bytes(value) => encoder
+                .bytes(value)
+                .expect("Vec-backed CBOR encoding is infallible"),
+        };
+    }
+    output
+}
+
 pub fn validate_id(id: &str) -> Result<(), ValidationError> {
     if id.is_empty() {
         return Err(ValidationError::EmptyId);
@@ -657,6 +704,33 @@ mod tests {
         assert_eq!(
             encode_uint_result("1", 0),
             [0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x00,]
+        );
+    }
+
+    #[test]
+    fn encodes_v1_map_result_shape() {
+        let encoded = encode_map_result(
+            "v",
+            &[
+                ResultMapEntry {
+                    key: "JADE_STATE",
+                    value: V1Value::Text("UNINIT"),
+                },
+                ResultMapEntry {
+                    key: "JADE_HAS_PIN",
+                    value: V1Value::Bool(false),
+                },
+            ],
+        );
+
+        assert_eq!(
+            encoded,
+            [
+                0xa2, 0x62, b'i', b'd', 0x61, b'v', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xa2,
+                0x6a, b'J', b'A', b'D', b'E', b'_', b'S', b'T', b'A', b'T', b'E', 0x66, b'U', b'N',
+                b'I', b'N', b'I', b'T', 0x6c, b'J', b'A', b'D', b'E', b'_', b'H', b'A', b'S', b'_',
+                b'P', b'I', b'N', 0xf4,
+            ]
         );
     }
 }
