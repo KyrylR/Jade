@@ -2386,6 +2386,192 @@ pub mod pure_rust {
         Some(xpub.to_bytes())
     }
 
+    pub fn green_gaservice_path_from_seed(seed: &[u8]) -> Option<[u32; 32]> {
+        let mut derivation_path = bip32::DerivationPath::default();
+        derivation_path.push(bip32::ChildNumber::new(0x4741, true).ok()?);
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        let public_key = private_key.public_key().to_bytes();
+
+        let mut mac = HmacSha512::new_from_slice(b"GreenAddress.it HD wallet path").ok()?;
+        mac.update(&private_key.attrs().chain_code);
+        mac.update(&public_key);
+        let serialized = mac.finalize().into_bytes();
+
+        let mut path = [0u32; 32];
+        for (index, item) in path.iter_mut().enumerate() {
+            *item = u16::from_be_bytes([serialized[index * 2], serialized[index * 2 + 1]]) as u32;
+        }
+        Some(path)
+    }
+
+    pub fn bitcoin_green_address_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        service_xpub: &[u8; 78],
+        recovery_xpub: Option<&[u8; 78]>,
+        csv_blocks: u32,
+        network: BitcoinNetwork,
+    ) -> Option<String> {
+        let script =
+            green_script_from_seed(seed, path, service_xpub, recovery_xpub, csv_blocks, false)?;
+        bitcoin_p2sh_p2wsh_address_from_script(&script, network)
+    }
+
+    pub fn liquid_unconfidential_green_address_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        service_xpub: &[u8; 78],
+        recovery_xpub: Option<&[u8; 78]>,
+        csv_blocks: u32,
+        network: LiquidNetwork,
+    ) -> Option<String> {
+        let script =
+            green_script_from_seed(seed, path, service_xpub, recovery_xpub, csv_blocks, true)?;
+        liquid_unconfidential_p2sh_p2wsh_address_from_script(&script, network)
+    }
+
+    pub fn liquid_confidential_green_address_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        service_xpub: &[u8; 78],
+        recovery_xpub: Option<&[u8; 78]>,
+        csv_blocks: u32,
+        network: LiquidNetwork,
+        master_unblinding_key: &[u8; SHA512_LEN],
+    ) -> Option<String> {
+        let script =
+            green_script_from_seed(seed, path, service_xpub, recovery_xpub, csv_blocks, true)?;
+        liquid_confidential_p2sh_p2wsh_address_from_script(&script, network, master_unblinding_key)
+    }
+
+    fn green_script_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        service_xpub: &[u8; 78],
+        recovery_xpub: Option<&[u8; 78]>,
+        csv_blocks: u32,
+        liquid: bool,
+    ) -> Option<Vec<u8>> {
+        const HARDENED: u32 = bip32::ChildNumber::HARDENED_FLAG;
+        const SUBACT_ROOT: u32 = HARDENED | 3;
+        const PATH_BRANCH: u32 = 1;
+        const MAX_PATH_PTR: u32 = 10_000;
+
+        let (is_subaccount, tail): (bool, Vec<u32>) =
+            if path.len() == 2 && path[0] == PATH_BRANCH && path[1] < MAX_PATH_PTR {
+                (false, alloc::vec![path[1]])
+            } else if path.len() == 4
+                && path[0] == SUBACT_ROOT
+                && path[1] > HARDENED
+                && path[1] < HARDENED + 16_384
+                && path[2] == PATH_BRANCH
+                && path[3] < MAX_PATH_PTR
+            {
+                (true, alloc::vec![path[1] & !HARDENED, path[3]])
+            } else {
+                return None;
+            };
+
+        if csv_blocks != 0 && recovery_xpub.is_some() {
+            return None;
+        }
+
+        let gaservice_path = green_gaservice_path_from_seed(seed)?;
+        let mut service_path = Vec::with_capacity(1 + gaservice_path.len() + tail.len());
+        service_path.push(if is_subaccount { 3 } else { 1 });
+        service_path.extend_from_slice(&gaservice_path);
+        service_path.extend_from_slice(&tail);
+
+        let ga_pubkey = public_key_from_serialized_xpub_path(service_xpub, &service_path)?;
+        let user_pubkey = public_key_from_seed_path(seed, path)?;
+        let mut pubkeys = Vec::with_capacity(if recovery_xpub.is_some() { 3 } else { 2 });
+        pubkeys.push(ga_pubkey);
+        pubkeys.push(user_pubkey);
+
+        if let Some(recovery_xpub) = recovery_xpub {
+            let pointer = *path.last()?;
+            pubkeys.push(public_key_from_serialized_xpub_path(
+                recovery_xpub,
+                &[pointer],
+            )?);
+        }
+
+        if csv_blocks != 0 {
+            green_csv_script(&pubkeys, csv_blocks, liquid)
+        } else {
+            multisig_script(&pubkeys, false, 2)
+        }
+    }
+
+    fn green_csv_script(
+        pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
+        csv_blocks: u32,
+        liquid: bool,
+    ) -> Option<Vec<u8>> {
+        const OP_DEPTH: u8 = 0x74;
+        const OP_1SUB: u8 = 0x8c;
+        const OP_IF: u8 = 0x63;
+        const OP_IFDUP: u8 = 0x73;
+        const OP_NOTIF: u8 = 0x64;
+        const OP_ELSE: u8 = 0x67;
+        const OP_ENDIF: u8 = 0x68;
+        const OP_DROP: u8 = 0x75;
+        const OP_CHECKSIG: u8 = 0xac;
+        const OP_CHECKSIGVERIFY: u8 = 0xad;
+        const OP_CSV: u8 = 0xb2;
+
+        if pubkeys.len() != 2 || !(17..=0xffff).contains(&csv_blocks) {
+            return None;
+        }
+        let csv = positive_script_int(csv_blocks);
+        let csv_len = u8::try_from(csv.len()).ok()?;
+
+        let mut script = Vec::with_capacity(if liquid { 82 } else { 79 });
+        if liquid {
+            script.extend_from_slice(&[
+                OP_DEPTH,
+                OP_1SUB,
+                OP_IF,
+                EC_PUBLIC_KEY_COMPRESSED_LEN as u8,
+            ]);
+            script.extend_from_slice(&pubkeys[0]);
+            script.extend_from_slice(&[OP_CHECKSIGVERIFY, OP_ELSE, csv_len]);
+            script.extend_from_slice(&csv);
+            script.extend_from_slice(&[
+                OP_CSV,
+                OP_DROP,
+                OP_ENDIF,
+                EC_PUBLIC_KEY_COMPRESSED_LEN as u8,
+            ]);
+            script.extend_from_slice(&pubkeys[1]);
+            script.push(OP_CHECKSIG);
+        } else {
+            script.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+            script.extend_from_slice(&pubkeys[1]);
+            script.extend_from_slice(&[OP_CHECKSIGVERIFY, EC_PUBLIC_KEY_COMPRESSED_LEN as u8]);
+            script.extend_from_slice(&pubkeys[0]);
+            script.extend_from_slice(&[OP_CHECKSIG, OP_IFDUP, OP_NOTIF, csv_len]);
+            script.extend_from_slice(&csv);
+            script.extend_from_slice(&[OP_CSV, OP_ENDIF]);
+        }
+        Some(script)
+    }
+
+    fn positive_script_int(value: u32) -> Vec<u8> {
+        let mut remaining = value;
+        let mut output = Vec::new();
+        let mut last = 0;
+        while remaining != 0 {
+            last = (remaining & 0xff) as u8;
+            output.push(last);
+            remaining >>= 8;
+        }
+        if last & 0x80 != 0 {
+            output.push(0);
+        }
+        output
+    }
+
     pub fn bitcoin_multisig_address_from_xpubs(
         xpubs: &[[u8; 78]],
         paths: &[Vec<u32>],
@@ -2432,6 +2618,43 @@ pub mod pure_rust {
                 p2sh_address(network, &script_hash)
             }
         }
+    }
+
+    pub fn bitcoin_p2sh_p2wsh_address_from_script(
+        script: &[u8],
+        network: BitcoinNetwork,
+    ) -> Option<String> {
+        let witness_script_hash = Sha256::digest(script);
+        let script_hash = hash160(&witness_v0_script_pubkey(witness_script_hash.as_ref()));
+        p2sh_address(network, &script_hash)
+    }
+
+    pub fn liquid_unconfidential_p2sh_p2wsh_address_from_script(
+        script: &[u8],
+        network: LiquidNetwork,
+    ) -> Option<String> {
+        let witness_script_hash = Sha256::digest(script);
+        let script_hash = hash160(&witness_v0_script_pubkey(witness_script_hash.as_ref()));
+        liquid_p2sh_address(network, &script_hash)
+    }
+
+    pub fn liquid_confidential_p2sh_p2wsh_address_from_script(
+        script: &[u8],
+        network: LiquidNetwork,
+        master_unblinding_key: &[u8; SHA512_LEN],
+    ) -> Option<String> {
+        let witness_script_hash = Sha256::digest(script);
+        let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
+        let script_hash = hash160(&witness_program);
+        let script_pubkey = p2sh_script_pubkey(&script_hash);
+        let blinding_public_key =
+            blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+        liquid_confidential_base58_address(
+            liquid_blinded_prefix(network),
+            liquid_p2sh_prefix(network),
+            &script_hash,
+            &blinding_public_key,
+        )
     }
 
     pub fn liquid_unconfidential_multisig_address_from_xpubs(

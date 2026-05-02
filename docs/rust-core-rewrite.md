@@ -96,10 +96,12 @@ is a reviewed pure-Rust replacement or an explicit release exception.
 - Wallet registration and enumeration: current/legacy multisig records,
   multisig setup-file import/export, descriptor registration for Bitcoin
   networks, and registered wallet listing/details.
-- Receive addresses: Bitcoin singlesig, Bitcoin multisig, Bitcoin descriptors,
-  Liquid singlesig confidential and unconfidential addresses, and Liquid
-  multisig confidential and unconfidential addresses. Liquid Taproot remains
-  deferred because Elements uses a different taproot tweak.
+- Receive addresses: default Green 2-of-2, Green 2-of-3 recovery-xpub, and
+  Green CSV p2sh-p2wsh addresses for Bitcoin and Liquid, plus Bitcoin
+  singlesig, Bitcoin multisig, Bitcoin descriptors, Liquid singlesig
+  confidential and unconfidential addresses, and Liquid multisig confidential
+  and unconfidential addresses. Liquid Taproot remains deferred because
+  Elements uses a different taproot tweak.
 - Liquid key helpers: master blinding key export, script blinding key, shared
   nonce, and deterministic blinding factors. `get_commitments` now performs
   v1-compatible request validation and deterministic ABF/VBF derivation before

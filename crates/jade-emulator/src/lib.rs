@@ -46,6 +46,11 @@ enum MultisigAddressNetwork {
     },
 }
 
+const MAINNET_SERVICE_XPUB: &str = "xpub661MyMwAqRbcGsMS1UQfLrVW52iFHhKd1WbL4BVBZt8xz8pE6oyz6La2LscN2WADtpZZXwKo4DXMbzUdxVsLYxm7f6instfCnpB3cFdbi2F";
+const TESTNET_SERVICE_XPUB: &str = "tpubD6NzVbkrYhZ4Y9k7T65kw2Sx9z67CzZr2Hi7w2pkKutUvm25ryvL79PqQTtDvAaYacd4z5NQTMmdJ37t8VbMVZbDY1z2rqUKLRNpVW6rGC3";
+const LIQUID_SERVICE_XPUB: &str = "xpub661MyMwAqRbcEZr3uYPEEP4X2bRmYXmxrcLMH8YEwLAFxonVGqstpNywBvwkUDCEZA1cd6fsLgKvb6iZP5yUtLc3G3L8WynChNJznHLaVrA";
+const TESTNET_LIQUID_SERVICE_XPUB: &str = "tpubD6NzVbkrYhZ4YKB74cMgKEpwByD7UWLXt2MxRdwwaQtgrw6E3YPQgSRkaxMWnpDXKtX5LvRmY5mT8FkzCtJcEQ1YhN1o8CU2S5gy9TDFc24";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BitcoinSignTxSession {
     txn: Vec<u8>,
@@ -1095,20 +1100,29 @@ impl Emulator {
             return self
                 .receive_multisig_address_result(params, MultisigAddressNetwork::Bitcoin(network));
         }
-        if !params.contains("variant").unwrap_or(false) {
-            return V1Outcome::DeferredToCore {
-                method: "get_receive_address".to_string(),
-            };
+        let variant_name = match params.str("variant") {
+            Ok(Some(variant)) => variant,
+            Ok(None) => "",
+            Err(_) => return bad_parameters("Invalid script variant parameter"),
+        };
+        if variant_name.is_empty() {
+            return self.receive_green_address_result(
+                params,
+                network_name,
+                is_liquid,
+                confidential,
+            );
         }
 
-        let variant = match params.str("variant") {
-            Ok(Some("pkh(k)")) => jade_crypto::SinglesigScriptVariant::Pkh,
-            Ok(Some("wpkh(k)")) => jade_crypto::SinglesigScriptVariant::Wpkh,
-            Ok(Some("sh(wpkh(k))")) => jade_crypto::SinglesigScriptVariant::ShWpkh,
-            Ok(Some("tr(k)")) => jade_crypto::SinglesigScriptVariant::Tr,
-            Ok(Some(_)) | Ok(None) | Err(_) => {
-                return bad_parameters("Invalid script variant parameter");
+        let variant = match variant_name {
+            "pkh(k)" => jade_crypto::SinglesigScriptVariant::Pkh,
+            "wpkh(k)" => jade_crypto::SinglesigScriptVariant::Wpkh,
+            "sh(wpkh(k))" => jade_crypto::SinglesigScriptVariant::ShWpkh,
+            "tr(k)" => jade_crypto::SinglesigScriptVariant::Tr,
+            "sh(multi(k))" | "wsh(multi(k))" | "sh(wsh(multi(k)))" => {
+                return bad_parameters("Unhandled script variant");
             }
+            _ => return bad_parameters("Invalid script variant parameter"),
         };
         let path = match params.u32_array("path", MAX_PATH_LEN) {
             Ok(Some(path)) if !path.is_empty() => path,
@@ -1159,6 +1173,121 @@ impl Emulator {
         };
 
         V1Outcome::TextResult { result: address }
+    }
+
+    fn receive_green_address_result(
+        &self,
+        params: jade_protocol_v1::Params<'_>,
+        network_name: &str,
+        is_liquid: bool,
+        confidential: bool,
+    ) -> V1Outcome {
+        const HARDENED: u32 = 0x8000_0000;
+        let subaccount = match params.u64("subaccount") {
+            Ok(Some(value)) if value <= u32::MAX as u64 => value as u32,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract path elements from parameters");
+            }
+        };
+        let branch = match params.u64("branch") {
+            Ok(Some(value)) if value <= u32::MAX as u64 => value as u32,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract path elements from parameters");
+            }
+        };
+        let pointer = match params.u64("pointer") {
+            Ok(Some(value)) if value <= u32::MAX as u64 => value as u32,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract path elements from parameters");
+            }
+        };
+
+        let csv_blocks = match params.u64("csv_blocks") {
+            Ok(Some(value)) if value <= u32::MAX as u64 => value as u32,
+            Ok(None) => 0,
+            Ok(Some(_)) | Err(_) => {
+                return bad_parameters("Failed to generate valid green address script");
+            }
+        };
+        if csv_blocks != 0 && !network_allows_csv_blocks(network_name, csv_blocks) {
+            return bad_parameters("Failed to generate valid green address script");
+        }
+
+        let xpub_prefix = match xpub_prefix_for_network(network_name) {
+            Some(prefix) => prefix,
+            None => return bad_parameters("Failed to extract valid network from parameters"),
+        };
+        let service_xpub = match green_service_xpub_for_network(network_name) {
+            Some(service_xpub) => service_xpub,
+            None => return bad_parameters("Failed to extract valid network from parameters"),
+        };
+        let recovery_xpub = match params.str("recovery_xpub") {
+            Ok(Some(value)) if !value.is_empty() => {
+                match decode_xpub_for_prefix(value, xpub_prefix) {
+                    Some(xpub) => Some(xpub),
+                    None => {
+                        return bad_parameters("Failed to generate valid green address script");
+                    }
+                }
+            }
+            Ok(_) => None,
+            Err(_) => return bad_parameters("Failed to generate valid green address script"),
+        };
+
+        let path = if subaccount > 0 {
+            Vec::from([HARDENED | 3, HARDENED | subaccount, branch, pointer])
+        } else {
+            Vec::from([branch, pointer])
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return bad_parameters("Failed to generate valid green address script");
+        };
+
+        let address = if is_liquid {
+            let Some(network) = liquid_network_for_name(network_name) else {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            };
+            if confidential {
+                jade_crypto::pure_rust::liquid_confidential_green_address_from_seed(
+                    seed,
+                    &path,
+                    &service_xpub,
+                    recovery_xpub.as_ref(),
+                    csv_blocks,
+                    network,
+                    &self.platform.master_unblinding_key,
+                )
+            } else {
+                jade_crypto::pure_rust::liquid_unconfidential_green_address_from_seed(
+                    seed,
+                    &path,
+                    &service_xpub,
+                    recovery_xpub.as_ref(),
+                    csv_blocks,
+                    network,
+                )
+            }
+        } else {
+            let Some(network) = bitcoin_network_for_name(network_name) else {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            };
+            jade_crypto::pure_rust::bitcoin_green_address_from_seed(
+                seed,
+                &path,
+                &service_xpub,
+                recovery_xpub.as_ref(),
+                csv_blocks,
+                network,
+            )
+        };
+        match address {
+            Some(result) => V1Outcome::TextResult { result },
+            None => bad_parameters("Failed to generate valid green address script"),
+        }
     }
 
     fn receive_descriptor_address_result(
@@ -4475,6 +4604,46 @@ fn xpub_prefix_for_network(network: &str) -> Option<jade_crypto::XpubPrefix> {
     }
 }
 
+fn decode_xpub_for_prefix(
+    xpub: &str,
+    xpub_prefix: jade_crypto::XpubPrefix,
+) -> Option<[u8; jade_storage::BIP32_SERIALIZED_LEN]> {
+    let bytes = base58ck::decode_check(xpub).ok()?;
+    let bytes: [u8; jade_storage::BIP32_SERIALIZED_LEN] = bytes.try_into().ok()?;
+    if valid_serialized_xpub_for_prefix(&bytes, xpub_prefix) {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+fn green_service_xpub_for_network(
+    network: &str,
+) -> Option<[u8; jade_storage::BIP32_SERIALIZED_LEN]> {
+    let xpub = match network {
+        "mainnet" => MAINNET_SERVICE_XPUB,
+        "liquid" => LIQUID_SERVICE_XPUB,
+        "testnet" | "localtest" | "localtest-liquid" => TESTNET_SERVICE_XPUB,
+        "testnet-liquid" => TESTNET_LIQUID_SERVICE_XPUB,
+        _ => return None,
+    };
+    let prefix = xpub_prefix_for_network(network)?;
+    decode_xpub_for_prefix(xpub, prefix)
+}
+
+fn network_allows_csv_blocks(network: &str, csv_blocks: u32) -> bool {
+    let Some(minimum) = (match network {
+        "mainnet" => Some(25_920),
+        "testnet" | "localtest" => Some(144),
+        "liquid" => Some(65_535),
+        "testnet-liquid" | "localtest-liquid" => Some(1_440),
+        _ => None,
+    }) else {
+        return false;
+    };
+    csv_blocks >= minimum && csv_blocks <= 65_535
+}
+
 fn valid_pinserver_url(url: &str) -> bool {
     (url.len() > "http://".len() && url.starts_with("http://"))
         || (url.len() > "https://".len() && url.starts_with("https://"))
@@ -7687,6 +7856,142 @@ mod tests {
     }
 
     #[test]
+    fn get_receive_address_derives_default_green_addresses() {
+        let seed = decode_hex::<64>(
+            "f1d56befd46eddfc31cda129dc76cd4a2b41d2cf86f10a5ccf0787617afa3869\
+             967aab0224742ccc002056747ea09b68598ddf79c027c37a7c3ec923004593da",
+        );
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(seed.to_vec());
+        emulator.platform_mut().set_master_unblinding_key(
+            jade_crypto::slip77_master_unblinding_key_from_seed(&seed).unwrap(),
+        );
+
+        for (network, subaccount, branch, pointer, recovery_xpub, csv_blocks, confidential, expected) in [
+            (
+                "localtest",
+                0,
+                1,
+                345,
+                None,
+                0,
+                None,
+                "2MyMy6Ey7a5dmWJW1D9M7RFwjmXD1ECrgy4",
+            ),
+            (
+                "testnet",
+                0,
+                1,
+                568,
+                None,
+                51_840,
+                None,
+                "2MxbBuvnRvgL3uTDtTkufPTdzuwuXE9HCNj",
+            ),
+            (
+                "mainnet",
+                3,
+                1,
+                88,
+                Some(""),
+                0,
+                None,
+                "36kTtrBFR5NQmzBxAuNWcmLk22WsuhRq2S",
+            ),
+            (
+                "mainnet",
+                0,
+                1,
+                568,
+                Some(
+                    "xpub6BYx1MizD2XPpY6EuF5Pso8cG5fVHJEWniziGqXcrrcqH96MUiPcuNQkfKSnGx9tCvBJBZx35fiZE3zBbVkZqH89TU4W6HkyE9fSUx9QHNX",
+                ),
+                0,
+                None,
+                "338M4PG24m1gZggrzQV1s9vr3dZZ31kLsU",
+            ),
+            (
+                "localtest-liquid",
+                6,
+                1,
+                345,
+                None,
+                65_535,
+                None,
+                "Azpx2UGRpzEQ6pt6yCbPYGnjqNaTtxN2ZdLmMMjWMVvJdzd5uD9cysaRc4Es5auve68RAwijQqReG3AT",
+            ),
+            (
+                "testnet-liquid",
+                3,
+                1,
+                244,
+                None,
+                65_535,
+                None,
+                "vjU6NdME2viTa8BzBA6qNG5jQKLfGfLvC93f4fRwZ9SR4pE7KBWQNbGUi2bodfxiMACFDombViiC5Vej",
+            ),
+            (
+                "liquid",
+                10,
+                1,
+                122,
+                None,
+                65_535,
+                None,
+                "VJLGotGqjthW3NY7JFZ7EaJZo8rnuRi23waPVY7FwJTYxtFNrNLy6CC4VEQoKRmd5VkL2mmuo64LfZNy",
+            ),
+            (
+                "testnet-liquid",
+                0,
+                1,
+                9,
+                None,
+                65_535,
+                Some(false),
+                "8z6YuTaMWRf4UeqAGKmQ64Bi4wPWtw7pqm",
+            ),
+        ] {
+            let mut params = Vec::new();
+            let entry_count = 5 + usize::from(recovery_xpub.is_some())
+                + usize::from(confidential.is_some());
+            let mut encoder = minicbor::Encoder::new(&mut params);
+            encoder.map(entry_count as u64).unwrap();
+            encoder.str("network").unwrap().str(network).unwrap();
+            encoder.str("subaccount").unwrap().u64(subaccount).unwrap();
+            encoder.str("branch").unwrap().u64(branch).unwrap();
+            encoder.str("pointer").unwrap().u64(pointer).unwrap();
+            encoder.str("csv_blocks").unwrap().u64(csv_blocks).unwrap();
+            if let Some(recovery_xpub) = recovery_xpub {
+                encoder
+                    .str("recovery_xpub")
+                    .unwrap()
+                    .str(recovery_xpub)
+                    .unwrap();
+            }
+            if let Some(confidential) = confidential {
+                encoder
+                    .str("confidential")
+                    .unwrap()
+                    .bool(confidential)
+                    .unwrap();
+            }
+            let request = Request {
+                id: Cow::Borrowed("a"),
+                method: Cow::Borrowed("get_receive_address"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::TextResult {
+                    result: expected.to_string()
+                },
+                "{network} {subaccount}/{branch}/{pointer}"
+            );
+        }
+    }
+
+    #[test]
     fn get_receive_address_derives_liquid_unconfidential_singlesig_address() {
         let mut emulator = Emulator::new();
         emulator.platform_mut().set_debug_wallet_seed(
@@ -9126,8 +9431,9 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "get_receive_address".to_string()
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract path elements from parameters".to_string()
             }
         );
 
