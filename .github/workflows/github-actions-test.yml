@@ -12,6 +12,8 @@ jobs:
         components: clippy, rustfmt
     - name: Check Rust workspace formatting
       run: cargo fmt --all --check
+    - name: Check Rust core has no C or C++ files
+      run: ./tools/check_rust_core_no_c.sh
     - name: Check Rust workspace
       run: cargo check --workspace --all-targets
     - name: Test Rust workspace

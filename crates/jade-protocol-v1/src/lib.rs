@@ -2,8 +2,8 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
-use minicbor::{Decode, Encode};
+use alloc::{borrow::Cow, vec::Vec};
+use minicbor::{data::Type, Decoder, Encoder};
 
 pub const MAX_ID_LEN: usize = 16;
 pub const MAX_METHOD_LEN: usize = 32;
@@ -307,12 +307,11 @@ pub fn method_spec(method: &str) -> Option<&'static MethodSpec> {
     METHOD_SPECS.iter().find(|spec| spec.name == method)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request<'a> {
-    #[n(0)]
     pub id: Cow<'a, str>,
-    #[n(1)]
     pub method: Cow<'a, str>,
+    pub params: Option<&'a [u8]>,
 }
 
 impl<'a> Request<'a> {
@@ -322,13 +321,10 @@ impl<'a> Request<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorResponse<'a> {
-    #[n(0)]
     pub id: Cow<'a, str>,
-    #[n(1)]
     pub code: i32,
-    #[n(2)]
     pub message: Cow<'a, str>,
 }
 
@@ -339,6 +335,123 @@ pub enum ValidationError {
     EmptyMethod,
     MethodTooLong,
     UnknownMethod,
+    MalformedCbor,
+    TrailingData,
+    MissingId,
+    MissingMethod,
+}
+
+impl From<minicbor::decode::Error> for ValidationError {
+    fn from(_: minicbor::decode::Error) -> Self {
+        Self::MalformedCbor
+    }
+}
+
+pub fn decode_request(input: &[u8]) -> Result<Request<'_>, ValidationError> {
+    let mut decoder = Decoder::new(input);
+    let Some(len) = decoder.map()? else {
+        return Err(ValidationError::MalformedCbor);
+    };
+
+    let mut id = None;
+    let mut method = None;
+    let mut params = None;
+
+    for _ in 0..len {
+        match decoder.datatype()? {
+            Type::String => {
+                let key = decoder.str()?;
+                match key {
+                    "id" if id.is_none() => id = Some(decoder.str()?),
+                    "method" if method.is_none() => method = Some(decoder.str()?),
+                    "params" if params.is_none() => {
+                        let start = decoder.position();
+                        decoder.skip()?;
+                        params = Some(&input[start..decoder.position()]);
+                    }
+                    _ => decoder.skip()?,
+                }
+            }
+            _ => {
+                decoder.skip()?;
+                decoder.skip()?;
+            }
+        }
+    }
+
+    if decoder.position() != input.len() {
+        return Err(ValidationError::TrailingData);
+    }
+
+    let request = Request {
+        id: Cow::Borrowed(id.ok_or(ValidationError::MissingId)?),
+        method: Cow::Borrowed(method.ok_or(ValidationError::MissingMethod)?),
+        params,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+pub fn encode_error_response(response: &ErrorResponse<'_>) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(&response.id))
+        .and_then(|e| e.str("error"))
+        .and_then(|e| e.map(2))
+        .and_then(|e| e.str("code"))
+        .and_then(|e| e.i32(response.code))
+        .and_then(|e| e.str("message"))
+        .and_then(|e| e.str(&response.message))
+        .expect("Vec-backed CBOR encoding is infallible");
+    output
+}
+
+pub fn encode_error_with_data_response(response: &ErrorResponse<'_>, data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(&response.id))
+        .and_then(|e| e.str("error"))
+        .and_then(|e| e.map(3))
+        .and_then(|e| e.str("code"))
+        .and_then(|e| e.i32(response.code))
+        .and_then(|e| e.str("message"))
+        .and_then(|e| e.str(&response.message))
+        .and_then(|e| e.str("data"))
+        .and_then(|e| e.bytes(data))
+        .expect("Vec-backed CBOR encoding is infallible");
+    output
+}
+
+pub fn encode_uint_result(id: &str, result: u64) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.u64(result))
+        .expect("Vec-backed CBOR encoding is infallible");
+    output
+}
+
+pub fn encode_bool_result(id: &str, result: bool) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.bool(result))
+        .expect("Vec-backed CBOR encoding is infallible");
+    output
 }
 
 pub fn validate_id(id: &str) -> Result<(), ValidationError> {
@@ -389,6 +502,73 @@ mod tests {
         assert_eq!(
             method_spec("sign_liquid_tx").unwrap().parity,
             ParityStatus::Deferred
+        );
+    }
+
+    #[test]
+    fn decodes_real_v1_string_keyed_request() {
+        let bytes = [
+            0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x64,
+            b'p', b'i', b'n', b'g',
+        ];
+
+        let request = decode_request(&bytes).unwrap();
+
+        assert_eq!(request.id, "1");
+        assert_eq!(request.method, "ping");
+        assert!(request.params.is_none());
+    }
+
+    #[test]
+    fn preserves_raw_params_slice() {
+        let bytes = [
+            0xa3, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x64,
+            b'p', b'i', b'n', b'g', 0x66, b'p', b'a', b'r', b'a', b'm', b's', 0xa1, 0x6b, b'n',
+            b'o', b'n', b'b', b'l', b'o', b'c', b'k', b'i', b'n', b'g', 0xf5,
+        ];
+
+        let request = decode_request(&bytes).unwrap();
+
+        assert_eq!(
+            request.params.unwrap(),
+            &[0xa1, 0x6b, b'n', b'o', b'n', b'b', b'l', b'o', b'c', b'k', b'i', b'n', b'g', 0xf5]
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_data() {
+        let bytes = [
+            0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'm', b'e', b't', b'h', b'o', b'd', 0x64,
+            b'p', b'i', b'n', b'g', 0x00,
+        ];
+
+        assert_eq!(decode_request(&bytes), Err(ValidationError::TrailingData));
+    }
+
+    #[test]
+    fn encodes_v1_error_shape() {
+        let response = ErrorResponse {
+            id: Cow::Borrowed("1"),
+            code: ErrorCode::UnknownMethod as i32,
+            message: Cow::Borrowed("Unknown method"),
+        };
+
+        assert_eq!(
+            encode_error_response(&response),
+            [
+                0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x65, b'e', b'r', b'r', b'o', b'r', 0xa2, 0x64,
+                b'c', b'o', b'd', b'e', 0x39, 0x7f, 0x58, 0x67, b'm', b'e', b's', b's', b'a', b'g',
+                b'e', 0x6e, b'U', b'n', b'k', b'n', b'o', b'w', b'n', b' ', b'm', b'e', b't', b'h',
+                b'o', b'd',
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_v1_ping_result_shape() {
+        assert_eq!(
+            encode_uint_result("1", 0),
+            [0xa2, 0x62, b'i', b'd', 0x61, b'1', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x00,]
         );
     }
 }

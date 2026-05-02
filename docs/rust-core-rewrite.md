@@ -59,3 +59,10 @@ the continuation methods used by multi-message flows.
 2. v1 method catalog matches current dispatch and continuation methods.
 3. `jade-emulator` can route `ping` immediately and defer non-immediate methods.
 4. Existing Python/libjade tests remain the oracle for subsequent ports.
+
+## C/C++ Removal Rule
+
+The first enforceable boundary is `crates/`: no C or C++ source/header files are
+allowed there. The legacy firmware remains available outside `crates/` only as
+the production implementation and differential oracle until Rust parity is
+proven subsystem by subsystem.
