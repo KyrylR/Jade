@@ -103,9 +103,10 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
   no-op PSBT/PSET payloads unchanged when there is nothing to sign or wallet
   inputs are already signed, and produces pure-Rust ECDSA signatures for the
-  first Bitcoin single-sig PSBT paths: legacy P2PKH, native P2WPKH, and
-  P2SH-wrapped P2WPKH. Taproot, multisig, anti-exfil PSBT flows, and
-  Liquid/PSET signing still defer to the transaction-signing milestone.
+  first Bitcoin single-sig PSBT paths: legacy P2PKH, native P2WPKH,
+  P2SH-wrapped P2WPKH, and Taproot key-path DEFAULT/ALL. Multisig,
+  anti-exfil PSBT flows, script-path Taproot, and Liquid/PSET signing still
+  defer to the transaction-signing milestone.
 
 ## First Parity Gates
 
