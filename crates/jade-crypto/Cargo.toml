@@ -28,6 +28,7 @@ k256 = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 pbkdf2.workspace = true
 ripemd = { workspace = true, optional = true }
+sha1.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 

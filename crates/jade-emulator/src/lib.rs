@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::fmt;
+use std::str;
 use std::string::String;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
 use jade_core::{
@@ -169,6 +171,12 @@ impl Emulator {
             }
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptor" => {
                 self.registered_descriptor_details(request)
+            }
+            Some(MethodClass::Authenticated) if request.method == "register_otp" => {
+                self.register_otp_result(request)
+            }
+            Some(MethodClass::Authenticated) if request.method == "get_otp_code" => {
+                self.otp_code_result(request)
             }
             Some(MethodClass::Authenticated) if request.method == "get_xpub" => {
                 self.xpub_result(request)
@@ -709,6 +717,159 @@ impl Emulator {
         };
 
         V1Outcome::TextResult { result: address }
+    }
+
+    fn register_otp_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let name = match params.str("name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to fetch valid otp name from parameters");
+            }
+        };
+        let uri = match params.str("uri") {
+            Ok(Some(uri)) if !uri.is_empty() => uri,
+            Ok(_) | Err(_) => return bad_parameters("Failed to fetch otp uri from parameters"),
+        };
+
+        if self.platform.wallet_seed().is_none() {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            };
+        }
+
+        let mut existing_otp = Vec::new();
+        if self
+            .storage
+            .get_record(StorageRecord::OtpData { name }, &mut existing_otp)
+            .is_err()
+            && self.storage.count(StorageNamespace::Otp).unwrap_or(0)
+                >= jade_crypto::OTP_MAX_RECORDS
+        {
+            return bad_parameters("Already have maximum number of otp records");
+        }
+
+        let otp = match jade_crypto::OtpUri::parse(uri) {
+            Ok(otp) => otp,
+            Err(_) => return bad_parameters("Failed to parse otp record"),
+        };
+        if otp.auth_code(0).is_err() {
+            return bad_parameters("Failed to calculate otp token");
+        }
+
+        if self.storage.set_otp_data(name, uri.as_bytes()).is_err() {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to persist otp details".to_string(),
+            };
+        }
+        if let Some(counter) = otp.initial_hotp_counter() {
+            if self.storage.set_otp_hotp_counter(name, counter).is_err() {
+                let _ = self.storage.erase_otp(name);
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to persist otp counter".to_string(),
+                };
+            }
+        }
+
+        V1Outcome::BoolResult { result: true }
+    }
+
+    fn otp_code_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let name = match params.str("name") {
+            Ok(Some(name)) if !name.is_empty() => name,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to fetch valid otp name from parameters");
+            }
+        };
+
+        if self.platform.wallet_seed().is_none() {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            };
+        }
+
+        let mut uri = Vec::new();
+        if self
+            .storage
+            .get_record(StorageRecord::OtpData { name }, &mut uri)
+            .is_err()
+            || uri.is_empty()
+        {
+            return bad_parameters("Cannot find or load named otp record");
+        }
+        let uri = match str::from_utf8(&uri) {
+            Ok(uri) => uri,
+            Err(_) => return bad_parameters("Failed to parse otp record"),
+        };
+        let otp = match jade_crypto::OtpUri::parse(uri) {
+            Ok(otp) => otp,
+            Err(_) => return bad_parameters("Failed to parse otp record"),
+        };
+
+        let value = match otp.kind {
+            jade_crypto::OtpKind::Hotp { .. } => {
+                let current = match self.storage.otp_hotp_counter(name) {
+                    Ok(counter) => counter,
+                    Err(_) => {
+                        return V1Outcome::Reject {
+                            code: ErrorCode::InternalError,
+                            message: "Failed to set OTP counter".to_string(),
+                        };
+                    }
+                };
+                if self
+                    .storage
+                    .set_otp_hotp_counter(name, current.saturating_add(1))
+                    .is_err()
+                {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::InternalError,
+                        message: "Failed to set OTP counter".to_string(),
+                    };
+                }
+                current
+            }
+            jade_crypto::OtpKind::Totp { .. } => self
+                .platform
+                .current_epoch()
+                .unwrap_or_else(current_unix_epoch),
+        };
+
+        let override_value = params.u64("override").ok().flatten();
+        let value = override_value.unwrap_or(value);
+
+        if override_value.is_none()
+            && matches!(otp.kind, jade_crypto::OtpKind::Totp { .. })
+            && value < 1_577_836_800
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to set OTP counter".to_string(),
+            };
+        }
+
+        match otp.auth_code(value) {
+            Ok(result) => V1Outcome::TextResult { result },
+            Err(_) => V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to calculate otp token".to_string(),
+            },
+        }
     }
 
     fn identity_pubkey_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -1579,6 +1740,13 @@ fn bad_parameters(message: &'static str) -> V1Outcome {
     }
 }
 
+fn current_unix_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn hash32_param(
     params: jade_protocol_v1::Params<'_>,
     field: &str,
@@ -1839,6 +2007,10 @@ impl HostPlatform {
     }
 
     pub fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    pub fn current_epoch(&self) -> Option<u64> {
         self.epoch
     }
 
@@ -2598,6 +2770,177 @@ mod tests {
                 V1Outcome::EmptyMapResult
             );
         }
+    }
+
+    #[test]
+    fn register_otp_and_get_hotp_codes_use_rust_storage() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x11; jade_crypto::SHA512_LEN]);
+        let uri = "otpauth://hotp/ACME%20Co:john.doe@email.com\
+                   ?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=ACME%20Co&counter=0";
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("name")
+            .unwrap()
+            .str("test_hotp")
+            .unwrap()
+            .str("uri")
+            .unwrap()
+            .str(uri)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("otp"),
+            method: Cow::Borrowed("register_otp"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("name")
+            .unwrap()
+            .str("test_hotp")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("otp"),
+            method: Cow::Borrowed("get_otp_code"),
+            params: Some(&params),
+        };
+
+        for expected in ["755224", "287082", "359152"] {
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::TextResult {
+                    result: expected.to_string(),
+                }
+            );
+        }
+
+        assert_eq!(emulator.storage.otp_hotp_counter("test_hotp").unwrap(), 3);
+    }
+
+    #[test]
+    fn get_otp_code_honors_debug_override_for_totp() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x22; jade_crypto::SHA512_LEN]);
+        let uri = "otpauth://totp/ACME%20Co:john.doe@email.com\
+                   ?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=ACME%20Co&digits=8&algorithm=SHA256";
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("name")
+            .unwrap()
+            .str("test_totp")
+            .unwrap()
+            .str("uri")
+            .unwrap()
+            .str(uri)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("otp"),
+            method: Cow::Borrowed("register_otp"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("name")
+            .unwrap()
+            .str("test_totp")
+            .unwrap()
+            .str("override")
+            .unwrap()
+            .u64(59)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("otp"),
+            method: Cow::Borrowed("get_otp_code"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "46119246".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn register_otp_rejects_missing_seed_and_bad_uri() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("name")
+            .unwrap()
+            .str("otp")
+            .unwrap()
+            .str("uri")
+            .unwrap()
+            .str("otpauth://totp/Foo?secret=VM")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("otp"),
+            method: Cow::Borrowed("register_otp"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            }
+        );
+
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x11; jade_crypto::SHA512_LEN]);
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("name")
+            .unwrap()
+            .str("otp")
+            .unwrap()
+            .str("uri")
+            .unwrap()
+            .str("otpauth://hotp/Foo?secret=VM")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("otp"),
+            method: Cow::Borrowed("register_otp"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to parse otp record".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -8,6 +8,10 @@ pub const SHA256_LEN: usize = 32;
 pub const SHA512_LEN: usize = 64;
 pub const EC_PRIVATE_KEY_LEN: usize = 32;
 pub const EC_PUBLIC_KEY_COMPRESSED_LEN: usize = 33;
+pub const OTP_MAX_NAME_LEN: usize = 16;
+pub const OTP_MAX_URI_LEN: usize = 256;
+pub const OTP_MAX_TOKEN_LEN: usize = 12;
+pub const OTP_MAX_RECORDS: usize = 16;
 
 pub trait SecretKeyMaterial: Zeroize {
     fn expose_secret_bytes(&self) -> &[u8];
@@ -120,6 +124,293 @@ pub struct IdentitySignature {
 pub struct Bip85EncryptedEntropy {
     pub pubkey: [u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
     pub encrypted: alloc::vec::Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpAlgorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpKind {
+    Hotp { counter: u64 },
+    Totp { period: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtpUri<'a> {
+    pub kind: OtpKind,
+    pub algorithm: OtpAlgorithm,
+    pub digits: u8,
+    pub secret: &'a str,
+    pub label: &'a str,
+    pub issuer: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpError {
+    InvalidUri,
+    InvalidSecret,
+    TokenTooLong,
+}
+
+impl<'a> OtpUri<'a> {
+    pub fn parse(uri: &'a str) -> Result<Self, OtpError> {
+        const PREFIX: &str = "otpauth://";
+
+        if uri.len() >= OTP_MAX_URI_LEN
+            || !uri.starts_with(PREFIX)
+            || uri.as_bytes().contains(&b'#')
+        {
+            return Err(OtpError::InvalidUri);
+        }
+
+        let rest = &uri[PREFIX.len()..];
+        let (kind_str, rest) = split_once(rest, b'/').ok_or(OtpError::InvalidUri)?;
+        let (label, query) = split_once(rest, b'?').ok_or(OtpError::InvalidUri)?;
+        if query.is_empty() {
+            return Err(OtpError::InvalidUri);
+        }
+
+        let secret = query_arg(query, "secret").ok_or(OtpError::InvalidUri)?;
+        if secret.is_empty() {
+            return Err(OtpError::InvalidUri);
+        }
+
+        let digits = match query_arg(query, "digits") {
+            Some(value) if value.len() == 1 => match value.as_bytes()[0] {
+                b'6' => 6,
+                b'8' => 8,
+                _ => return Err(OtpError::InvalidUri),
+            },
+            Some(_) => return Err(OtpError::InvalidUri),
+            None => 6,
+        };
+
+        let algorithm = match query_arg(query, "algorithm") {
+            Some("SHA1") | None => OtpAlgorithm::Sha1,
+            Some("SHA256") => OtpAlgorithm::Sha256,
+            Some("SHA512") => OtpAlgorithm::Sha512,
+            Some(_) => return Err(OtpError::InvalidUri),
+        };
+
+        let kind = match kind_str {
+            "hotp" => {
+                let counter = query_arg(query, "counter")
+                    .and_then(parse_decimal_u64)
+                    .ok_or(OtpError::InvalidUri)?;
+                OtpKind::Hotp { counter }
+            }
+            "totp" => {
+                let period = match query_arg(query, "period") {
+                    Some(value) => {
+                        let value = parse_decimal_u64(value).ok_or(OtpError::InvalidUri)?;
+                        if value == 0 || value > u8::MAX as u64 {
+                            return Err(OtpError::InvalidUri);
+                        }
+                        value as u8
+                    }
+                    None => 30,
+                };
+                OtpKind::Totp { period }
+            }
+            _ => return Err(OtpError::InvalidUri),
+        };
+
+        let parsed = Self {
+            kind,
+            algorithm,
+            digits,
+            secret,
+            label,
+            issuer: query_arg(query, "issuer"),
+        };
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    pub fn initial_hotp_counter(&self) -> Option<u64> {
+        match self.kind {
+            OtpKind::Hotp { counter } => Some(counter),
+            OtpKind::Totp { .. } => None,
+        }
+    }
+
+    pub fn counter_for_value(&self, value: u64) -> u64 {
+        match self.kind {
+            OtpKind::Hotp { .. } => value,
+            OtpKind::Totp { period } => value / period as u64,
+        }
+    }
+
+    pub fn auth_code(&self, value: u64) -> Result<alloc::string::String, OtpError> {
+        let counter = self.counter_for_value(value);
+        let secret = base32_to_bytes(self.secret)?;
+        let hmac = match self.algorithm {
+            OtpAlgorithm::Sha1 => hmac_sha1(&secret, counter),
+            OtpAlgorithm::Sha256 => {
+                let padded = padded_secret(secret, 32)?;
+                hmac_sha256(&padded, counter)
+            }
+            OtpAlgorithm::Sha512 => {
+                let padded = padded_secret(secret, 64)?;
+                hmac_sha512(&padded, counter)
+            }
+        };
+
+        let code = truncate_otp(&hmac, self.digits)?;
+        Ok(format_otp_code(code, self.digits))
+    }
+
+    fn validate(&self) -> Result<(), OtpError> {
+        if self.secret.is_empty()
+            || !matches!(self.kind, OtpKind::Hotp { .. } | OtpKind::Totp { .. })
+            || !matches!(self.digits, 6 | 8)
+        {
+            return Err(OtpError::InvalidUri);
+        }
+        if matches!(self.kind, OtpKind::Totp { period: 0 }) {
+            return Err(OtpError::InvalidUri);
+        }
+        Ok(())
+    }
+}
+
+fn split_once(value: &str, byte: u8) -> Option<(&str, &str)> {
+    let index = value.as_bytes().iter().position(|item| *item == byte)?;
+    Some((&value[..index], &value[index + 1..]))
+}
+
+fn query_arg<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for field in query.split('&') {
+        let (candidate, value) = split_once(field, b'=')?;
+        if candidate.eq_ignore_ascii_case(key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_decimal_u64(value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return None;
+    }
+
+    value.bytes().try_fold(0u64, |acc, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        acc.checked_mul(10)?.checked_add((byte - b'0') as u64)
+    })
+}
+
+fn base32_to_bytes(value: &str) -> Result<alloc::vec::Vec<u8>, OtpError> {
+    if value.is_empty() {
+        return Err(OtpError::InvalidSecret);
+    }
+
+    let mut out = alloc::vec::Vec::with_capacity(value.len() * 5 / 8);
+    let mut tmp = 0u32;
+    let mut num_bits = 0u8;
+    for byte in value.bytes() {
+        let value = match byte {
+            b'a'..=b'z' => byte - b'a',
+            b'A'..=b'Z' => byte - b'A',
+            b'2'..=b'7' => byte - b'2' + 26,
+            b'=' => break,
+            _ => return Err(OtpError::InvalidSecret),
+        } as u32;
+
+        tmp = (tmp << 5) | value;
+        num_bits += 5;
+        if num_bits >= 8 {
+            num_bits -= 8;
+            out.push((tmp >> num_bits) as u8);
+        }
+    }
+
+    if out.is_empty() {
+        return Err(OtpError::InvalidSecret);
+    }
+    Ok(out)
+}
+
+fn padded_secret(
+    mut secret: alloc::vec::Vec<u8>,
+    min_size: usize,
+) -> Result<alloc::vec::Vec<u8>, OtpError> {
+    if secret.is_empty() {
+        return Err(OtpError::InvalidSecret);
+    }
+
+    let original_len = secret.len();
+    while secret.len() < min_size {
+        let copy_len = core::cmp::min(min_size - secret.len(), original_len);
+        for index in 0..copy_len {
+            secret.push(secret[index]);
+        }
+    }
+    Ok(secret)
+}
+
+fn hmac_sha1(secret: &[u8], counter: u64) -> alloc::vec::Vec<u8> {
+    type HmacSha1 = hmac::Hmac<sha1::Sha1>;
+
+    let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts any key length");
+    hmac::Mac::update(&mut mac, &counter.to_be_bytes());
+    hmac::Mac::finalize(mac).into_bytes().to_vec()
+}
+
+fn hmac_sha256(secret: &[u8], counter: u64) -> alloc::vec::Vec<u8> {
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+    let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts any key length");
+    hmac::Mac::update(&mut mac, &counter.to_be_bytes());
+    hmac::Mac::finalize(mac).into_bytes().to_vec()
+}
+
+fn hmac_sha512(secret: &[u8], counter: u64) -> alloc::vec::Vec<u8> {
+    type HmacSha512 = hmac::Hmac<sha2::Sha512>;
+
+    let mut mac = <HmacSha512 as hmac::digest::KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts any key length");
+    hmac::Mac::update(&mut mac, &counter.to_be_bytes());
+    hmac::Mac::finalize(mac).into_bytes().to_vec()
+}
+
+fn truncate_otp(hmac: &[u8], digits: u8) -> Result<u32, OtpError> {
+    if hmac.is_empty() {
+        return Err(OtpError::InvalidSecret);
+    }
+    let offset = (hmac[hmac.len() - 1] & 0x0f) as usize;
+    if offset + 4 > hmac.len() {
+        return Err(OtpError::InvalidSecret);
+    }
+
+    let full_code = ((hmac[offset] as u32 & 0x7f) << 24)
+        | ((hmac[offset + 1] as u32) << 16)
+        | ((hmac[offset + 2] as u32) << 8)
+        | hmac[offset + 3] as u32;
+    let modulo = match digits {
+        6 => 1_000_000,
+        8 => 100_000_000,
+        _ => return Err(OtpError::TokenTooLong),
+    };
+    Ok(full_code % modulo)
+}
+
+fn format_otp_code(code: u32, digits: u8) -> alloc::string::String {
+    use alloc::format;
+
+    match digits {
+        6 => format!("{code:06}"),
+        8 => format!("{code:08}"),
+        _ => format!("{code}"),
+    }
 }
 
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
@@ -710,6 +1001,107 @@ pub mod pure_rust {
             .as_slice()
             .try_into()
             .ok()
+    }
+}
+
+#[cfg(test)]
+mod otp_tests {
+    use super::*;
+
+    #[test]
+    fn hotp_matches_rfc4226_vectors() {
+        let otp = OtpUri::parse(
+            "otpauth://hotp/ACME%20Co:john.doe@email.com\
+             ?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=ACME%20Co&counter=0",
+        )
+        .unwrap();
+
+        for (counter, expected) in [
+            (0, "755224"),
+            (1, "287082"),
+            (2, "359152"),
+            (3, "969429"),
+            (4, "338314"),
+            (5, "254676"),
+            (6, "287922"),
+            (7, "162583"),
+            (8, "399871"),
+            (9, "520489"),
+        ] {
+            assert_eq!(otp.auth_code(counter).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn totp_matches_rfc6238_vectors_for_supported_hashes() {
+        let timestamps = [
+            59,
+            1_111_111_109,
+            1_111_111_111,
+            1_234_567_890,
+            2_000_000_000,
+            20_000_000_000,
+        ];
+
+        for (algorithm, expected) in [
+            (
+                "SHA1",
+                [
+                    "94287082", "07081804", "14050471", "89005924", "69279037", "65353130",
+                ],
+            ),
+            (
+                "SHA256",
+                [
+                    "46119246", "68084774", "67062674", "91819424", "90698825", "77737706",
+                ],
+            ),
+            (
+                "SHA512",
+                [
+                    "90693936", "25091201", "99943326", "93441116", "38618901", "47863826",
+                ],
+            ),
+        ] {
+            let uri = alloc::format!(
+                "otpauth://totp/ACME%20Co:john.doe@email.com\
+                 ?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=ACME%20Co&digits=8&algorithm={algorithm}"
+            );
+            let otp = OtpUri::parse(&uri).unwrap();
+            for (timestamp, expected) in timestamps.iter().zip(expected) {
+                assert_eq!(otp.auth_code(*timestamp).unwrap(), expected, "{algorithm}");
+            }
+        }
+    }
+
+    #[test]
+    fn totp_short_secret_padding_matches_jade_vectors() {
+        let sha1 =
+            OtpUri::parse("otpauth://totp/ACM?secret=VMR466AB62ZBOKHE&digits=6&algorithm=SHA1")
+                .unwrap();
+        assert_eq!(sha1.auth_code(0).unwrap(), "538532");
+        assert_eq!(sha1.auth_code(1_426_847_216).unwrap(), "543160");
+
+        let short_sha1 = OtpUri::parse("otpauth://totp/Foo?secret=VM").unwrap();
+        assert_eq!(short_sha1.auth_code(1_659_641_526).unwrap(), "468828");
+        assert_eq!(short_sha1.auth_code(1_659_641_674).unwrap(), "550073");
+        assert_eq!(short_sha1.auth_code(1_659_641_710).unwrap(), "222948");
+    }
+
+    #[test]
+    fn otp_uri_rejects_jade_bad_parameter_cases() {
+        for uri in [
+            "otpauth://hotp/Foo?secret=GEZDGNBVGY3TQOJQ",
+            "otpauth://hotp/Foo?secret=GEZDGNBVGY3TQOJQ&counter=",
+            "otpauth://hotp/Foo?secret=GEZDGNBVGY3TQOJQ&counter=18446744073709551616",
+            "otpauth://hotp/Foo?secret=GEZDGNBVGY3TQOJQ&counter=abc",
+            "otpauth://totp/Foo?secret=GEZDGNBVGY3TQOJQ&digits=",
+            "otpauth://totp/Foo?secret=GEZDGNBVGY3TQOJQ&digits=7",
+            "otpauth://totp/Foo?secret=GEZDGNBVGY3TQOJQ&period=",
+            "otpauth://totp/Foo?secret=GEZDGNBVGY3TQOJQ&period=256",
+        ] {
+            assert_eq!(OtpUri::parse(uri), Err(OtpError::InvalidUri), "{uri}");
+        }
     }
 }
 
