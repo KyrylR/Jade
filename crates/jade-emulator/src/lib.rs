@@ -50,6 +50,15 @@ struct BitcoinSignTxSession {
     txn: Vec<u8>,
     expected_inputs: usize,
     received_inputs: usize,
+    next_signature: usize,
+    flow: BitcoinSignTxFlow,
+    inputs: Vec<BitcoinTxInputParams>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitcoinSignTxFlow {
+    Legacy,
+    Staged,
 }
 
 impl Default for Emulator {
@@ -263,6 +272,9 @@ impl Emulator {
             }
             Some(MethodClass::Continuation) if request.method == "tx_input" => {
                 self.tx_input_result(request)
+            }
+            Some(MethodClass::Continuation) if request.method == "get_signature" => {
+                self.get_signature_result(request)
             }
             Some(MethodClass::Continuation) if request.method == "ota_data" => {
                 self.handle_ota_data(request)
@@ -1957,16 +1969,19 @@ impl Emulator {
         if actual_inputs != expected_inputs {
             return bad_parameters("Wrong number of inputs");
         }
-        if optional_bool(params, "use_ae_signatures") {
-            return V1Outcome::DeferredToCore {
-                method: "sign_tx anti-exfil flow".to_string(),
-            };
-        }
+        let flow = if optional_bool(params, "use_ae_signatures") {
+            BitcoinSignTxFlow::Staged
+        } else {
+            BitcoinSignTxFlow::Legacy
+        };
 
         self.sign_tx = Some(BitcoinSignTxSession {
             txn,
             expected_inputs,
             received_inputs: 0,
+            next_signature: 0,
+            flow,
+            inputs: Vec::with_capacity(expected_inputs),
         });
         V1Outcome::BoolResult { result: true }
     }
@@ -2004,22 +2019,95 @@ impl Emulator {
                 message: "Too many tx_input messages".to_string(),
             };
         }
+        if input.uses_ae {
+            return V1Outcome::DeferredToCore {
+                method: "sign_tx anti-exfil flow".to_string(),
+            };
+        }
 
         let tx_input_index = session.received_inputs;
-        let signing_input = jade_crypto::pure_rust::BitcoinTxSignInput {
-            tx_input_index,
-            path: &input.path,
-            script_code: input.script,
-            sighash: input.sighash,
-            is_witness: input.is_witness,
-            satoshi: input.satoshi,
+        session.received_inputs += 1;
+
+        match session.flow {
+            BitcoinSignTxFlow::Legacy => {
+                let signature = sign_bitcoin_tx_input(&session.txn, seed, tx_input_index, &input)
+                    .map_err(|err| match err {
+                        jade_crypto::TxSignError::Invalid => {
+                            bad_parameters("Failed to extract tx input from parameters")
+                        }
+                        jade_crypto::TxSignError::Unsupported => V1Outcome::DeferredToCore {
+                            method: "sign_tx signing".to_string(),
+                        },
+                    });
+                if session.received_inputs == session.expected_inputs {
+                    self.sign_tx = None;
+                }
+                match signature {
+                    Ok(signature) => V1Outcome::BytesResult { result: signature },
+                    Err(outcome) => outcome,
+                }
+            }
+            BitcoinSignTxFlow::Staged => {
+                session.inputs.push(input);
+                V1Outcome::BytesResult { result: Vec::new() }
+            }
+        }
+    }
+
+    fn get_signature_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(session) = self.sign_tx.as_ref() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
         };
-        let signature = match jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(
-            &session.txn,
-            seed,
-            &[signing_input],
-        ) {
-            Ok(mut signatures) => signatures.remove(0),
+        if session.flow != BitcoinSignTxFlow::Staged
+            || session.received_inputs < session.expected_inputs
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        }
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let ae_host_entropy = match cbor_map_bytes_or_null(params.raw(), "ae_host_entropy") {
+            Ok(value) => value,
+            Err(()) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Failed to extract valid host entropy from parameters".to_string(),
+                };
+            }
+        };
+        if ae_host_entropy.is_some_and(|entropy| !entropy.is_empty()) {
+            return V1Outcome::DeferredToCore {
+                method: "sign_tx anti-exfil flow".to_string(),
+            };
+        }
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Wallet seed is not available".to_string(),
+            };
+        };
+        let session = self
+            .sign_tx
+            .as_mut()
+            .expect("checked active sign_tx session");
+        let signature_index = session.next_signature;
+        let Some(input) = session.inputs.get(signature_index) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        };
+        let signature = match sign_bitcoin_tx_input(&session.txn, seed, signature_index, input) {
+            Ok(signature) => signature,
             Err(jade_crypto::TxSignError::Invalid) => {
                 return bad_parameters("Failed to extract tx input from parameters");
             }
@@ -2029,8 +2117,8 @@ impl Emulator {
                 };
             }
         };
-        session.received_inputs += 1;
-        if session.received_inputs == session.expected_inputs {
+        session.next_signature += 1;
+        if session.next_signature == session.expected_inputs {
             self.sign_tx = None;
         }
 
@@ -3047,17 +3135,18 @@ fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Opti
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BitcoinTxInputParams<'a> {
+struct BitcoinTxInputParams {
     path: Vec<u32>,
-    script: &'a [u8],
+    script: Vec<u8>,
     sighash: u32,
     is_witness: bool,
     satoshi: Option<u64>,
+    uses_ae: bool,
 }
 
-fn parse_bitcoin_tx_input_params<'a>(
-    params: jade_protocol_v1::Params<'a>,
-) -> Result<BitcoinTxInputParams<'a>, &'static str> {
+fn parse_bitcoin_tx_input_params(
+    params: jade_protocol_v1::Params<'_>,
+) -> Result<BitcoinTxInputParams, &'static str> {
     let is_witness = match params.bool("is_witness") {
         Ok(Some(value)) => value,
         Ok(None) | Err(_) => return Err("Failed to extract is_witness from parameters"),
@@ -3067,7 +3156,7 @@ fn parse_bitcoin_tx_input_params<'a>(
         Ok(_) | Err(_) => return Err("Failed to extract path from parameters"),
     };
     let script = match params.bytes("script") {
-        Ok(Some(script)) if !script.is_empty() => script,
+        Ok(Some(script)) if !script.is_empty() => script.to_vec(),
         Ok(_) | Err(_) => return Err("Failed to extract script from parameters"),
     };
     let sighash = match params.u64("sighash") {
@@ -3079,6 +3168,14 @@ fn parse_bitcoin_tx_input_params<'a>(
         Ok(value) => value,
         Err(_) => return Err("Failed to extract satoshi from parameters"),
     };
+    let uses_ae = match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
+        Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
+        Ok(Some(commitment)) if commitment.is_empty() => false,
+        Ok(Some(_)) | Err(()) => {
+            return Err("Failed to extract valid host commitment from parameters")
+        }
+        Ok(None) => false,
+    };
 
     Ok(BitcoinTxInputParams {
         path,
@@ -3086,7 +3183,27 @@ fn parse_bitcoin_tx_input_params<'a>(
         sighash,
         is_witness,
         satoshi,
+        uses_ae,
     })
+}
+
+fn sign_bitcoin_tx_input(
+    txn: &[u8],
+    seed: &[u8],
+    tx_input_index: usize,
+    input: &BitcoinTxInputParams,
+) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let signing_input = jade_crypto::pure_rust::BitcoinTxSignInput {
+        tx_input_index,
+        path: &input.path,
+        script_code: &input.script,
+        sighash: input.sighash,
+        is_witness: input.is_witness,
+        satoshi: input.satoshi,
+    };
+    let mut signatures =
+        jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &[signing_input])?;
+    Ok(signatures.remove(0))
 }
 
 fn cbor_map_field<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [u8]>, ()> {
@@ -3131,6 +3248,13 @@ fn cbor_map_bytes<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [u8]>, ()
     cbor_map_field(raw, field)?.map(cbor_bytes).transpose()
 }
 
+fn cbor_map_bytes_or_null<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [u8]>, ()> {
+    match cbor_map_field(raw, field)? {
+        Some(value) => cbor_bytes_or_null(value),
+        None => Ok(None),
+    }
+}
+
 fn cbor_bool(raw: &[u8]) -> Result<bool, ()> {
     let mut decoder = Decoder::new(raw);
     let value = decoder.bool().map_err(|_| ())?;
@@ -3164,6 +3288,23 @@ fn cbor_str(raw: &[u8]) -> Result<&str, ()> {
 fn cbor_bytes(raw: &[u8]) -> Result<&[u8], ()> {
     let mut decoder = Decoder::new(raw);
     let value = decoder.bytes().map_err(|_| ())?;
+    if decoder.position() == raw.len() {
+        Ok(value)
+    } else {
+        Err(())
+    }
+}
+
+fn cbor_bytes_or_null(raw: &[u8]) -> Result<Option<&[u8]>, ()> {
+    let mut decoder = Decoder::new(raw);
+    let value = match decoder.datatype().map_err(|_| ())? {
+        Type::Null => {
+            decoder.null().map_err(|_| ())?;
+            None
+        }
+        Type::Bytes => Some(decoder.bytes().map_err(|_| ())?),
+        _ => return Err(()),
+    };
     if decoder.position() == raw.len() {
         Ok(value)
     } else {
@@ -4529,7 +4670,7 @@ mod tests {
         fixture_psbt_base64(&fixture[start..])
     }
 
-    fn sign_tx_start_params(txn: &[u8], num_inputs: u64) -> Vec<u8> {
+    fn sign_tx_start_params(txn: &[u8], num_inputs: u64, use_ae_signatures: bool) -> Vec<u8> {
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
             .map(4)
@@ -4548,7 +4689,19 @@ mod tests {
             .unwrap()
             .str("use_ae_signatures")
             .unwrap()
-            .bool(false)
+            .bool(use_ae_signatures)
+            .unwrap();
+        params
+    }
+
+    fn get_signature_params() -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("ae_host_entropy")
+            .unwrap()
+            .null()
             .unwrap();
         params
     }
@@ -4762,7 +4915,7 @@ mod tests {
         let txn = decode_hex_vec(
             "020000000283dbdaaee275d2910cd17f65187ea3f20fe37a553b16df398160f14b84ff49a3000000006b483045022100ff7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f02207f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f01210268246c0462037aefb8611a9cebf313ee2430c22a4f3644e6460f4e88d73b54f4fdffffff4c3f7d4310d8d679d89a8af18094bb29be7de8cbfdb4b466c400fd41bf11d9af000000006b483045022100ff7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f02207f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f0121027eeb53798c29e1d19ad9c4948fce7f4fd13f65ba25a3100130ec5d4747bf1d54fdffffff02983a000000000000160014c153947d38dccc7238947edb2ecea9a420a9fd1e15120000000000001976a914c4e6c152268f755afbd8e70b8aa07f9c3aa0b4c888ac72000000",
         );
-        let start_params = sign_tx_start_params(&txn, 2);
+        let start_params = sign_tx_start_params(&txn, 2, false);
         let start_request = Request {
             id: Cow::Borrowed("tx"),
             method: Cow::Borrowed("sign_tx"),
@@ -4809,7 +4962,7 @@ mod tests {
         let txn = decode_hex_vec(
             "02000000000101962675e3082c9df574155ea8a005a4d2888e8f6a68769e0fef1ca1fff24b23190000000000fdffffff028813000000000000160014c153947d38dccc7238947edb2ecea9a420a9fd1efb12000000000000160014fd02dc9ef3aa06200e215f8a16ff56241ac3077f02002102151478c7a51abb39dc80bc35231ebb6e4d681f68a955c7c2a37ea0aa4415fe6934000000",
         );
-        let start_params = sign_tx_start_params(&txn, 1);
+        let start_params = sign_tx_start_params(&txn, 1, false);
         let start_request = Request {
             id: Cow::Borrowed("tx"),
             method: Cow::Borrowed("sign_tx"),
@@ -4833,6 +4986,58 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(
+                    "304402206bebf8a137c9447e60ea079497ffc2e5d6fdd267e70a5742d1f4beb91a47ee7b02204fc4779b1293b53e5c32903943b6b12f9f3c46d8df559097aefb95be04a0836001"
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn sign_tx_staged_flow_returns_empty_commitment_then_signature() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let txn = decode_hex_vec(
+            "02000000000101962675e3082c9df574155ea8a005a4d2888e8f6a68769e0fef1ca1fff24b23190000000000fdffffff028813000000000000160014c153947d38dccc7238947edb2ecea9a420a9fd1efb12000000000000160014fd02dc9ef3aa06200e215f8a16ff56241ac3077f02002102151478c7a51abb39dc80bc35231ebb6e4d681f68a955c7c2a37ea0aa4415fe6934000000",
+        );
+        let start_params = sign_tx_start_params(&txn, 1, true);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let input_params = sign_tx_input_params(
+            true,
+            &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 2],
+            &decode_hex_vec("76a914faaba4d82b92371198437bc6fc7f995834fdf25a88ac"),
+            Some(10_000),
+        );
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult { result: Vec::new() }
+        );
+
+        let signature_params = get_signature_params();
+        let signature_request = Request {
+            id: Cow::Borrowed("sig"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&signature_request),
             V1Outcome::BytesResult {
                 result: decode_hex_vec(
                     "304402206bebf8a137c9447e60ea079497ffc2e5d6fdd267e70a5742d1f4beb91a47ee7b02204fc4779b1293b53e5c32903943b6b12f9f3c46d8df559097aefb95be04a0836001"
