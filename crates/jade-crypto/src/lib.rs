@@ -509,6 +509,7 @@ pub mod pure_rust {
     use aes::{Aes256, Block};
     use alloc::string::String;
     use alloc::vec::Vec;
+    use bech32::{ByteIterExt, Fe32IterExt};
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
     use k256::ecdsa::SigningKey as K256SigningKey;
@@ -527,6 +528,23 @@ pub mod pure_rust {
 
     type HmacSha256 = Hmac<Sha256>;
     type HmacSha512 = Hmac<Sha512>;
+
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    enum Blech32 {}
+
+    impl bech32::Checksum for Blech32 {
+        type MidstateRepr = u64;
+        const CHECKSUM_LENGTH: usize = 12;
+        const GENERATOR_SH: [u64; 5] = [
+            0x7d52fba40bd886,
+            0x5e8dbf1a03950c,
+            0x1c3a3c74072a18,
+            0x385d72fa0e5139,
+            0x7093e5a608865b,
+        ];
+        const TARGET_RESIDUE: u64 = 1;
+        const CODE_LENGTH: usize = 1024;
+    }
 
     pub fn sign_bitcoin_message_from_seed(
         seed: &[u8],
@@ -677,6 +695,34 @@ pub mod pure_rust {
         )
     }
 
+    pub fn liquid_confidential_multisig_address_from_xpubs(
+        xpubs: &[[u8; 78]],
+        paths: &[Vec<u32>],
+        network: LiquidNetwork,
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+        master_unblinding_key: &[u8; SHA512_LEN],
+    ) -> Option<String> {
+        if xpubs.len() != paths.len() {
+            return None;
+        }
+
+        let mut pubkeys = Vec::with_capacity(xpubs.len());
+        for (xpub, path) in xpubs.iter().zip(paths.iter()) {
+            pubkeys.push(public_key_from_serialized_xpub_path(xpub, path)?);
+        }
+
+        liquid_confidential_multisig_address_from_pubkeys(
+            &pubkeys,
+            network,
+            variant,
+            sorted,
+            threshold,
+            master_unblinding_key,
+        )
+    }
+
     pub fn liquid_unconfidential_multisig_address_from_pubkeys(
         pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
         network: LiquidNetwork,
@@ -701,6 +747,56 @@ pub mod pure_rust {
                 witness_program[2..].copy_from_slice(witness_script_hash.as_ref());
                 let script_hash = hash160(&witness_program);
                 liquid_p2sh_address(network, &script_hash)
+            }
+        }
+    }
+
+    pub fn liquid_confidential_multisig_address_from_pubkeys(
+        pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
+        network: LiquidNetwork,
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+        master_unblinding_key: &[u8; SHA512_LEN],
+    ) -> Option<String> {
+        let multisig_script = multisig_script(pubkeys, sorted, threshold)?;
+        match variant {
+            MultisigScriptVariant::P2wsh => {
+                let script_hash = Sha256::digest(&multisig_script);
+                let script_pubkey = witness_v0_script_pubkey(script_hash.as_ref());
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_segwit_address(
+                    network,
+                    script_hash.as_ref(),
+                    &blinding_public_key,
+                )
+            }
+            MultisigScriptVariant::P2sh => {
+                let script_hash = hash160(&multisig_script);
+                let script_pubkey = p2sh_script_pubkey(&script_hash);
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_base58_address(
+                    liquid_blinded_prefix(network),
+                    liquid_p2sh_prefix(network),
+                    &script_hash,
+                    &blinding_public_key,
+                )
+            }
+            MultisigScriptVariant::P2wshP2sh => {
+                let witness_script_hash = Sha256::digest(&multisig_script);
+                let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
+                let script_hash = hash160(&witness_program);
+                let script_pubkey = p2sh_script_pubkey(&script_hash);
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_base58_address(
+                    liquid_blinded_prefix(network),
+                    liquid_p2sh_prefix(network),
+                    &script_hash,
+                    &blinding_public_key,
+                )
             }
         }
     }
@@ -993,6 +1089,52 @@ pub mod pure_rust {
         }
     }
 
+    pub fn liquid_confidential_singlesig_address_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        network: LiquidNetwork,
+        variant: SinglesigScriptVariant,
+        master_unblinding_key: &[u8; SHA512_LEN],
+    ) -> Option<String> {
+        let public_key = public_key_from_seed_path(seed, path)?;
+        let pubkey_hash = hash160(&public_key);
+        match variant {
+            SinglesigScriptVariant::Pkh => {
+                let script_pubkey = p2pkh_script_pubkey(&pubkey_hash);
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_base58_address(
+                    liquid_blinded_prefix(network),
+                    liquid_p2pkh_prefix(network),
+                    &pubkey_hash,
+                    &blinding_public_key,
+                )
+            }
+            SinglesigScriptVariant::Wpkh => {
+                let script_pubkey = witness_v0_script_pubkey(&pubkey_hash);
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_segwit_address(network, &pubkey_hash, &blinding_public_key)
+            }
+            SinglesigScriptVariant::ShWpkh => {
+                let mut redeem_script = [0u8; 22];
+                redeem_script[1] = 0x14;
+                redeem_script[2..].copy_from_slice(&pubkey_hash);
+                let script_hash = hash160(&redeem_script);
+                let script_pubkey = p2sh_script_pubkey(&script_hash);
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_base58_address(
+                    liquid_blinded_prefix(network),
+                    liquid_p2sh_prefix(network),
+                    &script_hash,
+                    &blinding_public_key,
+                )
+            }
+            SinglesigScriptVariant::Tr => None,
+        }
+    }
+
     pub fn slip77_blinding_private_key(
         master_unblinding_key: &[u8; 64],
         script: &[u8],
@@ -1097,13 +1239,100 @@ pub mod pure_rust {
 
     fn liquid_p2sh_address(network: LiquidNetwork, script_hash: &[u8; 20]) -> Option<String> {
         let mut payload = Vec::with_capacity(21);
-        payload.push(match network {
+        payload.push(liquid_p2sh_prefix(network));
+        payload.extend_from_slice(script_hash);
+        Some(base58ck::encode_check(&payload))
+    }
+
+    fn liquid_confidential_base58_address(
+        confidential_prefix: u8,
+        unconfidential_prefix: u8,
+        hash: &[u8; 20],
+        blinding_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<String> {
+        let mut payload = Vec::with_capacity(55);
+        payload.push(confidential_prefix);
+        payload.push(unconfidential_prefix);
+        payload.extend_from_slice(blinding_public_key);
+        payload.extend_from_slice(hash);
+        Some(base58ck::encode_check(&payload))
+    }
+
+    fn liquid_confidential_segwit_address(
+        network: LiquidNetwork,
+        witness_program: &[u8],
+        blinding_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<String> {
+        let hrp = liquid_blech32_hrp(network);
+        let byte_iter = blinding_public_key
+            .iter()
+            .copied()
+            .chain(witness_program.iter().copied());
+        let chars = byte_iter
+            .bytes_to_fes()
+            .with_checksum::<Blech32>(&hrp)
+            .with_witness_version(bech32::Fe32::Q)
+            .chars();
+
+        let mut output = String::new();
+        output.extend(chars);
+        Some(output)
+    }
+
+    fn blinding_public_key_for_script(
+        master_unblinding_key: &[u8; SHA512_LEN],
+        script_pubkey: &[u8],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let private_key = slip77_blinding_private_key(master_unblinding_key, script_pubkey)?;
+        public_key_from_private_key(&private_key)
+    }
+
+    fn p2pkh_script_pubkey(hash: &[u8; 20]) -> Vec<u8> {
+        let mut script = Vec::with_capacity(25);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(hash);
+        script.extend_from_slice(&[0x88, 0xac]);
+        script
+    }
+
+    fn p2sh_script_pubkey(hash: &[u8; 20]) -> Vec<u8> {
+        let mut script = Vec::with_capacity(23);
+        script.extend_from_slice(&[0xa9, 0x14]);
+        script.extend_from_slice(hash);
+        script.push(0x87);
+        script
+    }
+
+    fn witness_v0_script_pubkey(program: &[u8]) -> Vec<u8> {
+        let mut script = Vec::with_capacity(2 + program.len());
+        script.push(0x00);
+        script.push(program.len() as u8);
+        script.extend_from_slice(program);
+        script
+    }
+
+    fn liquid_p2pkh_prefix(network: LiquidNetwork) -> u8 {
+        match network {
+            LiquidNetwork::Main => 57,
+            LiquidNetwork::Test => 36,
+            LiquidNetwork::Regtest => 235,
+        }
+    }
+
+    fn liquid_p2sh_prefix(network: LiquidNetwork) -> u8 {
+        match network {
             LiquidNetwork::Main => 39,
             LiquidNetwork::Test => 19,
             LiquidNetwork::Regtest => 75,
-        });
-        payload.extend_from_slice(script_hash);
-        Some(base58ck::encode_check(&payload))
+        }
+    }
+
+    fn liquid_blinded_prefix(network: LiquidNetwork) -> u8 {
+        match network {
+            LiquidNetwork::Main => 12,
+            LiquidNetwork::Test => 23,
+            LiquidNetwork::Regtest => 4,
+        }
     }
 
     fn multisig_script(
@@ -1177,6 +1406,14 @@ pub mod pure_rust {
             LiquidNetwork::Main => bech32::Hrp::parse_unchecked("ex"),
             LiquidNetwork::Test => bech32::Hrp::parse_unchecked("tex"),
             LiquidNetwork::Regtest => bech32::Hrp::parse_unchecked("ert"),
+        }
+    }
+
+    fn liquid_blech32_hrp(network: LiquidNetwork) -> bech32::Hrp {
+        match network {
+            LiquidNetwork::Main => bech32::Hrp::parse_unchecked("lq"),
+            LiquidNetwork::Test => bech32::Hrp::parse_unchecked("tlq"),
+            LiquidNetwork::Regtest => bech32::Hrp::parse_unchecked("el"),
         }
     }
 
@@ -1608,6 +1845,80 @@ mod tests {
             )
             .unwrap(),
             "2dafKNiCKbRum9S1u5BYqTByZT5R9zSqcWy"
+        );
+    }
+
+    #[test]
+    fn liquid_confidential_singlesig_addresses_match_jade_vectors() {
+        let seed =
+            decode_hex_32("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c");
+        let master_unblinding_key = slip77_master_unblinding_key_from_seed(&seed).unwrap();
+
+        for (variant, index, expected) in [
+            (
+                SinglesigScriptVariant::ShWpkh,
+                1,
+                "AzpnFQq17AnWm4gvL2oHLRucFawmq8VWFyaxfPX3EgrihEdwDXWmb1QmA7QrRu5RCy3wDtSe8h9WxKbQ",
+            ),
+            (
+                SinglesigScriptVariant::Wpkh,
+                2,
+                "el1qqwud2rtjxwgfxc9wrey504mtjqujrmzsc442zway65gkuj2f0mm4xfv8h3sqfz223jxjrj307zyqln2dywxmsvpvs9x2tvufj",
+            ),
+            (
+                SinglesigScriptVariant::Pkh,
+                3,
+                "CTEuAWMSL94hM2PbTzoe8TGLjyVkkSgdPFas7eUMouiGk5Q2SfzadGnGduPwvoVK1ZpthykJup8A8Eh2",
+            ),
+            (
+                SinglesigScriptVariant::Pkh,
+                9,
+                "CTEjtdpkvj7mrGtgMTrmDfSnH9DdN9Rzi2tzsxsFNujSU8qhYzNnQaWx24j5hX8iWcaZgTZJ6Y3sedLi",
+            ),
+        ] {
+            let path = [0x8000_0000, 0x8000_0000, 0x8000_0000 | index];
+            assert_eq!(
+                pure_rust::liquid_confidential_singlesig_address_from_seed(
+                    &seed,
+                    &path,
+                    LiquidNetwork::Regtest,
+                    variant,
+                    &master_unblinding_key,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn liquid_confidential_multisig_address_matches_jade_fixture() {
+        let mut master_unblinding_key = [0u8; SHA512_LEN];
+        master_unblinding_key[32..].copy_from_slice(&decode_hex_32(
+            "afacc503637e85da661ca1706c4ea147f1407868c48d8f92dd339ac272293cdc",
+        ));
+        let xpubs = [
+            decode_xpub(
+                "tpubECMbgHMZm4QymESFZ9tr4ADVDyePJChBrHH6s1Vp728PdQcPbGNoG6HjPx9pH3SzmtmJuiBPhmVBhYgJF6t9tz1SADXpvqeexwWCq79KoRa",
+            ),
+            decode_xpub(
+                "tpubDDExQpZg2tziZ7ACSBCYsY3rYxAZtTRBgWwioRLYqgNBguH6rMHN1D8epTxUQUB5kM5nxkEtr2SNic6PJLPubcGMR6S2fmDZTzL9dHpU7ka",
+            ),
+        ];
+        let paths = alloc::vec![alloc::vec![1], alloc::vec![1]];
+
+        assert_eq!(
+            pure_rust::liquid_confidential_multisig_address_from_xpubs(
+                &xpubs,
+                &paths,
+                LiquidNetwork::Test,
+                MultisigScriptVariant::P2wshP2sh,
+                false,
+                2,
+                &master_unblinding_key,
+            )
+            .unwrap(),
+            "vjTyeX1qFEukxp2Yi3T9ohfyLxxSKfn2NnRNHuniCqpQhkTv53HkUi9i4hunmxbm1WFy1QVogAeXkQ6A"
         );
     }
 

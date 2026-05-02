@@ -37,7 +37,11 @@ pub struct Emulator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultisigAddressNetwork {
     Bitcoin(jade_crypto::BitcoinNetwork),
-    Liquid(jade_crypto::LiquidNetwork),
+    LiquidUnconfidential(jade_crypto::LiquidNetwork),
+    LiquidConfidential {
+        network: jade_crypto::LiquidNetwork,
+        master_unblinding_key: [u8; jade_crypto::SHA512_LEN],
+    },
 }
 
 impl Default for Emulator {
@@ -1016,19 +1020,28 @@ impl Emulator {
 
         if params.contains("multisig_name").unwrap_or(false) {
             if is_liquid {
-                if confidential {
-                    return V1Outcome::DeferredToCore {
-                        method: "get_receive_address".to_string(),
-                    };
-                }
                 let Some(network) = liquid_network_for_name(network_name) else {
                     return V1Outcome::DeferredToCore {
                         method: "get_receive_address".to_string(),
                     };
                 };
+                if confidential {
+                    let master_unblinding_key = match self.master_unblinding_key_for_params(params)
+                    {
+                        Ok(master_unblinding_key) => master_unblinding_key,
+                        Err(outcome) => return outcome,
+                    };
+                    return self.receive_multisig_address_result(
+                        params,
+                        MultisigAddressNetwork::LiquidConfidential {
+                            network,
+                            master_unblinding_key,
+                        },
+                    );
+                }
                 return self.receive_multisig_address_result(
                     params,
-                    MultisigAddressNetwork::Liquid(network),
+                    MultisigAddressNetwork::LiquidUnconfidential(network),
                 );
             }
             let Some(network) = bitcoin_network_for_name(network_name) else {
@@ -1065,11 +1078,6 @@ impl Emulator {
         };
 
         let address = if is_liquid {
-            if confidential {
-                return V1Outcome::DeferredToCore {
-                    method: "get_receive_address".to_string(),
-                };
-            }
             let Some(network) = liquid_network_for_name(network_name) else {
                 return V1Outcome::DeferredToCore {
                     method: "get_receive_address".to_string(),
@@ -1080,9 +1088,19 @@ impl Emulator {
                     method: "get_receive_address".to_string(),
                 };
             }
-            jade_crypto::pure_rust::liquid_unconfidential_singlesig_address_from_seed(
-                seed, &path, network, variant,
-            )
+            if confidential {
+                jade_crypto::pure_rust::liquid_confidential_singlesig_address_from_seed(
+                    seed,
+                    &path,
+                    network,
+                    variant,
+                    &self.platform.master_unblinding_key,
+                )
+            } else {
+                jade_crypto::pure_rust::liquid_unconfidential_singlesig_address_from_seed(
+                    seed, &path, network, variant,
+                )
+            }
         } else {
             let Some(network) = bitcoin_network_for_name(network_name) else {
                 return V1Outcome::DeferredToCore {
@@ -1238,7 +1256,7 @@ impl Emulator {
                     details.summary.threshold,
                 )
             }
-            MultisigAddressNetwork::Liquid(network) => {
+            MultisigAddressNetwork::LiquidUnconfidential(network) => {
                 jade_crypto::pure_rust::liquid_unconfidential_multisig_address_from_xpubs(
                     &xpubs,
                     &effective_paths,
@@ -1248,6 +1266,18 @@ impl Emulator {
                     details.summary.threshold,
                 )
             }
+            MultisigAddressNetwork::LiquidConfidential {
+                network,
+                master_unblinding_key,
+            } => jade_crypto::pure_rust::liquid_confidential_multisig_address_from_xpubs(
+                &xpubs,
+                &effective_paths,
+                network,
+                variant,
+                details.summary.sorted,
+                details.summary.threshold,
+                &master_unblinding_key,
+            ),
         };
         let Some(address) = address else {
             return bad_parameters(
@@ -5341,6 +5371,57 @@ mod tests {
     }
 
     #[test]
+    fn get_receive_address_derives_liquid_confidential_singlesig_address() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(
+            decode_hex::<32>("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c")
+                .to_vec(),
+        );
+        let master_unblinding_key = jade_crypto::slip77_master_unblinding_key_from_seed(
+            &decode_hex::<32>("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c"),
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key(master_unblinding_key);
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wpkh(k)")
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(3)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap()
+            .u32(0x8000_0002)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "el1qqwud2rtjxwgfxc9wrey504mtjqujrmzsc442zway65gkuj2f0mm4xfv8h3sqfz223jxjrj307zyqln2dywxmsvpvs9x2tvufj".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn get_receive_address_derives_taproot_bip86_address() {
         let mut emulator = Emulator::new();
         emulator.platform_mut().set_debug_wallet_seed(vec![
@@ -7211,6 +7292,20 @@ mod tests {
             1,
         )
         .unwrap();
+        let mut record_master_unblinding_key = [0u8; jade_crypto::SHA512_LEN];
+        record_master_unblinding_key[32..]
+            .copy_from_slice(&[0x33; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        let expected_confidential =
+            jade_crypto::pure_rust::liquid_confidential_multisig_address_from_xpubs(
+                &[xpub_bytes],
+                &[vec![0]],
+                jade_crypto::LiquidNetwork::Regtest,
+                jade_crypto::MultisigScriptVariant::P2wsh,
+                true,
+                1,
+                &record_master_unblinding_key,
+            )
+            .unwrap();
 
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
@@ -7308,6 +7403,38 @@ mod tests {
         assert_eq!(
             emulator.handle_v1_request(&request),
             V1Outcome::TextResult { result: expected }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("liquid-r")
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: expected_confidential
+            }
         );
     }
 

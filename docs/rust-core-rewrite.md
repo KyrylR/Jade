@@ -40,7 +40,8 @@ the continuation methods used by multi-message flows.
 | Immediate | `ping` | must-parity |
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
-| Liquid | `sign_liquid_tx`, `get_commitments`, `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | deferred until audited pure-Rust Liquid milestone |
+| Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | deferred until audited pure-Rust Liquid transaction milestone |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -52,12 +53,59 @@ the continuation methods used by multi-message flows.
 - Freeze BIP85 RSA against golden behavior before swapping implementations.
 - Do not introduce C-linked core dependencies. Temporary C/ESP-IDF use belongs
   only in platform shims.
+- Liquid address encoding uses a minimal pure-Rust Blech32/address encoder in
+  `jade-crypto`, adapted from the local rust-elements implementation under
+  `/Users/inter/Desktop/Simpl/rust-elements`. The C++ Elements tree at
+  `/Users/inter/Desktop/Simpl/elements` was checked for Blech32 constants and
+  network HRPs, but it is not copied into the Rust core. The full `elements`
+  crate remains a later decision because its transaction stack brings
+  `secp256k1-zkp` concerns that must be audited separately for the no-C-core
+  rule.
+
+## Elements Copy/Paste Evaluation
+
+The C++ Elements tree is useful as an oracle, not as a source to paste into the
+Rust core. Its Blech32 code is small and isolated, so the Rust rewrite only
+ports the constants/checksum shape needed for address parity and validates it
+against Jade vectors. The rest of full Liquid parity is spread across C++ wallet,
+script, primitive transaction, confidential asset/value, rangeproof, sighash,
+and validation code. Copying that into this project would move a large C++/Core
+architecture into `jade-core`, violate the no-C-application/core target, and
+make bounded-allocation/no-panic review harder.
+
+Liquid transaction completion should therefore use the Elements implementation
+as a differential reference and pull behavior across as small Rust modules:
+PSET/transaction parsing, issuance/reissuance commitments, confidential
+value/asset handling, rangeproof/surjection-proof boundaries, Elements sighash,
+anti-exfil signing, and golden vector compatibility. Any temporary dependency
+on `secp256k1-zkp` belongs behind the cryptographic backend traits until there
+is a reviewed pure-Rust replacement or an explicit release exception.
+
+## Implemented Rust Parity
+
+- v1 management and debug basics: `ping`, `get_version_info`, entropy/epoch,
+  logout, OTA metadata flow, pinserver update/reset, and debug seed/mnemonic
+  injection.
+- Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
+  BIP85 RSA validation boundary, P-256 identity pubkey/sign/ECDH, OTP storage,
+  and legacy message signing.
+- Wallet registration and enumeration: current/legacy multisig records,
+  multisig setup-file import/export, descriptor registration for Bitcoin
+  networks, and registered wallet listing/details.
+- Receive addresses: Bitcoin singlesig, Bitcoin multisig, Bitcoin descriptors,
+  Liquid singlesig confidential and unconfidential addresses, and Liquid
+  multisig confidential and unconfidential addresses. Liquid Taproot remains
+  deferred because Elements uses a different taproot tweak.
+- Liquid key helpers: master blinding key export, script blinding key, shared
+  nonce, and deterministic blinding factors.
 
 ## First Parity Gates
 
 1. `cargo check --workspace --all-targets` passes.
 2. v1 method catalog matches current dispatch and continuation methods.
-3. `jade-emulator` can route `ping` immediately and defer non-immediate methods.
+3. `jade-emulator` routes immediate/pre-auth/authenticated calls through Rust
+   where parity is implemented and keeps explicit defers for remaining signing
+   and Liquid transaction flows.
 4. Existing Python/libjade tests remain the oracle for subsequent ports.
 
 ## C/C++ Removal Rule
