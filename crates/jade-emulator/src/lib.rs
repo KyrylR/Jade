@@ -19,9 +19,9 @@ use jade_protocol_v1::{
 };
 use jade_storage::{
     key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
-    parse_multisig_summary, JadeStorage, MemoryStorage, MultisigDetails, MultisigSignerDetails,
-    MultisigVariant, RecordAuthenticator, StorageLimits, StorageNamespace, StorageRecord,
-    HMAC_SHA256_LEN,
+    parse_multisig_summary, DescriptorDataValue, DescriptorDetails, JadeStorage, MemoryStorage,
+    MultisigDetails, MultisigSignerDetails, MultisigVariant, RecordAuthenticator, StorageLimits,
+    StorageNamespace, StorageRecord, HMAC_SHA256_LEN,
 };
 use minicbor::{data::Type, Decoder};
 use sha2::{Digest, Sha256};
@@ -681,7 +681,19 @@ impl Emulator {
             return bad_parameters("Confidential addresses only apply to liquid networks");
         }
 
-        if is_liquid || params.contains("descriptor_name").unwrap_or(false) {
+        if params.contains("descriptor_name").unwrap_or(false) {
+            if is_liquid {
+                return bad_parameters("Descriptor wallets not supported on liquid network");
+            }
+            let Some(network) = bitcoin_network_for_name(network_name) else {
+                return V1Outcome::DeferredToCore {
+                    method: "get_receive_address".to_string(),
+                };
+            };
+            return self.receive_descriptor_address_result(params, network);
+        }
+
+        if is_liquid {
             return V1Outcome::DeferredToCore {
                 method: "get_receive_address".to_string(),
             };
@@ -726,6 +738,60 @@ impl Emulator {
         };
 
         V1Outcome::TextResult { result: address }
+    }
+
+    fn receive_descriptor_address_result(
+        &self,
+        params: jade_protocol_v1::Params<'_>,
+        network: jade_crypto::BitcoinNetwork,
+    ) -> V1Outcome {
+        let descriptor_name = match params.str("descriptor_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => return bad_parameters("Invalid descriptor name parameter"),
+        };
+
+        let mut record = Vec::new();
+        if self
+            .storage
+            .get_record(
+                StorageRecord::DescriptorRegistration {
+                    name: descriptor_name,
+                },
+                &mut record,
+            )
+            .is_err()
+        {
+            return bad_parameters("Cannot find named descriptor wallet");
+        }
+        let details = match parse_descriptor_details(&record, &HostRecordAuthenticator) {
+            Ok(details) => details,
+            Err(_) => return bad_parameters("Cannot de-serialise descriptor wallet data"),
+        };
+        if details.descriptor.is_empty()
+            || details.descriptor_type > 2
+            || details.datavalues.len() > jade_storage::MAX_ALLOWED_SIGNERS
+        {
+            return bad_parameters("Descriptor wallet data invalid");
+        }
+
+        let branch = match params.u64("branch") {
+            Ok(Some(branch)) if branch <= u32::MAX as u64 => branch as u32,
+            Ok(None) => 0,
+            Ok(Some(_)) | Err(_) => {
+                return bad_parameters("Failed to extract path elements from parameters");
+            }
+        };
+        let pointer = match params.u64("pointer") {
+            Ok(Some(pointer)) if pointer <= u32::MAX as u64 => pointer as u32,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract path elements from parameters");
+            }
+        };
+
+        match descriptor_receive_address(&details, branch, pointer, network) {
+            Some(address) => V1Outcome::TextResult { result: address },
+            None => bad_parameters("Failed to generate valid descriptor script"),
+        }
     }
 
     fn receive_multisig_address_result(
@@ -1942,6 +2008,19 @@ fn split_once_byte(value: &str, byte: u8) -> Option<(&str, &str)> {
     Some((&value[..index], &value[index + 1..]))
 }
 
+fn parse_decimal_u64(value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return None;
+    }
+
+    value.bytes().try_fold(0u64, |acc, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        acc.checked_mul(10)?.checked_add((byte - b'0') as u64)
+    })
+}
+
 fn hash32_param(
     params: jade_protocol_v1::Params<'_>,
     field: &str,
@@ -2060,6 +2139,437 @@ fn bitcoin_network_for_name(network: &str) -> Option<jade_crypto::BitcoinNetwork
         "testnet" => Some(jade_crypto::BitcoinNetwork::Test),
         "localtest" => Some(jade_crypto::BitcoinNetwork::Regtest),
         _ => None,
+    }
+}
+
+fn descriptor_receive_address(
+    details: &DescriptorDetails,
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<String> {
+    let inner = descriptor_function_body(&details.descriptor, "wsh")?;
+    let script = descriptor_script(inner, &details.datavalues, branch, pointer, network)?;
+    jade_crypto::pure_rust::bitcoin_wsh_address_from_script(&script, network)
+}
+
+fn descriptor_script(
+    expression: &str,
+    datavalues: &[DescriptorDataValue],
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<Vec<u8>> {
+    let expression = expression.trim();
+    if let Some(inner) = expression.strip_prefix("v:") {
+        let mut script = descriptor_script(inner, datavalues, branch, pointer, network)?;
+        descriptor_script_push_verify(&mut script);
+        return Some(script);
+    }
+    if let Some(inner) = expression.strip_prefix("c:") {
+        let mut script = descriptor_script(inner, datavalues, branch, pointer, network)?;
+        script.push(OP_CHECKSIG);
+        return Some(script);
+    }
+
+    let (name, args) = descriptor_function_call(expression)?;
+    match name {
+        "and_v" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let mut script = descriptor_script(args[0], datavalues, branch, pointer, network)?;
+            script.extend_from_slice(&descriptor_script(
+                args[1], datavalues, branch, pointer, network,
+            )?);
+            Some(script)
+        }
+        "or_d" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let mut script = descriptor_script(args[0], datavalues, branch, pointer, network)?;
+            script.extend_from_slice(&[OP_IFDUP, OP_NOTIF]);
+            script.extend_from_slice(&descriptor_script(
+                args[1], datavalues, branch, pointer, network,
+            )?);
+            script.push(OP_ENDIF);
+            Some(script)
+        }
+        "pk" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let mut script = descriptor_pk_script(args[0], datavalues, branch, pointer, network)?;
+            script.push(OP_CHECKSIG);
+            Some(script)
+        }
+        "pk_k" => {
+            if args.len() != 1 {
+                return None;
+            }
+            descriptor_pk_script(args[0], datavalues, branch, pointer, network)
+        }
+        "pkh" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let mut script = descriptor_pkh_script(args[0], datavalues, branch, pointer, network)?;
+            script.push(OP_CHECKSIG);
+            Some(script)
+        }
+        "pk_h" => {
+            if args.len() != 1 {
+                return None;
+            }
+            descriptor_pkh_script(args[0], datavalues, branch, pointer, network)
+        }
+        "older" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let value = parse_decimal_u64(args[0])?;
+            if value > i32::MAX as u64 {
+                return None;
+            }
+            let mut script = Vec::new();
+            descriptor_script_push_int(&mut script, value as i64)?;
+            script.push(OP_CSV);
+            Some(script)
+        }
+        "multi" | "sortedmulti" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let threshold = parse_decimal_u64(args[0])?;
+            if threshold == 0 || threshold > 16 || threshold as usize >= args.len() {
+                return None;
+            }
+
+            let mut pubkeys = Vec::with_capacity(args.len() - 1);
+            for key_expression in &args[1..] {
+                pubkeys.push(descriptor_public_key(
+                    key_expression,
+                    datavalues,
+                    branch,
+                    pointer,
+                    network,
+                )?);
+            }
+            if name == "sortedmulti" {
+                pubkeys.sort();
+            }
+            let mut script = Vec::new();
+            descriptor_script_push_int(&mut script, threshold as i64)?;
+            for pubkey in &pubkeys {
+                descriptor_script_push_slice(&mut script, pubkey)?;
+            }
+            descriptor_script_push_int(&mut script, pubkeys.len() as i64)?;
+            script.push(OP_CHECKMULTISIG);
+            Some(script)
+        }
+        _ => None,
+    }
+}
+
+const OP_0: u8 = 0x00;
+const OP_PUSHDATA1: u8 = 0x4c;
+const OP_1: u8 = 0x51;
+const OP_DUP: u8 = 0x76;
+const OP_IFDUP: u8 = 0x73;
+const OP_NOTIF: u8 = 0x64;
+const OP_ENDIF: u8 = 0x68;
+const OP_VERIFY: u8 = 0x69;
+const OP_HASH160: u8 = 0xa9;
+const OP_EQUAL: u8 = 0x87;
+const OP_EQUALVERIFY: u8 = 0x88;
+const OP_CHECKSIG: u8 = 0xac;
+const OP_CHECKSIGVERIFY: u8 = 0xad;
+const OP_CHECKMULTISIG: u8 = 0xae;
+const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+const OP_CSV: u8 = 0xb2;
+
+fn descriptor_function_body<'a>(expression: &'a str, expected_name: &str) -> Option<&'a str> {
+    let (name, args) = descriptor_function_call(expression)?;
+    if name == expected_name && args.len() == 1 {
+        Some(args[0])
+    } else {
+        None
+    }
+}
+
+fn descriptor_function_call(expression: &str) -> Option<(&str, Vec<&str>)> {
+    let expression = expression.trim();
+    let open = expression.find('(')?;
+    if !expression.ends_with(')') {
+        return None;
+    }
+    let name = expression[..open].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, byte) in expression.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth = depth.checked_add(1)?,
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if close? != expression.len() - 1 {
+        return None;
+    }
+
+    Some((
+        name,
+        descriptor_split_args(&expression[open + 1..expression.len() - 1])?,
+    ))
+}
+
+fn descriptor_split_args(args: &str) -> Option<Vec<&str>> {
+    if args.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut output = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, ch) in args.char_indices() {
+        match ch {
+            '(' => paren_depth = paren_depth.checked_add(1)?,
+            ')' => paren_depth = paren_depth.checked_sub(1)?,
+            '<' => angle_depth = angle_depth.checked_add(1)?,
+            '>' => angle_depth = angle_depth.checked_sub(1)?,
+            '[' => bracket_depth = bracket_depth.checked_add(1)?,
+            ']' => bracket_depth = bracket_depth.checked_sub(1)?,
+            ',' if paren_depth == 0 && angle_depth == 0 && bracket_depth == 0 => {
+                output.push(args[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if paren_depth != 0 || angle_depth != 0 || bracket_depth != 0 {
+        return None;
+    }
+    output.push(args[start..].trim());
+    if output.iter().any(|arg| arg.is_empty()) {
+        return None;
+    }
+    Some(output)
+}
+
+fn descriptor_pk_script(
+    key_expression: &str,
+    datavalues: &[DescriptorDataValue],
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<Vec<u8>> {
+    let pubkey = descriptor_public_key(key_expression, datavalues, branch, pointer, network)?;
+    let mut script = Vec::new();
+    descriptor_script_push_slice(&mut script, &pubkey)?;
+    Some(script)
+}
+
+fn descriptor_pkh_script(
+    key_expression: &str,
+    datavalues: &[DescriptorDataValue],
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<Vec<u8>> {
+    let pubkey = descriptor_public_key(key_expression, datavalues, branch, pointer, network)?;
+    let pubkey_hash = jade_crypto::pure_rust::hash160_digest(&pubkey);
+    let mut script = Vec::new();
+    script.extend_from_slice(&[OP_DUP, OP_HASH160]);
+    descriptor_script_push_slice(&mut script, &pubkey_hash)?;
+    script.push(OP_EQUALVERIFY);
+    Some(script)
+}
+
+fn descriptor_public_key(
+    key_expression: &str,
+    datavalues: &[DescriptorDataValue],
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<[u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+    let key_expression = key_expression.trim();
+    if let Some(pubkey) = descriptor_raw_public_key(key_expression) {
+        return Some(pubkey);
+    }
+
+    let (key_name, suffix) = split_descriptor_key_suffix(key_expression);
+    let value = datavalues
+        .iter()
+        .find(|item| item.key == key_name)
+        .map(|item| item.value.as_str())?;
+    let xpub = descriptor_xpub(value, network)?;
+    let path = descriptor_key_suffix_path(suffix, branch, pointer)?;
+    jade_crypto::pure_rust::public_key_from_serialized_xpub_path(&xpub, &path)
+}
+
+fn split_descriptor_key_suffix(key_expression: &str) -> (&str, &str) {
+    match key_expression.find('/') {
+        Some(index) => (&key_expression[..index], &key_expression[index..]),
+        None => (key_expression, ""),
+    }
+}
+
+fn descriptor_xpub(
+    value: &str,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<[u8; jade_storage::BIP32_SERIALIZED_LEN]> {
+    let value = value.trim();
+    let value = if let Some(rest) = value.strip_prefix('[') {
+        let (_, xpub) = split_once_byte(rest, b']')?;
+        xpub
+    } else {
+        value
+    };
+    let xpub_end = value.find('/').unwrap_or(value.len());
+    let xpub = &value[..xpub_end];
+    let bytes = base58ck::decode_check(xpub).ok()?;
+    let bytes: [u8; jade_storage::BIP32_SERIALIZED_LEN] = bytes.try_into().ok()?;
+    let prefix = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+    let expected_prefix = match network {
+        jade_crypto::BitcoinNetwork::Main => 0x0488_b21e,
+        jade_crypto::BitcoinNetwork::Test | jade_crypto::BitcoinNetwork::Regtest => 0x0435_87cf,
+    };
+    if prefix == expected_prefix {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+fn descriptor_key_suffix_path(suffix: &str, branch: u32, pointer: u32) -> Option<Vec<u32>> {
+    let mut path = Vec::new();
+    let mut rest = suffix;
+    let mut saw_multipath = false;
+    while !rest.is_empty() {
+        rest = rest.strip_prefix('/')?;
+        if let Some(after_open) = rest.strip_prefix('<') {
+            let (choices, after_choices) = split_once_byte(after_open, b'>')?;
+            let choices: Vec<&str> = choices.split(';').collect();
+            let choice = choices.get(branch as usize)?;
+            path.push(parse_descriptor_path_index(choice)?);
+            saw_multipath = true;
+            rest = after_choices;
+            continue;
+        }
+        if let Some(after_wildcard) = rest.strip_prefix('*') {
+            path.push(pointer);
+            rest = after_wildcard;
+            continue;
+        }
+
+        let segment_end = rest.find('/').unwrap_or(rest.len());
+        path.push(parse_descriptor_path_index(&rest[..segment_end])?);
+        rest = &rest[segment_end..];
+    }
+    if !saw_multipath && branch != 0 {
+        return None;
+    }
+    Some(path)
+}
+
+fn parse_descriptor_path_index(value: &str) -> Option<u32> {
+    if value.is_empty() || value.ends_with('\'') || value.ends_with('h') {
+        return None;
+    }
+    let value = parse_decimal_u64(value)?;
+    if value <= 0x7fff_ffff {
+        Some(value as u32)
+    } else {
+        None
+    }
+}
+
+fn descriptor_raw_public_key(
+    key_expression: &str,
+) -> Option<[u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+    if key_expression.len() != jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN * 2 {
+        return None;
+    }
+    let mut pubkey = [0u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN];
+    for (index, item) in pubkey.iter_mut().enumerate() {
+        let high = hex_nibble_value(key_expression.as_bytes()[index * 2])?;
+        let low = hex_nibble_value(key_expression.as_bytes()[index * 2 + 1])?;
+        *item = (high << 4) | low;
+    }
+    if valid_compressed_secp256k1_pubkey(&pubkey) {
+        Some(pubkey)
+    } else {
+        None
+    }
+}
+
+fn hex_nibble_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn descriptor_script_push_slice(script: &mut Vec<u8>, data: &[u8]) -> Option<()> {
+    match data.len() {
+        0..=75 => script.push(data.len() as u8),
+        76..=255 => {
+            script.push(OP_PUSHDATA1);
+            script.push(data.len() as u8);
+        }
+        _ => return None,
+    }
+    script.extend_from_slice(data);
+    Some(())
+}
+
+fn descriptor_script_push_int(script: &mut Vec<u8>, value: i64) -> Option<()> {
+    match value {
+        0 => {
+            script.push(OP_0);
+            Some(())
+        }
+        1..=16 => {
+            script.push(OP_1 + value as u8 - 1);
+            Some(())
+        }
+        17..=i64::MAX => {
+            let mut encoded = Vec::new();
+            let mut remaining = value as u64;
+            while remaining > 0 {
+                encoded.push((remaining & 0xff) as u8);
+                remaining >>= 8;
+            }
+            if encoded.last().copied().unwrap_or(0) & 0x80 != 0 {
+                encoded.push(0);
+            }
+            descriptor_script_push_slice(script, &encoded)
+        }
+        _ => None,
+    }
+}
+
+fn descriptor_script_push_verify(script: &mut Vec<u8>) {
+    match script.last_mut() {
+        Some(last) if *last == OP_EQUAL => *last = OP_EQUALVERIFY,
+        Some(last) if *last == OP_CHECKSIG => *last = OP_CHECKSIGVERIFY,
+        Some(last) if *last == OP_CHECKMULTISIG => *last = OP_CHECKMULTISIGVERIFY,
+        _ => script.push(OP_VERIFY),
     }
 }
 
@@ -2522,6 +3032,25 @@ mod tests {
 
     fn authenticated_record(mut payload: Vec<u8>) -> Vec<u8> {
         payload.extend_from_slice(&[0xa5; HMAC_SHA256_LEN]);
+        payload
+    }
+
+    fn descriptor_registration_payload(
+        descriptor_type: u8,
+        descriptor: &str,
+        datavalues: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, descriptor_type]);
+        payload.extend_from_slice(&(descriptor.len() as u16).to_le_bytes());
+        payload.extend_from_slice(descriptor.as_bytes());
+        payload.push(datavalues.len() as u8);
+        for (key, value) in datavalues {
+            payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            payload.extend_from_slice(key.as_bytes());
+            payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            payload.extend_from_slice(value.as_bytes());
+        }
         payload
     }
 
@@ -3824,6 +4353,239 @@ mod tests {
             V1Outcome::TextResult {
                 result: "bc1qyjkdrj9rr6uzt46fgr7j7kelx92n0lu99ex2zsxlmlvcsaf3yy3qaxune3"
                     .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_receive_address_derives_registered_descriptor_address() {
+        let mut emulator = Emulator::new();
+        let descriptor =
+            "wsh(or_d(multi(2,@0/<0;1>/*,@1/<0;1>/*),and_v(v:pkh(@2/<0;1>/*),older(100))))";
+        let datavalues = [
+            (
+                "@0",
+                "[7897b5b3/48'/1'/0'/2']\
+                 tpubDE8B47dY4JuGLnXVyDzG76UuhBM5hTjc6sXeJjG6ThbPsryiAnKqQY8CmxWcYjM6eVvkyH7CNTVrmPMxSWP9ZzCfHVHo6preHp6Xhgd42JH",
+            ),
+            (
+                "@1",
+                "[1bf12fe0/48'/1'/0'/2']\
+                 tpubDEHXLZfMAAM5duEnX6SSnZjGYbrxqXvRJmMxw8MFwr3gu4LC4DSxR9KVEfVDVcZxre4XL5tGcwVRrHwQ9euTMnSq6P6BqREemaqrFsC96Fy",
+            ),
+            (
+                "@2",
+                "[7897b5b3/48'/1'/1'/2']\
+                 tpubDFf2ES1oUSZRgiCFT4mvBQ4jC2xTfRzVwfa6KewXZthgtL83UquqirWXzo1EKi4et3bx2wQz9QFKLDeu6vXoKpgQnJHyV8DomjCjJRT3d57",
+            ),
+        ];
+        emulator
+            .storage_mut()
+            .set_descriptor_registration(
+                "liana-a",
+                &authenticated_record(descriptor_registration_payload(2, descriptor, &datavalues)),
+            )
+            .unwrap();
+
+        let expected = [
+            [
+                "tb1q0ddn2fn5y66gt2r69dv6el32lw44lupa2ry9enlm8zduxhpwk6aqen88zh",
+                "tb1qfj66kfjk98cfcays67c9rvkzals7tnxz2dkxnwrjslwk5tzcd8ysgx9ahf",
+            ],
+            [
+                "tb1qu6j64q9kezc0dxgfl67fgnm2z9yycc55c0fa09uresf65w6py04s4qwgul",
+                "tb1qkmr7qpxagfn7mafmsrt6e3qzzc599w28cl037cktjjegenfnhyysllxj5p",
+            ],
+        ];
+        for (branch, branch_expected) in expected.iter().enumerate() {
+            for (pointer, expected_address) in branch_expected.iter().enumerate() {
+                let mut params = Vec::new();
+                minicbor::Encoder::new(&mut params)
+                    .map(4)
+                    .unwrap()
+                    .str("network")
+                    .unwrap()
+                    .str("testnet")
+                    .unwrap()
+                    .str("descriptor_name")
+                    .unwrap()
+                    .str("liana-a")
+                    .unwrap()
+                    .str("branch")
+                    .unwrap()
+                    .u64(branch as u64)
+                    .unwrap()
+                    .str("pointer")
+                    .unwrap()
+                    .u64(pointer as u64)
+                    .unwrap();
+                let request = Request {
+                    id: Cow::Borrowed("a"),
+                    method: Cow::Borrowed("get_receive_address"),
+                    params: Some(&params),
+                };
+
+                assert_eq!(
+                    emulator.handle_v1_request(&request),
+                    V1Outcome::TextResult {
+                        result: (*expected_address).to_string()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_receive_address_rejects_invalid_registered_descriptor_inputs() {
+        let mut emulator = Emulator::new();
+        let descriptor = "wsh(@0/<0;1>/*)";
+        let datavalues = [(
+            "@0",
+            "[7897b5b3/48'/1'/0'/2']\
+             tpubDE8B47dY4JuGLnXVyDzG76UuhBM5hTjc6sXeJjG6ThbPsryiAnKqQY8CmxWcYjM6eVvkyH7CNTVrmPMxSWP9ZzCfHVHo6preHp6Xhgd42JH",
+        )];
+        emulator
+            .storage_mut()
+            .set_descriptor_registration(
+                "desc-a",
+                &authenticated_record(descriptor_registration_payload(2, descriptor, &datavalues)),
+            )
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("bad name")
+            .unwrap()
+            .str("pointer")
+            .unwrap()
+            .u64(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Invalid descriptor name parameter".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("missing")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Cannot find named descriptor wallet".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract path elements from parameters".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("liquid")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-a")
+            .unwrap()
+            .str("pointer")
+            .unwrap()
+            .u64(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Descriptor wallets not supported on liquid network".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-a")
+            .unwrap()
+            .str("pointer")
+            .unwrap()
+            .u64(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to generate valid descriptor script".to_string()
             }
         );
     }

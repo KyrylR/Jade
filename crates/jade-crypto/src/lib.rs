@@ -648,6 +648,18 @@ pub mod pure_rust {
         }
     }
 
+    pub fn bitcoin_wsh_address_from_script(
+        script: &[u8],
+        network: BitcoinNetwork,
+    ) -> Option<String> {
+        let script_hash = Sha256::digest(script);
+        bech32::segwit::encode_v0(segwit_hrp(network), script_hash.as_ref()).ok()
+    }
+
+    pub fn hash160_digest(bytes: &[u8]) -> [u8; 20] {
+        hash160(bytes)
+    }
+
     pub fn bip85_bip39_entropy_from_seed(
         seed: &[u8],
         nwords: usize,
