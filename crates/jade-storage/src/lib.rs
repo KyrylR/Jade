@@ -10,6 +10,11 @@ pub const NVS_KEY_NAME_MAX_SIZE: usize = 16;
 pub const MAX_KEY_NAME_LEN: usize = NVS_KEY_NAME_MAX_SIZE - 1;
 pub const DEFAULT_PIN_RETRIES: u8 = 3;
 pub const BLE_ENABLED: u8 = 0x01;
+pub const HMAC_SHA256_LEN: usize = 32;
+pub const BIP32_SERIALIZED_LEN: usize = 78;
+pub const MAX_ALLOWED_SIGNERS: usize = 15;
+pub const MAX_PATH_LEN: usize = 16;
+pub const MULTISIG_MASTER_BLINDING_KEY_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StorageNamespace {
@@ -26,6 +31,8 @@ pub enum StorageError {
     InvalidKey,
     ValueTooLarge,
     CapacityExceeded,
+    AuthenticationFailed,
+    InvalidRecord,
     BackendFailure,
 }
 
@@ -36,6 +43,142 @@ pub trait StorageBackend {
     fn set(&mut self, namespace: StorageNamespace, key: &str, value: &[u8]) -> StorageResult<()>;
     fn erase(&mut self, namespace: StorageNamespace, key: &str) -> StorageResult<()>;
     fn list(&self, namespace: StorageNamespace, out: &mut Vec<String>) -> StorageResult<()>;
+}
+
+pub trait RecordAuthenticator {
+    fn verify_record(&self, payload: &[u8], tag: &[u8; HMAC_SHA256_LEN]) -> bool;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorSummary {
+    pub descriptor_type: u8,
+    pub descriptor_len: u16,
+    pub num_datavalues: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultisigSummary {
+    pub variant: MultisigVariant,
+    pub sorted: bool,
+    pub threshold: u8,
+    pub num_signers: u8,
+    pub master_blinding_key: Option<[u8; MULTISIG_MASTER_BLINDING_KEY_SIZE]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MultisigVariant {
+    P2wsh = 4,
+    P2sh = 5,
+    P2wshP2sh = 6,
+}
+
+impl MultisigVariant {
+    pub fn from_storage(value: u8) -> StorageResult<Self> {
+        match value {
+            4 => Ok(Self::P2wsh),
+            5 => Ok(Self::P2sh),
+            6 => Ok(Self::P2wshP2sh),
+            _ => Err(StorageError::InvalidRecord),
+        }
+    }
+
+    pub fn as_v1_str(self) -> &'static str {
+        match self {
+            Self::P2wsh => "wsh(multi(k))",
+            Self::P2sh => "sh(multi(k))",
+            Self::P2wshP2sh => "sh(wsh(multi(k)))",
+        }
+    }
+}
+
+pub fn parse_descriptor_summary(
+    record: &[u8],
+    authenticator: &impl RecordAuthenticator,
+) -> StorageResult<DescriptorSummary> {
+    let payload = authenticated_payload(record, authenticator)?;
+    let mut reader = RecordReader::new(payload);
+
+    let version = reader.u8()?;
+    if version > 0 {
+        return Err(StorageError::InvalidRecord);
+    }
+
+    let descriptor_type = reader.u8()?;
+    let descriptor_len = reader.u16_le()?;
+    reader.skip(descriptor_len as usize)?;
+
+    let num_datavalues = reader.u8()?;
+    if num_datavalues as usize > MAX_ALLOWED_SIGNERS {
+        return Err(StorageError::InvalidRecord);
+    }
+
+    for _ in 0..num_datavalues {
+        let key_len = reader.u16_le()? as usize;
+        reader.skip(key_len)?;
+        let value_len = reader.u16_le()? as usize;
+        reader.skip(value_len)?;
+    }
+    reader.finish()?;
+
+    Ok(DescriptorSummary {
+        descriptor_type,
+        descriptor_len,
+        num_datavalues,
+    })
+}
+
+pub fn parse_multisig_summary(
+    record: &[u8],
+    authenticator: &impl RecordAuthenticator,
+) -> StorageResult<MultisigSummary> {
+    let payload = authenticated_payload(record, authenticator)?;
+    let mut reader = RecordReader::new(payload);
+
+    let version = reader.u8()?;
+    if version > 3 {
+        return Err(StorageError::InvalidRecord);
+    }
+
+    let variant = MultisigVariant::from_storage(reader.u8()?)?;
+    let sorted = if version > 0 {
+        reader.u8()? != 0
+    } else {
+        false
+    };
+    let threshold = reader.u8()?;
+
+    let master_blinding_key = if version > 1 {
+        let key_len = reader.u8()? as usize;
+        match key_len {
+            0 => None,
+            MULTISIG_MASTER_BLINDING_KEY_SIZE => Some(reader.array32()?),
+            _ => return Err(StorageError::InvalidRecord),
+        }
+    } else {
+        None
+    };
+
+    let num_signers = if version < 3 {
+        let remaining_len = reader.remaining().len();
+        let num_signers = parse_legacy_multisig_signer_count(reader.remaining())?;
+        reader.skip(remaining_len)?;
+        num_signers
+    } else {
+        parse_current_multisig_signer_count(&mut reader)?
+    };
+    if threshold == 0 || threshold > num_signers {
+        return Err(StorageError::InvalidRecord);
+    }
+    reader.finish()?;
+
+    Ok(MultisigSummary {
+        variant,
+        sorted,
+        threshold,
+        num_signers,
+        master_blinding_key,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +479,122 @@ impl<B: StorageBackend> JadeStorage<B> {
     }
 }
 
+fn authenticated_payload<'a>(
+    record: &'a [u8],
+    authenticator: &impl RecordAuthenticator,
+) -> StorageResult<&'a [u8]> {
+    if record.len() <= HMAC_SHA256_LEN {
+        return Err(StorageError::InvalidRecord);
+    }
+    let payload_len = record.len() - HMAC_SHA256_LEN;
+    let (payload, tag) = record.split_at(payload_len);
+    let tag: &[u8; HMAC_SHA256_LEN] = tag.try_into().map_err(|_| StorageError::InvalidRecord)?;
+    if authenticator.verify_record(payload, tag) {
+        Ok(payload)
+    } else {
+        Err(StorageError::AuthenticationFailed)
+    }
+}
+
+fn parse_legacy_multisig_signer_count(signer_bytes: &[u8]) -> StorageResult<u8> {
+    let num_signers = signer_bytes.len() / BIP32_SERIALIZED_LEN;
+    if num_signers == 0
+        || num_signers > MAX_ALLOWED_SIGNERS
+        || num_signers * BIP32_SERIALIZED_LEN != signer_bytes.len()
+    {
+        return Err(StorageError::InvalidRecord);
+    }
+    Ok(num_signers as u8)
+}
+
+fn parse_current_multisig_signer_count(reader: &mut RecordReader<'_>) -> StorageResult<u8> {
+    let num_signers = reader.u8()?;
+    if num_signers == 0 || num_signers as usize > MAX_ALLOWED_SIGNERS {
+        return Err(StorageError::InvalidRecord);
+    }
+
+    for _ in 0..num_signers {
+        reader.skip(4)?;
+
+        let derivation_len = reader.u8()? as usize;
+        if derivation_len > MAX_PATH_LEN {
+            return Err(StorageError::InvalidRecord);
+        }
+        reader.skip(derivation_len * core::mem::size_of::<u32>())?;
+
+        reader.skip(BIP32_SERIALIZED_LEN)?;
+
+        let path_len = reader.u8()? as usize;
+        if path_len > MAX_PATH_LEN {
+            return Err(StorageError::InvalidRecord);
+        }
+        reader.skip(path_len * core::mem::size_of::<u32>())?;
+    }
+
+    Ok(num_signers)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> RecordReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.cursor..]
+    }
+
+    fn u8(&mut self) -> StorageResult<u8> {
+        let value = *self
+            .bytes
+            .get(self.cursor)
+            .ok_or(StorageError::InvalidRecord)?;
+        self.cursor += 1;
+        Ok(value)
+    }
+
+    fn u16_le(&mut self) -> StorageResult<u16> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn array32(&mut self) -> StorageResult<[u8; 32]> {
+        self.take(32)?
+            .try_into()
+            .map_err(|_| StorageError::InvalidRecord)
+    }
+
+    fn skip(&mut self, len: usize) -> StorageResult<()> {
+        self.take(len).map(|_| ())
+    }
+
+    fn take(&mut self, len: usize) -> StorageResult<&'a [u8]> {
+        let end = self
+            .cursor
+            .checked_add(len)
+            .ok_or(StorageError::InvalidRecord)?;
+        let bytes = self
+            .bytes
+            .get(self.cursor..end)
+            .ok_or(StorageError::InvalidRecord)?;
+        self.cursor = end;
+        Ok(bytes)
+    }
+
+    fn finish(self) -> StorageResult<()> {
+        if self.cursor == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidRecord)
+        }
+    }
+}
+
 pub fn key_name_valid(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_KEY_NAME_LEN
@@ -454,6 +713,20 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    #[derive(Debug, Clone, Copy)]
+    struct TestAuthenticator;
+
+    impl RecordAuthenticator for TestAuthenticator {
+        fn verify_record(&self, _payload: &[u8], tag: &[u8; HMAC_SHA256_LEN]) -> bool {
+            tag == &[0xa5; HMAC_SHA256_LEN]
+        }
+    }
+
+    fn authenticated_record(mut payload: Vec<u8>) -> Vec<u8> {
+        payload.extend_from_slice(&[0xa5; HMAC_SHA256_LEN]);
+        payload
+    }
+
     #[test]
     fn key_names_follow_jade_nvs_constraints() {
         assert!(key_name_valid("wallet-1"));
@@ -466,6 +739,92 @@ mod tests {
         assert_eq!(
             make_key_name_valid("123456789012345678").unwrap(),
             "123456789012345"
+        );
+    }
+
+    #[test]
+    fn parses_authenticated_descriptor_summary_records() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 2]);
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(b"wsh");
+        payload.push(2);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(b"k");
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(b"value");
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice(b"xpub");
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(b"abc");
+
+        let summary =
+            parse_descriptor_summary(&authenticated_record(payload), &TestAuthenticator).unwrap();
+
+        assert_eq!(
+            summary,
+            DescriptorSummary {
+                descriptor_type: 2,
+                descriptor_len: 3,
+                num_datavalues: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_authenticated_current_multisig_summary_records() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 1, 2]);
+        payload.push(MULTISIG_MASTER_BLINDING_KEY_SIZE as u8);
+        payload.extend_from_slice(&[0x11; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        payload.push(3);
+        for signer in 0..3u8 {
+            payload.extend_from_slice(&[signer; 4]);
+            payload.push(1);
+            payload.extend_from_slice(&(48u32 | 0x8000_0000).to_le_bytes());
+            payload.extend_from_slice(&[0; BIP32_SERIALIZED_LEN]);
+            payload.push(2);
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&(signer as u32).to_le_bytes());
+        }
+
+        let summary =
+            parse_multisig_summary(&authenticated_record(payload), &TestAuthenticator).unwrap();
+
+        assert_eq!(summary.variant.as_v1_str(), "wsh(multi(k))");
+        assert!(summary.sorted);
+        assert_eq!(summary.threshold, 2);
+        assert_eq!(summary.num_signers, 3);
+        assert_eq!(
+            summary.master_blinding_key,
+            Some([0x11; MULTISIG_MASTER_BLINDING_KEY_SIZE])
+        );
+    }
+
+    #[test]
+    fn parses_authenticated_legacy_multisig_summary_records() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[2, MultisigVariant::P2wshP2sh as u8, 0, 1, 0]);
+        payload.extend_from_slice(&[0; BIP32_SERIALIZED_LEN * 2]);
+
+        let summary =
+            parse_multisig_summary(&authenticated_record(payload), &TestAuthenticator).unwrap();
+
+        assert_eq!(summary.variant.as_v1_str(), "sh(wsh(multi(k)))");
+        assert!(!summary.sorted);
+        assert_eq!(summary.threshold, 1);
+        assert_eq!(summary.num_signers, 2);
+        assert_eq!(summary.master_blinding_key, None);
+    }
+
+    #[test]
+    fn rejects_records_without_valid_authentication() {
+        let mut record = vec![0, 2, 0, 0, 0, 0];
+        record.extend_from_slice(&[0; HMAC_SHA256_LEN]);
+
+        assert_eq!(
+            parse_descriptor_summary(&record, &TestAuthenticator),
+            Err(StorageError::AuthenticationFailed)
         );
     }
 
