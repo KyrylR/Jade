@@ -525,6 +525,52 @@ impl<B: StorageBackend> JadeStorage<B> {
         self.erase_record(StorageRecord::OtpData { name })
     }
 
+    pub fn debug_clean_reset(&mut self) -> StorageResult<()> {
+        for record in [
+            StorageRecord::EncryptedBlob,
+            StorageRecord::PinCounter,
+            StorageRecord::NetworkRestriction,
+            StorageRecord::PinserverUrlA,
+            StorageRecord::PinserverUrlB,
+            StorageRecord::PinserverPubkey,
+            StorageRecord::PinserverCertificate,
+            StorageRecord::PinPrivateKey,
+        ] {
+            self.erase_optional_record(record)?;
+        }
+
+        self.erase_namespace(StorageNamespace::Multisig)?;
+        self.erase_namespace(StorageNamespace::Descriptor)?;
+        self.erase_namespace(StorageNamespace::Otp)?;
+        self.erase_namespace(StorageNamespace::HotpCounters)?;
+        Ok(())
+    }
+
+    fn erase_optional_record(&mut self, record: StorageRecord<'_>) -> StorageResult<()> {
+        match self.erase_record(record) {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn erase_namespace(&mut self, namespace: StorageNamespace) -> StorageResult<()> {
+        let mut names = Vec::new();
+        self.list_names(namespace, &mut names)?;
+        for name in names {
+            let record = match namespace {
+                StorageNamespace::Multisig => StorageRecord::MultisigRegistration { name: &name },
+                StorageNamespace::Descriptor => {
+                    StorageRecord::DescriptorRegistration { name: &name }
+                }
+                StorageNamespace::Otp => StorageRecord::OtpData { name: &name },
+                StorageNamespace::HotpCounters => StorageRecord::OtpHotpCounter { name: &name },
+                StorageNamespace::Default => continue,
+            };
+            self.erase_optional_record(record)?;
+        }
+        Ok(())
+    }
+
     fn ensure_namespace_capacity(
         &self,
         namespace: StorageNamespace,
@@ -992,6 +1038,45 @@ mod tests {
             .erase_record(StorageRecord::MultisigRegistration { name: "wallet-a" })
             .unwrap();
         assert_eq!(storage.count(StorageNamespace::Multisig).unwrap(), 0);
+    }
+
+    #[test]
+    fn debug_clean_reset_erases_wallet_pinserver_and_registration_records() {
+        let mut storage = JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT);
+        storage
+            .set_record(StorageRecord::EncryptedBlob, b"blob")
+            .unwrap();
+        storage.set_u16(StorageRecord::PinCounter, 2).unwrap();
+        storage
+            .set_record(StorageRecord::PinserverUrlA, b"https://a")
+            .unwrap();
+        storage
+            .set_record(StorageRecord::PinserverCertificate, b"cert")
+            .unwrap();
+        storage
+            .set_multisig_registration("wallet-a", b"multisig")
+            .unwrap();
+        storage
+            .set_descriptor_registration("desc-a", b"descriptor")
+            .unwrap();
+        storage.set_otp_data("otp-a", b"otp").unwrap();
+        storage.set_otp_hotp_counter("otp-a", 9).unwrap();
+
+        storage.debug_clean_reset().unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            storage.get_record(StorageRecord::EncryptedBlob, &mut out),
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(
+            storage.get_record(StorageRecord::PinserverCertificate, &mut out),
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(storage.count(StorageNamespace::Multisig).unwrap(), 0);
+        assert_eq!(storage.count(StorageNamespace::Descriptor).unwrap(), 0);
+        assert_eq!(storage.count(StorageNamespace::Otp).unwrap(), 0);
+        assert_eq!(storage.count(StorageNamespace::HotpCounters).unwrap(), 0);
     }
 
     #[test]

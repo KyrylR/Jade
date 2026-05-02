@@ -114,6 +114,18 @@ impl Emulator {
                 self.state.logout();
                 V1Outcome::BoolResult { result: true }
             }
+            Some(MethodClass::Debug) if request.method == "debug_clean_reset" => {
+                match self.storage.debug_clean_reset() {
+                    Ok(()) => {
+                        self.state = CoreState::default();
+                        V1Outcome::BoolResult { result: true }
+                    }
+                    Err(_) => V1Outcome::Reject {
+                        code: ErrorCode::InternalError,
+                        message: "debug clean reset failed".to_string(),
+                    },
+                }
+            }
             Some(MethodClass::Authenticated) if request.method == "get_registered_multisigs" => {
                 self.registered_wallets_result(StorageNamespace::Multisig, "multisig")
             }
@@ -1633,6 +1645,54 @@ mod tests {
             [0xa2, 0x62, b'i', b'd', 0x61, b't', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
         );
         assert_eq!(emulator.platform().epoch(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn debug_clean_reset_wipes_emulator_storage_and_state() {
+        let mut emulator = Emulator::new();
+        emulator.state.wallet = jade_core::WalletLifecycle::Ready;
+        emulator
+            .storage_mut()
+            .set_record(StorageRecord::EncryptedBlob, b"blob")
+            .unwrap();
+        emulator
+            .storage_mut()
+            .set_record(StorageRecord::PinserverCertificate, b"cert")
+            .unwrap();
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", b"record-a")
+            .unwrap();
+        emulator
+            .storage_mut()
+            .set_descriptor_registration("desc-a", b"record-d")
+            .unwrap();
+        emulator
+            .storage_mut()
+            .set_otp_data("otp-a", b"otp")
+            .unwrap();
+
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_clean_reset"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.state.wallet, jade_core::WalletLifecycle::Uninit);
+        assert_eq!(emulator.storage.count(StorageNamespace::Multisig), Ok(0));
+        assert_eq!(emulator.storage.count(StorageNamespace::Descriptor), Ok(0));
+        assert_eq!(emulator.storage.count(StorageNamespace::Otp), Ok(0));
+        let mut out = Vec::new();
+        assert_eq!(
+            emulator
+                .storage
+                .get_record(StorageRecord::EncryptedBlob, &mut out),
+            Err(jade_storage::StorageError::NotFound)
+        );
     }
 
     #[test]
