@@ -416,23 +416,34 @@ impl<B: StorageBackend> JadeStorage<B> {
     pub fn set_pinserver_details(
         &mut self,
         url_a: &str,
-        url_b: &str,
+        url_b: Option<&str>,
         pubkey: Option<&[u8]>,
     ) -> StorageResult<()> {
         self.set_record(StorageRecord::PinserverUrlA, url_a.as_bytes())?;
-        self.set_record(StorageRecord::PinserverUrlB, url_b.as_bytes())?;
-        if let Some(pubkey) = pubkey {
-            self.set_record(StorageRecord::PinserverPubkey, pubkey)?;
+        match url_b {
+            Some(url_b) if !url_b.is_empty() => {
+                self.set_record(StorageRecord::PinserverUrlB, url_b.as_bytes())?;
+            }
+            _ => self.erase_optional_record(StorageRecord::PinserverUrlB)?,
         }
-        let _ = self.erase_record(StorageRecord::PinPrivateKey);
-        Ok(())
+        match pubkey {
+            Some(pubkey) if !pubkey.is_empty() => {
+                self.set_record(StorageRecord::PinserverPubkey, pubkey)?;
+            }
+            _ => self.erase_optional_record(StorageRecord::PinserverPubkey)?,
+        }
+        self.erase_optional_record(StorageRecord::PinPrivateKey)
     }
 
     pub fn erase_pinserver_details(&mut self) -> StorageResult<()> {
-        let _ = self.erase_record(StorageRecord::PinserverUrlA);
-        let _ = self.erase_record(StorageRecord::PinserverUrlB);
-        let _ = self.erase_record(StorageRecord::PinserverPubkey);
-        let _ = self.erase_record(StorageRecord::PinPrivateKey);
+        for record in [
+            StorageRecord::PinserverUrlA,
+            StorageRecord::PinserverUrlB,
+            StorageRecord::PinserverPubkey,
+            StorageRecord::PinPrivateKey,
+        ] {
+            self.erase_optional_record(record)?;
+        }
         Ok(())
     }
 
@@ -523,6 +534,14 @@ impl<B: StorageBackend> JadeStorage<B> {
     pub fn erase_otp(&mut self, name: &str) -> StorageResult<()> {
         let _ = self.erase_record(StorageRecord::OtpHotpCounter { name });
         self.erase_record(StorageRecord::OtpData { name })
+    }
+
+    pub fn set_pinserver_certificate(&mut self, certificate: &str) -> StorageResult<()> {
+        self.set_record(StorageRecord::PinserverCertificate, certificate.as_bytes())
+    }
+
+    pub fn erase_pinserver_certificate(&mut self) -> StorageResult<()> {
+        self.erase_optional_record(StorageRecord::PinserverCertificate)
     }
 
     pub fn debug_clean_reset(&mut self) -> StorageResult<()> {
@@ -1080,6 +1099,48 @@ mod tests {
     }
 
     #[test]
+    fn pinserver_helpers_set_replace_and_erase_details() {
+        let mut storage = JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT);
+        storage
+            .set_pinserver_details("https://a", Some("http://b"), Some(&[2; 33]))
+            .unwrap();
+        storage.set_pinserver_certificate("certificate").unwrap();
+
+        let mut out = Vec::new();
+        storage
+            .get_record(StorageRecord::PinserverUrlA, &mut out)
+            .unwrap();
+        assert_eq!(out, b"https://a");
+        storage
+            .get_record(StorageRecord::PinserverPubkey, &mut out)
+            .unwrap();
+        assert_eq!(out, vec![2; 33]);
+
+        storage
+            .set_pinserver_details("https://only-a", None, None)
+            .unwrap();
+        assert_eq!(
+            storage.get_record(StorageRecord::PinserverUrlB, &mut out),
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(
+            storage.get_record(StorageRecord::PinserverPubkey, &mut out),
+            Err(StorageError::NotFound)
+        );
+
+        storage.erase_pinserver_details().unwrap();
+        storage.erase_pinserver_certificate().unwrap();
+        assert_eq!(
+            storage.get_record(StorageRecord::PinserverUrlA, &mut out),
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(
+            storage.get_record(StorageRecord::PinserverCertificate, &mut out),
+            Err(StorageError::NotFound)
+        );
+    }
+
+    #[test]
     fn wallet_blob_restores_and_erases_pin_counter() {
         let mut storage = JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT);
 
@@ -1121,7 +1182,11 @@ mod tests {
             .set_u32(StorageRecord::QrFlags, 0x1234_5678)
             .unwrap();
         storage
-            .set_pinserver_details("https://a.example", "https://b.example", Some(&[1, 2, 3]))
+            .set_pinserver_details(
+                "https://a.example",
+                Some("https://b.example"),
+                Some(&[1, 2, 3]),
+            )
             .unwrap();
 
         assert_eq!(

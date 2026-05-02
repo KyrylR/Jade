@@ -119,6 +119,9 @@ impl Emulator {
                 self.state.logout();
                 V1Outcome::BoolResult { result: true }
             }
+            Some(MethodClass::PreAuth) if request.method == "update_pinserver" => {
+                self.update_pinserver(request)
+            }
             Some(MethodClass::Debug) if request.method == "debug_clean_reset" => {
                 match self.storage.debug_clean_reset() {
                     Ok(()) => {
@@ -532,6 +535,83 @@ impl Emulator {
             result: self.platform.master_blinding_key().to_vec(),
         }
     }
+
+    fn update_pinserver(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        let reset_details = optional_bool(params, "reset_details");
+        let url_a_present = params.contains("urlA").unwrap_or(false);
+        let url_a = optional_str(params, "urlA").unwrap_or("");
+        let url_b = optional_str(params, "urlB").unwrap_or("");
+        let pubkey = optional_bytes(params, "pubkey");
+
+        if url_a_present && !valid_pinserver_url(url_a) {
+            return bad_parameters("Empty or invalid first URL");
+        }
+        if !url_b.is_empty() && !valid_pinserver_url(url_b) {
+            return bad_parameters("Invalid second URL");
+        }
+        if !url_b.is_empty() && url_a.is_empty() {
+            return bad_parameters("Cannot set only second URL");
+        }
+        if (url_a_present || pubkey.is_some()) && reset_details {
+            return bad_parameters("Cannot set and reset details");
+        }
+        if let Some(pubkey) = pubkey {
+            if url_a.is_empty() {
+                return bad_parameters("Cannot set pubkey without URL");
+            }
+            if !valid_compressed_secp256k1_pubkey(pubkey) {
+                return bad_parameters("Invalid Oracle pubkey");
+            }
+        }
+
+        let reset_certificate = optional_bool(params, "reset_certificate");
+        let set_certificate = params.contains("certificate").unwrap_or(false);
+        if set_certificate && reset_certificate {
+            return bad_parameters("Cannot set and reset certificate");
+        }
+        let certificate = optional_str(params, "certificate").unwrap_or("");
+
+        let storage_result = if !url_a.is_empty() {
+            self.storage.set_pinserver_details(
+                url_a,
+                if url_b.is_empty() { None } else { Some(url_b) },
+                pubkey,
+            )
+        } else if reset_details {
+            self.storage.erase_pinserver_details()
+        } else {
+            Ok(())
+        };
+        if storage_result.is_err() {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to persist Oracle details".to_string(),
+            };
+        }
+
+        let storage_result = if set_certificate {
+            self.storage.set_pinserver_certificate(certificate)
+        } else if reset_certificate {
+            self.storage.erase_pinserver_certificate()
+        } else {
+            Ok(())
+        };
+        if storage_result.is_err() {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to persist Oracle certificate".to_string(),
+            };
+        }
+
+        V1Outcome::BoolResult { result: true }
+    }
 }
 
 fn missing_descriptor_result() -> V1Outcome {
@@ -546,6 +626,36 @@ fn missing_multisig_result() -> V1Outcome {
         code: ErrorCode::BadParameters,
         message: "Named multisig wallet does not exist for this signer".to_string(),
     }
+}
+
+fn bad_parameters(message: &'static str) -> V1Outcome {
+    V1Outcome::Reject {
+        code: ErrorCode::BadParameters,
+        message: message.to_string(),
+    }
+}
+
+fn optional_bool(params: jade_protocol_v1::Params<'_>, field: &str) -> bool {
+    params.bool(field).ok().flatten().unwrap_or(false)
+}
+
+fn optional_str<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Option<&'a str> {
+    params.str(field).ok().flatten()
+}
+
+fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Option<&'a [u8]> {
+    params.bytes(field).ok().flatten()
+}
+
+fn valid_pinserver_url(url: &str) -> bool {
+    (url.len() > "http://".len() && url.starts_with("http://"))
+        || (url.len() > "https://".len() && url.starts_with("https://"))
+}
+
+fn valid_compressed_secp256k1_pubkey(pubkey: &[u8]) -> bool {
+    pubkey.len() == jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN
+        && matches!(pubkey.first(), Some(0x02 | 0x03))
+        && jade_crypto::pure_rust::k256::PublicKey::from_sec1_bytes(pubkey).is_ok()
 }
 
 fn multisig_signer_entries(signer: &MultisigSignerDetails) -> Vec<OwnedResultMapEntry> {
@@ -1768,6 +1878,196 @@ mod tests {
         }
 
         assert_eq!(result, Some(&[0x42; 32][..]));
+    }
+
+    #[test]
+    fn update_pinserver_sets_details_and_certificate() {
+        let mut emulator = Emulator::new();
+        let pubkey = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(5)
+            .unwrap()
+            .str("urlA")
+            .unwrap()
+            .str("https://pin.example")
+            .unwrap()
+            .str("urlB")
+            .unwrap()
+            .str("http://backup.example")
+            .unwrap()
+            .str("pubkey")
+            .unwrap()
+            .bytes(&pubkey)
+            .unwrap()
+            .str("certificate")
+            .unwrap()
+            .str("pem")
+            .unwrap()
+            .str("reset_certificate")
+            .unwrap()
+            .bool(false)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("update_pinserver"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut out = Vec::new();
+        emulator
+            .storage
+            .get_record(StorageRecord::PinserverUrlA, &mut out)
+            .unwrap();
+        assert_eq!(out, b"https://pin.example");
+        emulator
+            .storage
+            .get_record(StorageRecord::PinserverUrlB, &mut out)
+            .unwrap();
+        assert_eq!(out, b"http://backup.example");
+        emulator
+            .storage
+            .get_record(StorageRecord::PinserverPubkey, &mut out)
+            .unwrap();
+        assert_eq!(out, pubkey);
+        emulator
+            .storage
+            .get_record(StorageRecord::PinserverCertificate, &mut out)
+            .unwrap();
+        assert_eq!(out, b"pem");
+    }
+
+    #[test]
+    fn update_pinserver_resets_details_and_certificate() {
+        let mut emulator = Emulator::new();
+        emulator
+            .storage_mut()
+            .set_record(StorageRecord::PinserverUrlA, b"https://pin.example")
+            .unwrap();
+        emulator
+            .storage_mut()
+            .set_record(StorageRecord::PinserverCertificate, b"pem")
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("reset_details")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("reset_certificate")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("update_pinserver"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            emulator
+                .storage
+                .get_record(StorageRecord::PinserverUrlA, &mut out),
+            Err(jade_storage::StorageError::NotFound)
+        );
+        assert_eq!(
+            emulator
+                .storage
+                .get_record(StorageRecord::PinserverCertificate, &mut out),
+            Err(jade_storage::StorageError::NotFound)
+        );
+    }
+
+    #[test]
+    fn update_pinserver_rejects_invalid_combinations() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("urlB")
+            .unwrap()
+            .str("http://backup.example")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("update_pinserver"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Cannot set only second URL".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("urlA")
+            .unwrap()
+            .str("https://pin.example")
+            .unwrap()
+            .str("reset_details")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("update_pinserver"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Cannot set and reset details".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("urlA")
+            .unwrap()
+            .str("https://pin.example")
+            .unwrap()
+            .str("pubkey")
+            .unwrap()
+            .bytes(&[0x04; 33])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("update_pinserver"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Invalid Oracle pubkey".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -395,6 +395,31 @@ impl<'a> Params<'a> {
         })
     }
 
+    pub fn contains(self, field: &str) -> Result<bool, ValidationError> {
+        let mut decoder = Decoder::new(self.0);
+        let Some(len) = decoder.map()? else {
+            return Err(ValidationError::MalformedCbor);
+        };
+
+        for _ in 0..len {
+            match decoder.datatype()? {
+                Type::String => {
+                    let key = decoder.str()?;
+                    if key == field {
+                        return Ok(true);
+                    }
+                    decoder.skip()?;
+                }
+                _ => {
+                    decoder.skip()?;
+                    decoder.skip()?;
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     pub fn u32_array(
         self,
         field: &str,
@@ -824,6 +849,8 @@ mod tests {
         assert_eq!(params.bytes("binary"), Ok(Some(&[0xab, 0xcd][..])));
         assert_eq!(params.bool("flag"), Ok(Some(false)));
         assert_eq!(params.u64("missing"), Ok(None));
+        assert_eq!(params.contains("epoch"), Ok(true));
+        assert_eq!(params.contains("missing"), Ok(false));
     }
 
     #[test]

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 base58ck.workspace = true
 jade-core.workspace = true
+jade-crypto = { workspace = true, features = ["pure-rust-curves"] }
 jade-protocol-v1.workspace = true
 jade-protocol-v2.workspace = true
 jade-storage.workspace = true
