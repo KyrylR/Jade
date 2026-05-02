@@ -149,6 +149,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
                 self.master_blinding_key_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_blinding_key" => {
+                self.blinding_key_result(request)
+            }
             Some(_) => V1Outcome::DeferredToCore {
                 method: request.method.to_string(),
             },
@@ -534,6 +537,81 @@ impl Emulator {
         V1Outcome::BytesResult {
             result: self.platform.master_blinding_key().to_vec(),
         }
+    }
+
+    fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let script = match params.bytes("script") {
+            Ok(Some(script)) if !script.is_empty() => script,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract script from parameters");
+            }
+        };
+
+        let master_unblinding_key = match self.master_unblinding_key_for_params(params) {
+            Ok(key) => key,
+            Err(outcome) => return outcome,
+        };
+        let Some(private_key) =
+            jade_crypto::pure_rust::slip77_blinding_private_key(&master_unblinding_key, script)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Cannot get blinding key for script".to_string(),
+            };
+        };
+        let Some(public_key) = jade_crypto::pure_rust::public_key_from_private_key(&private_key)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Cannot get blinding key for script".to_string(),
+            };
+        };
+
+        V1Outcome::BytesResult {
+            result: public_key.to_vec(),
+        }
+    }
+
+    fn master_unblinding_key_for_params(
+        &self,
+        params: jade_protocol_v1::Params<'_>,
+    ) -> Result<[u8; 64], V1Outcome> {
+        if !params.contains("multisig_name").unwrap_or(false) {
+            return Ok(self.platform.master_unblinding_key);
+        }
+
+        let multisig_name = match params.str("multisig_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => return Err(bad_parameters("Invalid multisig name parameter")),
+        };
+        let mut record = Vec::new();
+        if self
+            .storage
+            .get_record(
+                StorageRecord::MultisigRegistration {
+                    name: multisig_name,
+                },
+                &mut record,
+            )
+            .is_err()
+        {
+            return Err(bad_parameters("Cannot find named multisig wallet"));
+        }
+        let details = parse_multisig_details(&record, &HostRecordAuthenticator)
+            .map_err(|_| bad_parameters("Cannot de-serialise multisig wallet data"))?;
+        let Some(master_blinding_key) = details.summary.master_blinding_key else {
+            return Err(bad_parameters("No blinding key for multisig record"));
+        };
+
+        let mut master_unblinding_key = [0u8; 64];
+        master_unblinding_key[32..64].copy_from_slice(&master_blinding_key);
+        Ok(master_unblinding_key)
     }
 
     fn update_pinserver(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -1878,6 +1956,146 @@ mod tests {
         }
 
         assert_eq!(result, Some(&[0x42; 32][..]));
+    }
+
+    #[test]
+    fn get_blinding_key_derives_script_public_key_from_host_master_key() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x11; 64]);
+        let script = b"\x00\x14script";
+        let expected_private =
+            jade_crypto::pure_rust::slip77_blinding_private_key(&[0x11; 64], script).unwrap();
+        let expected_public =
+            jade_crypto::pure_rust::public_key_from_private_key(&expected_private).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("blind"),
+            method: Cow::Borrowed("get_blinding_key"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: expected_public.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn get_blinding_key_uses_registered_multisig_master_key_when_named() {
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_master_unblinding_key([0; 64]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 1, 1]);
+        payload.push(MULTISIG_MASTER_BLINDING_KEY_SIZE as u8);
+        payload.extend_from_slice(&[0x33; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        payload.push(1);
+        payload.extend_from_slice(&[0; 4]);
+        payload.push(0);
+        payload.extend_from_slice(&[1; BIP32_SERIALIZED_LEN]);
+        payload.push(0);
+        emulator
+            .storage_mut()
+            .set_multisig_registration("liquid-a", &authenticated_record(payload))
+            .unwrap();
+
+        let script = b"\x00\x14script";
+        let mut padded_key = [0u8; 64];
+        padded_key[32..64].copy_from_slice(&[0x33; MULTISIG_MASTER_BLINDING_KEY_SIZE]);
+        let expected_private =
+            jade_crypto::pure_rust::slip77_blinding_private_key(&padded_key, script).unwrap();
+        let expected_public =
+            jade_crypto::pure_rust::public_key_from_private_key(&expected_private).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("liquid-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("blind"),
+            method: Cow::Borrowed("get_blinding_key"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: expected_public.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn get_blinding_key_rejects_missing_script_and_unblinded_multisig() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("blind"),
+            method: Cow::Borrowed("get_blinding_key"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 1, 1, 0]);
+        payload.push(1);
+        payload.extend_from_slice(&[0; 4]);
+        payload.push(0);
+        payload.extend_from_slice(&[1; BIP32_SERIALIZED_LEN]);
+        payload.push(0);
+        emulator
+            .storage_mut()
+            .set_multisig_registration("plain-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(b"\x00\x14script")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("plain-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("blind"),
+            method: Cow::Borrowed("get_blinding_key"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "No blinding key for multisig record".to_string(),
+            }
+        );
     }
 
     #[test]

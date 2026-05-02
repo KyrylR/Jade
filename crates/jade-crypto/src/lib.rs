@@ -65,6 +65,64 @@ pub trait Bip85RsaCompatibility {
 
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
+    use super::{EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN};
+    use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
     pub use p256;
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+
+    pub fn slip77_blinding_private_key(
+        master_unblinding_key: &[u8; 64],
+        script: &[u8],
+    ) -> Option<[u8; EC_PRIVATE_KEY_LEN]> {
+        if script.is_empty() {
+            return None;
+        }
+
+        let mut mac = HmacSha256::new_from_slice(&master_unblinding_key[32..64]).ok()?;
+        mac.update(script);
+        let bytes = mac.finalize().into_bytes();
+        let key: [u8; EC_PRIVATE_KEY_LEN] = bytes.as_slice().try_into().ok()?;
+        k256::SecretKey::from_slice(&key).ok()?;
+        Some(key)
+    }
+
+    pub fn public_key_from_private_key(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let secret = k256::SecretKey::from_slice(private_key).ok()?;
+        let public_key = secret.public_key();
+        public_key.to_encoded_point(true).as_bytes().try_into().ok()
+    }
+}
+
+#[cfg(all(test, feature = "pure-rust-curves"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_compressed_public_key_from_private_key_one() {
+        let mut private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        private_key[EC_PRIVATE_KEY_LEN - 1] = 1;
+
+        assert_eq!(
+            pure_rust::public_key_from_private_key(&private_key).unwrap(),
+            [
+                0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+                0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+                0x5b, 0x16, 0xf8, 0x17, 0x98,
+            ]
+        );
+    }
+
+    #[test]
+    fn slip77_rejects_empty_scripts() {
+        assert_eq!(
+            pure_rust::slip77_blinding_private_key(&[0x11; 64], &[]),
+            None
+        );
+    }
 }
