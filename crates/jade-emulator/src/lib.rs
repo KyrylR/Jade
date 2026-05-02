@@ -170,6 +170,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_receive_address" => {
                 self.receive_address_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "get_identity_pubkey" => {
+                self.identity_pubkey_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_master_blinding_key" => {
                 self.master_blinding_key_result(request)
             }
@@ -688,6 +691,59 @@ impl Emulator {
         };
 
         V1Outcome::TextResult { result: address }
+    }
+
+    fn identity_pubkey_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let identity = match params.str("identity") {
+            Ok(Some(identity)) if valid_identity(identity) => identity,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid identity from parameters");
+            }
+        };
+        match params.str("curve") {
+            Ok(Some("nist256p1")) => {}
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid curve name from parameters");
+            }
+        }
+        let index = match params.u64("index") {
+            Ok(Some(index)) if index <= 0x7fff_ffff => index as u32,
+            Ok(None) => 0,
+            Ok(Some(_)) | Err(_) => {
+                return bad_parameters("Failed to extract valid index from parameters");
+            }
+        };
+        let key_type = match params.str("type") {
+            Ok(Some("slip-0013")) => jade_crypto::IdentityKeyType::Slip13,
+            Ok(Some("slip-0017")) => jade_crypto::IdentityKeyType::Slip17,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid key type from parameters");
+            }
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            };
+        };
+        let Some(pubkey) =
+            jade_crypto::pure_rust::identity_public_key_from_seed(seed, identity, index, key_type)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to get identity pubkey".to_string(),
+            };
+        };
+
+        V1Outcome::BytesResult {
+            result: pubkey.to_vec(),
+        }
     }
 
     fn blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -1268,6 +1324,12 @@ fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Opti
     params.bytes(field).ok().flatten()
 }
 
+fn valid_identity(identity: &str) -> bool {
+    identity.len() < 192
+        && ((identity.len() > "ssh://".len() && identity.starts_with("ssh://"))
+            || (identity.len() > "gpg://".len() && identity.starts_with("gpg://")))
+}
+
 fn valid_network_name(network: &str) -> bool {
     matches!(
         network,
@@ -1757,6 +1819,25 @@ mod tests {
         }
 
         (code.unwrap(), message.unwrap())
+    }
+
+    fn decode_hex<const N: usize>(input: &str) -> [u8; N] {
+        assert_eq!(input.len(), N * 2);
+        let mut output = [0u8; N];
+        let bytes = input.as_bytes();
+        for (index, output_byte) in output.iter_mut().enumerate() {
+            *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
+        }
+        output
+    }
+
+    fn hex_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("invalid hex"),
+        }
     }
 
     #[test]
@@ -2642,6 +2723,204 @@ mod tests {
         }
 
         assert_eq!(result, Some("bc1qtsdavj8dyw49l4gt554jg47pr60gpf48ww2ens"));
+    }
+
+    #[test]
+    fn get_identity_pubkey_derives_slip13_and_slip17_keys() {
+        let mut emulator = Emulator::new();
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(mnemonic.to_seed("").to_vec());
+
+        for (key_type, expected) in [
+            (
+                "slip-0013",
+                "0473f21a3da3d0e96fc2189f81dd826658c3d76b2d55bd1da349bc6c3573b13ae4d564710ca0bf84b81c6850e916cb94ae9c397b550589da476ace7aee39ebcb37",
+            ),
+            (
+                "slip-0017",
+                "04248befa95e9dbcf0a2ef7cf6957651ee25a168355590c4c84a6a8601758ca230d397bcba67b4676c3f2711b59083fff9157c16899da6d4ed76f8eaf57a100fa8",
+            ),
+        ] {
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(4)
+                .unwrap()
+                .str("identity")
+                .unwrap()
+                .str("ssh://satoshi@bitcoin.org")
+                .unwrap()
+                .str("curve")
+                .unwrap()
+                .str("nist256p1")
+                .unwrap()
+                .str("type")
+                .unwrap()
+                .str(key_type)
+                .unwrap()
+                .str("index")
+                .unwrap()
+                .u64(47)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("id"),
+                method: Cow::Borrowed("get_identity_pubkey"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult {
+                    result: decode_hex::<65>(expected).to_vec(),
+                },
+                "{key_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_identity_pubkey_rejects_invalid_inputs() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x11; jade_crypto::SHA512_LEN]);
+
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_identity_pubkey"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("identity")
+            .unwrap()
+            .str("ftp://some.xyz.com")
+            .unwrap()
+            .str("curve")
+            .unwrap()
+            .str("nist256p1")
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("slip-0013")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_identity_pubkey"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid identity from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("identity")
+            .unwrap()
+            .str("ssh://satoshi@bitcoin.org")
+            .unwrap()
+            .str("curve")
+            .unwrap()
+            .str("ed25519")
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("slip-0013")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_identity_pubkey"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid curve name from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("identity")
+            .unwrap()
+            .str("ssh://satoshi@bitcoin.org")
+            .unwrap()
+            .str("curve")
+            .unwrap()
+            .str("nist256p1")
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("slip-0013")
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(0x8000_0000)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_identity_pubkey"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid index from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("identity")
+            .unwrap()
+            .str("ssh://satoshi@bitcoin.org")
+            .unwrap()
+            .str("curve")
+            .unwrap()
+            .str("nist256p1")
+            .unwrap()
+            .str("type")
+            .unwrap()
+            .str("not-slip")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("id"),
+            method: Cow::Borrowed("get_identity_pubkey"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid key type from parameters".to_string(),
+            }
+        );
     }
 
     #[test]

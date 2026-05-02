@@ -104,6 +104,12 @@ pub enum SinglesigScriptVariant {
     Tr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityKeyType {
+    Slip13,
+    Slip17,
+}
+
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
     if !matches!(seed.len(), 16 | 32 | 64) {
         return None;
@@ -129,8 +135,9 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
     use super::{
-        BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind, SinglesigScriptVariant,
-        XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN,
+        BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind, IdentityKeyType,
+        SinglesigScriptVariant, XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN,
+        SHA256_LEN,
     };
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -139,6 +146,7 @@ pub mod pure_rust {
     use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
+    use p256::{FieldBytes as P256FieldBytes, Scalar as P256Scalar, SecretKey as P256SecretKey};
     use sha2::{Digest, Sha256, Sha512};
 
     type HmacSha256 = Hmac<Sha256>;
@@ -211,6 +219,22 @@ pub mod pure_rust {
         let mut mac = HmacSha512::new_from_slice(b"bip-entropy-from-k").ok()?;
         mac.update(private_key.to_bytes().as_ref());
         Some(mac.finalize().into_bytes()[..entropy_len].to_vec())
+    }
+
+    pub fn identity_public_key_from_seed(
+        seed: &[u8],
+        identity: &str,
+        index: u32,
+        key_type: IdentityKeyType,
+    ) -> Option<[u8; 65]> {
+        let private_key = identity_private_key_from_seed(seed, identity, index, key_type)?;
+        let secret = P256SecretKey::from_slice(&private_key).ok()?;
+        let public_key = secret.public_key();
+        public_key
+            .to_encoded_point(false)
+            .as_bytes()
+            .try_into()
+            .ok()
     }
 
     pub fn bitcoin_singlesig_address_from_seed(
@@ -353,6 +377,69 @@ pub mod pure_rust {
             BitcoinNetwork::Test => bech32::hrp::TB,
             BitcoinNetwork::Regtest => bech32::hrp::BCRT,
         }
+    }
+
+    fn identity_private_key_from_seed(
+        seed: &[u8],
+        identity: &str,
+        index: u32,
+        key_type: IdentityKeyType,
+    ) -> Option<[u8; EC_PRIVATE_KEY_LEN]> {
+        if identity.is_empty() || index > 0x7fff_ffff {
+            return None;
+        }
+
+        let mut root_mac = HmacSha512::new_from_slice(b"Nist256p1 seed").ok()?;
+        root_mac.update(seed);
+        let root = root_mac.finalize().into_bytes();
+        let mut private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        let mut chain_code = [0u8; EC_PRIVATE_KEY_LEN];
+        private_key.copy_from_slice(&root[..EC_PRIVATE_KEY_LEN]);
+        chain_code.copy_from_slice(&root[EC_PRIVATE_KEY_LEN..]);
+
+        for child_index in identity_path(identity, index, key_type) {
+            let mut mac = HmacSha512::new_from_slice(&chain_code).ok()?;
+            mac.update(&[0]);
+            mac.update(&private_key);
+            mac.update(&child_index.to_be_bytes());
+            let digest = mac.finalize().into_bytes();
+
+            let parent_scalar =
+                <P256Scalar as Reduce<U256>>::reduce(U256::from_be_slice(&private_key));
+            let tweak_scalar = <P256Scalar as Reduce<U256>>::reduce(U256::from_be_slice(
+                &digest[..EC_PRIVATE_KEY_LEN],
+            ));
+            let child_scalar = parent_scalar + tweak_scalar;
+            let child_bytes: P256FieldBytes = child_scalar.to_bytes();
+            private_key.copy_from_slice(&child_bytes);
+            chain_code.copy_from_slice(&digest[EC_PRIVATE_KEY_LEN..]);
+        }
+
+        P256SecretKey::from_slice(&private_key).ok()?;
+        Some(private_key)
+    }
+
+    fn identity_path(identity: &str, index: u32, key_type: IdentityKeyType) -> [u32; 5] {
+        let mut hasher = Sha256::new();
+        hasher.update(index.to_le_bytes());
+        hasher.update(identity.as_bytes());
+        let identity_hash = hasher.finalize();
+        let prefix = match key_type {
+            IdentityKeyType::Slip13 => 13,
+            IdentityKeyType::Slip17 => 17,
+        };
+
+        [
+            bip32::ChildNumber::HARDENED_FLAG | prefix,
+            bip32::ChildNumber::HARDENED_FLAG
+                | u32::from_le_bytes(identity_hash[0..4].try_into().expect("slice length")),
+            bip32::ChildNumber::HARDENED_FLAG
+                | u32::from_le_bytes(identity_hash[4..8].try_into().expect("slice length")),
+            bip32::ChildNumber::HARDENED_FLAG
+                | u32::from_le_bytes(identity_hash[8..12].try_into().expect("slice length")),
+            bip32::ChildNumber::HARDENED_FLAG
+                | u32::from_le_bytes(identity_hash[12..16].try_into().expect("slice length")),
+        ]
     }
 
     pub(crate) fn taproot_keyspend_output_key(
@@ -557,6 +644,50 @@ mod tests {
     }
 
     #[test]
+    fn identity_public_keys_match_jade_fixtures() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+        let identity = "ssh://satoshi@bitcoin.org";
+
+        assert_eq!(
+            pure_rust::identity_public_key_from_seed(&seed, identity, 47, IdentityKeyType::Slip13)
+                .unwrap(),
+            decode_hex_65(
+                "0473f21a3da3d0e96fc2189f81dd826658c3d76b2d55bd1da349bc6c3573b13ae4d564710ca0bf84b81c6850e916cb94ae9c397b550589da476ace7aee39ebcb37"
+            )
+        );
+        assert_eq!(
+            pure_rust::identity_public_key_from_seed(&seed, identity, 47, IdentityKeyType::Slip17)
+                .unwrap(),
+            decode_hex_65(
+                "04248befa95e9dbcf0a2ef7cf6957651ee25a168355590c4c84a6a8601758ca230d397bcba67b4676c3f2711b59083fff9157c16899da6d4ed76f8eaf57a100fa8"
+            )
+        );
+    }
+
+    #[test]
+    fn identity_public_key_rejects_empty_identity_and_oversized_index() {
+        let seed = [0x11; SHA512_LEN];
+
+        assert_eq!(
+            pure_rust::identity_public_key_from_seed(&seed, "", 0, IdentityKeyType::Slip13),
+            None
+        );
+        assert_eq!(
+            pure_rust::identity_public_key_from_seed(
+                &seed,
+                "ssh://satoshi@bitcoin.org",
+                0x8000_0000,
+                IdentityKeyType::Slip13,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn bitcoin_taproot_address_matches_bip86_vector() {
         let seed = [
             0x5e, 0xb0, 0x0b, 0xbd, 0xdc, 0xf0, 0x69, 0x08, 0x48, 0x89, 0xa8, 0xab, 0x91, 0x55,
@@ -665,5 +796,24 @@ mod tests {
             .len(),
             SHA256_LEN * 2
         );
+    }
+
+    fn decode_hex_65(input: &str) -> [u8; 65] {
+        assert_eq!(input.len(), 130);
+        let mut output = [0u8; 65];
+        let bytes = input.as_bytes();
+        for (index, output_byte) in output.iter_mut().enumerate() {
+            *output_byte = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
+        }
+        output
+    }
+
+    fn hex_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("invalid hex"),
+        }
     }
 }
