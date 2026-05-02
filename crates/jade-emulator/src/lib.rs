@@ -167,11 +167,17 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "get_registered_multisig" => {
                 self.registered_multisig_details(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "register_multisig" => {
+                self.register_multisig_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptors" => {
                 self.registered_wallets_result(StorageNamespace::Descriptor, "descriptor")
             }
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptor" => {
                 self.registered_descriptor_details(request)
+            }
+            Some(MethodClass::Authenticated) if request.method == "register_descriptor" => {
+                self.register_descriptor_result(request)
             }
             Some(MethodClass::Authenticated) if request.method == "register_otp" => {
                 self.register_otp_result(request)
@@ -595,6 +601,268 @@ impl Emulator {
                 },
             ],
         }
+    }
+
+    fn register_multisig_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        if params.contains("multisig_file").unwrap_or(false) {
+            return V1Outcome::DeferredToCore {
+                method: "register_multisig_file".to_string(),
+            };
+        }
+
+        let network = match params.str("network") {
+            Ok(Some(network)) => match bitcoin_network_for_name(network) {
+                Some(network) => network,
+                None => return bad_parameters("Failed to extract valid network from parameters"),
+            },
+            Ok(None) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters")
+            }
+        };
+        let multisig_name = match params.str("multisig_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Missing or invalid multisig name parameter");
+            }
+        };
+
+        let descriptor_raw = match cbor_map_field(params.raw(), "descriptor") {
+            Ok(Some(raw)) => raw,
+            Ok(None) | Err(()) => return bad_parameters("Cannot extract multisig descriptor data"),
+        };
+        let variant = match cbor_map_str(descriptor_raw, "variant") {
+            Ok(Some("wsh(multi(k))")) => MultisigVariant::P2wsh,
+            Ok(Some("sh(multi(k))")) => MultisigVariant::P2sh,
+            Ok(Some("sh(wsh(multi(k)))")) => MultisigVariant::P2wshP2sh,
+            Ok(Some(_)) | Ok(None) | Err(()) => {
+                return bad_parameters("Invalid script variant parameter");
+            }
+        };
+        let sorted = match cbor_map_bool(descriptor_raw, "sorted") {
+            Ok(value) => value.unwrap_or(false),
+            Err(()) => return bad_parameters("Invalid sorted flag value"),
+        };
+        let master_blinding_key = match cbor_map_bytes(descriptor_raw, "master_blinding_key") {
+            Ok(Some(bytes)) if bytes.len() == jade_storage::MULTISIG_MASTER_BLINDING_KEY_SIZE => {
+                Some(bytes.try_into().expect("checked length"))
+            }
+            Ok(Some(_)) | Err(()) => return bad_parameters("Invalid blinding key value"),
+            Ok(None) => None,
+        };
+        let threshold = match cbor_map_u64(descriptor_raw, "threshold") {
+            Ok(Some(value)) if value > 0 && value <= jade_storage::MAX_ALLOWED_SIGNERS as u64 => {
+                value as u8
+            }
+            Ok(_) | Err(()) => return bad_parameters("Invalid multisig threshold value"),
+        };
+        let signers =
+            match cbor_map_field(descriptor_raw, "signers").and_then(decode_registration_signers) {
+                Ok(signers) if !signers.is_empty() => signers,
+                Ok(_) | Err(()) => {
+                    return bad_parameters("Failed to extract valid co-signers from parameters");
+                }
+            };
+
+        if signers.len() > jade_storage::MAX_ALLOWED_SIGNERS {
+            return bad_parameters("Invalid multisig co-signers");
+        }
+        if threshold as usize > signers.len() {
+            return bad_parameters("Invalid multisig threshold");
+        }
+        if !self.validate_registration_signers(&signers, network) {
+            return bad_parameters("Failed to validate co-signers");
+        }
+
+        let record = match multisig_registration_record(
+            variant,
+            sorted,
+            threshold,
+            master_blinding_key,
+            &signers,
+        ) {
+            Some(record) => record,
+            None => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to serialise multisig".to_string(),
+                };
+            }
+        };
+        let storage_record = StorageRecord::MultisigRegistration {
+            name: multisig_name,
+        };
+        let exists = self.registration_exists(storage_record);
+        if exists && self.registration_exists_equal(storage_record, &record) {
+            return V1Outcome::BoolResult { result: true };
+        }
+        if !exists
+            && self.storage.count(StorageNamespace::Multisig).unwrap_or(0)
+                >= jade_storage::MAX_MULTISIG_REGISTRATIONS
+        {
+            return bad_parameters("Already have maximum number of multisig wallets");
+        }
+        if self
+            .storage
+            .set_multisig_registration(multisig_name, &record)
+            .is_err()
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to persist multisig data".to_string(),
+            };
+        }
+
+        V1Outcome::BoolResult { result: true }
+    }
+
+    fn register_descriptor_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        let network_name = match params.str("network") {
+            Ok(Some(network)) if valid_network_name(network) => network,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters")
+            }
+        };
+        if is_liquid_network(network_name) {
+            return bad_parameters("Descriptor wallets not supported on liquid network");
+        }
+        let Some(network) = bitcoin_network_for_name(network_name) else {
+            return bad_parameters("Failed to extract valid network from parameters");
+        };
+        let descriptor_name = match params.str("descriptor_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Missing or invalid descriptor name parameter");
+            }
+        };
+        let descriptor = match params.str("descriptor") {
+            Ok(Some(descriptor))
+                if !descriptor.is_empty()
+                    && descriptor.len() < jade_storage::MAX_DESCRIPTOR_SCRIPT_LEN =>
+            {
+                descriptor
+            }
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid output descriptor string");
+            }
+        };
+        let datavalues = match cbor_map_field(params.raw(), "datavalues")
+            .and_then(decode_descriptor_datavalues)
+        {
+            Ok(datavalues) => datavalues,
+            Err(()) => return bad_parameters("Failed to extract valid parameter values"),
+        };
+        let details = DescriptorDetails {
+            descriptor_type: 2,
+            descriptor: descriptor.to_string(),
+            datavalues,
+        };
+
+        if descriptor_receive_address(&details, 0, 0, network).is_none()
+            || descriptor_receive_address(&details, 1, 0, network).is_none()
+        {
+            return bad_parameters("Failed to generate valid descriptor script");
+        }
+
+        let record = descriptor_registration_record(&details);
+        let storage_record = StorageRecord::DescriptorRegistration {
+            name: descriptor_name,
+        };
+        let exists = self.registration_exists(storage_record);
+        if exists && self.registration_exists_equal(storage_record, &record) {
+            return V1Outcome::BoolResult { result: true };
+        }
+        if !exists
+            && self
+                .storage
+                .count(StorageNamespace::Descriptor)
+                .unwrap_or(0)
+                >= jade_storage::MAX_DESCRIPTOR_REGISTRATIONS
+        {
+            return bad_parameters("Already have maximum number of descriptor wallets");
+        }
+        if self
+            .storage
+            .set_descriptor_registration(descriptor_name, &record)
+            .is_err()
+        {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to persist descriptor data".to_string(),
+            };
+        }
+
+        V1Outcome::BoolResult { result: true }
+    }
+
+    fn registration_exists(&self, record: StorageRecord<'_>) -> bool {
+        let mut existing = Vec::new();
+        self.storage.get_record(record, &mut existing).is_ok()
+    }
+
+    fn registration_exists_equal(&self, record: StorageRecord<'_>, value: &[u8]) -> bool {
+        let mut existing = Vec::new();
+        self.storage.get_record(record, &mut existing).is_ok() && existing == value
+    }
+
+    fn validate_registration_signers(
+        &self,
+        signers: &[MultisigSignerDetails],
+        network: jade_crypto::BitcoinNetwork,
+    ) -> bool {
+        let Some(seed) = self.platform.wallet_seed() else {
+            return false;
+        };
+        let Some(fingerprint) = wallet_fingerprint_from_seed(seed) else {
+            return false;
+        };
+        let prefix = match network {
+            jade_crypto::BitcoinNetwork::Main => jade_crypto::XpubPrefix::Main,
+            jade_crypto::BitcoinNetwork::Test | jade_crypto::BitcoinNetwork::Regtest => {
+                jade_crypto::XpubPrefix::Test
+            }
+        };
+
+        let mut found_wallet_signer = false;
+        for signer in signers {
+            if signer.path.iter().any(|value| value & 0x8000_0000 != 0)
+                || signer.derivation.len() > MAX_PATH_LEN
+                || signer.path.len() > MAX_PATH_LEN
+                || !valid_serialized_xpub_for_network(&signer.xpub, network)
+            {
+                return false;
+            }
+            if signer.fingerprint == fingerprint {
+                let Some(expected_xpub) =
+                    jade_crypto::pure_rust::xpub_from_seed(seed, &signer.derivation, prefix)
+                else {
+                    return false;
+                };
+                let Ok(expected_bytes) = base58ck::decode_check(&expected_xpub) else {
+                    return false;
+                };
+                if expected_bytes.get(13..45) == Some(&signer.xpub[13..45])
+                    && expected_bytes.get(45..78) == Some(&signer.xpub[45..78])
+                {
+                    found_wallet_signer = true;
+                }
+            }
+        }
+
+        found_wallet_signer
     }
 
     fn master_blinding_key_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -2054,6 +2322,183 @@ fn optional_bytes<'a>(params: jade_protocol_v1::Params<'a>, field: &str) -> Opti
     params.bytes(field).ok().flatten()
 }
 
+fn cbor_map_field<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [u8]>, ()> {
+    let mut decoder = Decoder::new(raw);
+    let Some(len) = decoder.map().map_err(|_| ())? else {
+        return Err(());
+    };
+
+    for _ in 0..len {
+        match decoder.datatype().map_err(|_| ())? {
+            Type::String => {
+                let key = decoder.str().map_err(|_| ())?;
+                let start = decoder.position();
+                decoder.skip().map_err(|_| ())?;
+                if key == field {
+                    return Ok(Some(&raw[start..decoder.position()]));
+                }
+            }
+            _ => {
+                decoder.skip().map_err(|_| ())?;
+                decoder.skip().map_err(|_| ())?;
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn cbor_map_bool(raw: &[u8], field: &str) -> Result<Option<bool>, ()> {
+    cbor_map_field(raw, field)?.map(cbor_bool).transpose()
+}
+
+fn cbor_map_u64(raw: &[u8], field: &str) -> Result<Option<u64>, ()> {
+    cbor_map_field(raw, field)?.map(cbor_u64).transpose()
+}
+
+fn cbor_map_str<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a str>, ()> {
+    cbor_map_field(raw, field)?.map(cbor_str).transpose()
+}
+
+fn cbor_map_bytes<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [u8]>, ()> {
+    cbor_map_field(raw, field)?.map(cbor_bytes).transpose()
+}
+
+fn cbor_bool(raw: &[u8]) -> Result<bool, ()> {
+    let mut decoder = Decoder::new(raw);
+    let value = decoder.bool().map_err(|_| ())?;
+    if decoder.position() == raw.len() {
+        Ok(value)
+    } else {
+        Err(())
+    }
+}
+
+fn cbor_u64(raw: &[u8]) -> Result<u64, ()> {
+    let mut decoder = Decoder::new(raw);
+    let value = decoder.u64().map_err(|_| ())?;
+    if decoder.position() == raw.len() {
+        Ok(value)
+    } else {
+        Err(())
+    }
+}
+
+fn cbor_str(raw: &[u8]) -> Result<&str, ()> {
+    let mut decoder = Decoder::new(raw);
+    let value = decoder.str().map_err(|_| ())?;
+    if decoder.position() == raw.len() {
+        Ok(value)
+    } else {
+        Err(())
+    }
+}
+
+fn cbor_bytes(raw: &[u8]) -> Result<&[u8], ()> {
+    let mut decoder = Decoder::new(raw);
+    let value = decoder.bytes().map_err(|_| ())?;
+    if decoder.position() == raw.len() {
+        Ok(value)
+    } else {
+        Err(())
+    }
+}
+
+fn cbor_u32_array(raw: &[u8], max_len: usize) -> Result<Vec<u32>, ()> {
+    let mut decoder = Decoder::new(raw);
+    let Some(len) = decoder.array().map_err(|_| ())? else {
+        return Err(());
+    };
+    if len as usize > max_len {
+        return Err(());
+    }
+
+    let mut values = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        values.push(decoder.u32().map_err(|_| ())?);
+    }
+    if decoder.position() == raw.len() {
+        Ok(values)
+    } else {
+        Err(())
+    }
+}
+
+fn decode_registration_signers(
+    signers_raw: Option<&[u8]>,
+) -> Result<Vec<MultisigSignerDetails>, ()> {
+    let signers_raw = signers_raw.ok_or(())?;
+    let mut decoder = Decoder::new(signers_raw);
+    let Some(len) = decoder.array().map_err(|_| ())? else {
+        return Err(());
+    };
+    if len == 0 || len as usize > jade_storage::MAX_ALLOWED_SIGNERS {
+        return Err(());
+    }
+
+    let mut signers = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let start = decoder.position();
+        decoder.skip().map_err(|_| ())?;
+        let raw = &signers_raw[start..decoder.position()];
+        let fingerprint = cbor_map_bytes(raw, "fingerprint")?
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(())?;
+        let derivation = cbor_map_field(raw, "derivation")?
+            .map(|raw| cbor_u32_array(raw, MAX_PATH_LEN))
+            .transpose()?
+            .ok_or(())?;
+        let xpub = cbor_map_str(raw, "xpub")?
+            .and_then(|xpub| base58ck::decode_check(xpub).ok())
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(())?;
+        let path = cbor_map_field(raw, "path")?
+            .map(|raw| cbor_u32_array(raw, MAX_PATH_LEN))
+            .transpose()?
+            .ok_or(())?;
+        signers.push(MultisigSignerDetails {
+            fingerprint,
+            derivation,
+            xpub,
+            path,
+        });
+    }
+    if decoder.position() != signers_raw.len() {
+        return Err(());
+    }
+
+    Ok(signers)
+}
+
+fn decode_descriptor_datavalues(raw: Option<&[u8]>) -> Result<Vec<DescriptorDataValue>, ()> {
+    let raw = raw.ok_or(())?;
+    let mut decoder = Decoder::new(raw);
+    let Some(len) = decoder.map().map_err(|_| ())? else {
+        return Err(());
+    };
+    if len == 0 || len as usize > jade_storage::MAX_ALLOWED_SIGNERS {
+        return Err(());
+    }
+
+    let mut datavalues = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let key = decoder.str().map_err(|_| ())?;
+        let value = decoder.str().map_err(|_| ())?;
+        if key.is_empty() || key.len() >= 16 || value.is_empty() || value.len() >= 160 {
+            return Err(());
+        }
+        datavalues.push(DescriptorDataValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    if decoder.position() != raw.len() {
+        return Err(());
+    }
+
+    Ok(datavalues)
+}
+
 fn nested_u32_arrays(
     params: jade_protocol_v1::Params<'_>,
     field: &str,
@@ -2570,6 +3015,111 @@ fn descriptor_script_push_verify(script: &mut Vec<u8>) {
         Some(last) if *last == OP_CHECKSIG => *last = OP_CHECKSIGVERIFY,
         Some(last) if *last == OP_CHECKMULTISIG => *last = OP_CHECKMULTISIGVERIFY,
         _ => script.push(OP_VERIFY),
+    }
+}
+
+fn multisig_registration_record(
+    variant: MultisigVariant,
+    sorted: bool,
+    threshold: u8,
+    master_blinding_key: Option<[u8; jade_storage::MULTISIG_MASTER_BLINDING_KEY_SIZE]>,
+    signers: &[MultisigSignerDetails],
+) -> Option<Vec<u8>> {
+    if signers.is_empty()
+        || signers.len() > jade_storage::MAX_ALLOWED_SIGNERS
+        || threshold == 0
+        || threshold as usize > signers.len()
+    {
+        return None;
+    }
+
+    let path_elements = signers.iter().try_fold(0usize, |acc, signer| {
+        if signer.derivation.len() > MAX_PATH_LEN || signer.path.len() > MAX_PATH_LEN {
+            None
+        } else {
+            acc.checked_add(signer.derivation.len())?
+                .checked_add(signer.path.len())
+        }
+    })?;
+    let master_blinding_len = master_blinding_key.as_ref().map(|_| 32).unwrap_or(0);
+    let mut payload = Vec::with_capacity(
+        6 + master_blinding_len
+            + signers.len() * (6 + jade_storage::BIP32_SERIALIZED_LEN)
+            + path_elements * 4,
+    );
+    payload.push(3);
+    payload.push(variant as u8);
+    payload.push(u8::from(sorted));
+    payload.push(threshold);
+    payload.push(master_blinding_len as u8);
+    if let Some(master_blinding_key) = master_blinding_key {
+        payload.extend_from_slice(&master_blinding_key);
+    }
+    payload.push(signers.len() as u8);
+    for signer in signers {
+        payload.extend_from_slice(&signer.fingerprint);
+        payload.push(signer.derivation.len() as u8);
+        push_le_u32s(&mut payload, &signer.derivation);
+        payload.extend_from_slice(&signer.xpub);
+        payload.push(signer.path.len() as u8);
+        push_le_u32s(&mut payload, &signer.path);
+    }
+
+    Some(host_authenticated_record(payload))
+}
+
+fn descriptor_registration_record(details: &DescriptorDetails) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        4 + details.descriptor.len()
+            + 1
+            + details
+                .datavalues
+                .iter()
+                .map(|item| 4 + item.key.len() + item.value.len())
+                .sum::<usize>(),
+    );
+    payload.push(0);
+    payload.push(details.descriptor_type);
+    payload.extend_from_slice(&(details.descriptor.len() as u16).to_le_bytes());
+    payload.extend_from_slice(details.descriptor.as_bytes());
+    payload.push(details.datavalues.len() as u8);
+    for item in &details.datavalues {
+        payload.extend_from_slice(&(item.key.len() as u16).to_le_bytes());
+        payload.extend_from_slice(item.key.as_bytes());
+        payload.extend_from_slice(&(item.value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(item.value.as_bytes());
+    }
+
+    host_authenticated_record(payload)
+}
+
+fn host_authenticated_record(mut payload: Vec<u8>) -> Vec<u8> {
+    payload.extend_from_slice(&[0xa5; HMAC_SHA256_LEN]);
+    payload
+}
+
+fn push_le_u32s(output: &mut Vec<u8>, values: &[u32]) {
+    for value in values {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn wallet_fingerprint_from_seed(seed: &[u8]) -> Option<[u8; 4]> {
+    let pubkey = jade_crypto::pure_rust::public_key_from_seed_path(seed, &[])?;
+    let hash = jade_crypto::pure_rust::hash160_digest(&pubkey);
+    hash[..4].try_into().ok()
+}
+
+fn valid_serialized_xpub_for_network(
+    xpub: &[u8; jade_storage::BIP32_SERIALIZED_LEN],
+    network: jade_crypto::BitcoinNetwork,
+) -> bool {
+    let prefix = u32::from_be_bytes(xpub[..4].try_into().expect("fixed prefix len"));
+    match network {
+        jade_crypto::BitcoinNetwork::Main => prefix == 0x0488_b21e,
+        jade_crypto::BitcoinNetwork::Test | jade_crypto::BitcoinNetwork::Regtest => {
+            prefix == 0x0435_87cf
+        }
     }
 }
 
@@ -5709,6 +6259,192 @@ mod tests {
     }
 
     #[test]
+    fn register_multisig_persists_current_record_for_address_derivation() {
+        let mut emulator = Emulator::new();
+        let seed = test_mnemonic_seed();
+        emulator.platform_mut().set_debug_wallet_seed(seed.to_vec());
+        let fingerprint = wallet_fingerprint_from_seed(&seed).unwrap();
+        let xpub =
+            jade_crypto::pure_rust::xpub_from_seed(&seed, &[], jade_crypto::XpubPrefix::Main)
+                .unwrap();
+        let xpub_bytes: [u8; BIP32_SERIALIZED_LEN] =
+            base58ck::decode_check(&xpub).unwrap().try_into().unwrap();
+        let expected = jade_crypto::pure_rust::bitcoin_multisig_address_from_xpubs(
+            &[xpub_bytes],
+            &[vec![0]],
+            jade_crypto::BitcoinNetwork::Main,
+            jade_crypto::MultisigScriptVariant::P2wsh,
+            true,
+            1,
+        )
+        .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-r")
+            .unwrap()
+            .str("descriptor")
+            .unwrap()
+            .map(4)
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wsh(multi(k))")
+            .unwrap()
+            .str("sorted")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("threshold")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("signers")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .map(4)
+            .unwrap()
+            .str("fingerprint")
+            .unwrap()
+            .bytes(&fingerprint)
+            .unwrap()
+            .str("derivation")
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .str("xpub")
+            .unwrap()
+            .str(&xpub)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("r"),
+            method: Cow::Borrowed("register_multisig"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-r")
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult { result: expected }
+        );
+    }
+
+    #[test]
+    fn register_multisig_rejects_invalid_or_unowned_signers() {
+        let mut emulator = Emulator::new();
+        let seed = test_mnemonic_seed();
+        let xpub =
+            jade_crypto::pure_rust::xpub_from_seed(&seed, &[], jade_crypto::XpubPrefix::Main)
+                .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("mainnet")
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-r")
+            .unwrap()
+            .str("descriptor")
+            .unwrap()
+            .map(4)
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str("wsh(multi(k))")
+            .unwrap()
+            .str("threshold")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("sorted")
+            .unwrap()
+            .bool(false)
+            .unwrap()
+            .str("signers")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .map(4)
+            .unwrap()
+            .str("fingerprint")
+            .unwrap()
+            .bytes(&[0u8; 4])
+            .unwrap()
+            .str("derivation")
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .str("xpub")
+            .unwrap()
+            .str(&xpub)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0x8000_0000)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("r"),
+            method: Cow::Borrowed("register_multisig"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to validate co-signers".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn registered_descriptor_enumeration_uses_authenticated_summary_parser() {
         let mut emulator = Emulator::new();
         let mut payload = Vec::new();
@@ -5929,6 +6665,134 @@ mod tests {
         assert_eq!(descriptor_name, Some("desc-a"));
         assert_eq!(descriptor, Some("wsh(@0/**)"));
         assert_eq!(data_value, Some("xpub0"));
+    }
+
+    #[test]
+    fn register_descriptor_persists_record_for_address_derivation() {
+        let mut emulator = Emulator::new();
+        let descriptor =
+            "wsh(or_d(multi(2,@0/<0;1>/*,@1/<0;1>/*),and_v(v:pkh(@2/<0;1>/*),older(100))))";
+        let datavalues = [
+            (
+                "@0",
+                "[7897b5b3/48'/1'/0'/2']\
+                 tpubDE8B47dY4JuGLnXVyDzG76UuhBM5hTjc6sXeJjG6ThbPsryiAnKqQY8CmxWcYjM6eVvkyH7CNTVrmPMxSWP9ZzCfHVHo6preHp6Xhgd42JH",
+            ),
+            (
+                "@1",
+                "[1bf12fe0/48'/1'/0'/2']\
+                 tpubDEHXLZfMAAM5duEnX6SSnZjGYbrxqXvRJmMxw8MFwr3gu4LC4DSxR9KVEfVDVcZxre4XL5tGcwVRrHwQ9euTMnSq6P6BqREemaqrFsC96Fy",
+            ),
+            (
+                "@2",
+                "[7897b5b3/48'/1'/1'/2']\
+                 tpubDFf2ES1oUSZRgiCFT4mvBQ4jC2xTfRzVwfa6KewXZthgtL83UquqirWXzo1EKi4et3bx2wQz9QFKLDeu6vXoKpgQnJHyV8DomjCjJRT3d57",
+            ),
+        ];
+
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-r")
+            .unwrap()
+            .str("descriptor")
+            .unwrap()
+            .str(descriptor)
+            .unwrap()
+            .str("datavalues")
+            .unwrap()
+            .map(datavalues.len() as u64)
+            .unwrap();
+        for (key, value) in datavalues {
+            encoder.str(key).unwrap().str(value).unwrap();
+        }
+        let request = Request {
+            id: Cow::Borrowed("r"),
+            method: Cow::Borrowed("register_descriptor"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-r")
+            .unwrap()
+            .str("branch")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("pointer")
+            .unwrap()
+            .u64(1)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "tb1qkmr7qpxagfn7mafmsrt6e3qzzc599w28cl037cktjjegenfnhyysllxj5p"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn register_descriptor_rejects_liquid_network() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("liquid")
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str("desc-r")
+            .unwrap()
+            .str("descriptor")
+            .unwrap()
+            .str("wsh(@0/<0;1>/*)")
+            .unwrap()
+            .str("datavalues")
+            .unwrap()
+            .map(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("r"),
+            method: Cow::Borrowed("register_descriptor"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Descriptor wallets not supported on liquid network".to_string(),
+            }
+        );
     }
 
     #[test]

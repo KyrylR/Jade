@@ -19,6 +19,9 @@ pub const BIP32_SERIALIZED_LEN: usize = 78;
 pub const MAX_ALLOWED_SIGNERS: usize = 15;
 pub const MAX_PATH_LEN: usize = 16;
 pub const MULTISIG_MASTER_BLINDING_KEY_SIZE: usize = 32;
+pub const MAX_MULTISIG_REGISTRATIONS: usize = 16;
+pub const MAX_DESCRIPTOR_REGISTRATIONS: usize = 16;
+pub const MAX_DESCRIPTOR_SCRIPT_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StorageNamespace {
