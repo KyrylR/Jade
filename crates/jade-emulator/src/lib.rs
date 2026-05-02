@@ -5,7 +5,7 @@ use std::vec::Vec;
 
 use jade_core::{
     CoreError, CoreResult, CoreState, NetworkRestriction, OperationState, Platform,
-    VersionDebugInfo, VersionInfo,
+    VersionDebugInfo, VersionInfo, WalletLifecycle,
 };
 use jade_protocol_v1::{
     decode_request, encode_bool_result, encode_bytes_result, encode_error_response,
@@ -126,6 +126,7 @@ impl Emulator {
                 match self.storage.debug_clean_reset() {
                     Ok(()) => {
                         self.state = CoreState::default();
+                        self.platform.clear_debug_wallet();
                         V1Outcome::BoolResult { result: true }
                     }
                     Err(_) => V1Outcome::Reject {
@@ -133,6 +134,9 @@ impl Emulator {
                         message: "debug clean reset failed".to_string(),
                     },
                 }
+            }
+            Some(MethodClass::Debug) if request.method == "debug_set_mnemonic" => {
+                self.debug_set_mnemonic(request)
             }
             Some(MethodClass::Authenticated) if request.method == "get_registered_multisigs" => {
                 self.registered_wallets_result(StorageNamespace::Multisig, "multisig")
@@ -840,6 +844,87 @@ impl Emulator {
 
         V1Outcome::BoolResult { result: true }
     }
+
+    fn debug_set_mnemonic(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        let mut temporary_wallet = optional_bool(params, "temporary_wallet");
+        let seed = if params.contains("seed").unwrap_or(false) {
+            let Some(seed) = optional_bytes(params, "seed") else {
+                return bad_parameters("Failed to extract valid seed from parameters");
+            };
+            if !matches!(seed.len(), 32 | 64) {
+                return bad_parameters("Failed to extract valid seed from parameters");
+            }
+            temporary_wallet = true;
+            seed.to_vec()
+        } else {
+            let mnemonic = match params.str("mnemonic") {
+                Ok(Some(mnemonic)) if !mnemonic.is_empty() => mnemonic.to_string(),
+                _ => {
+                    let Some(mnemonic_bytes) = optional_bytes(params, "mnemonic") else {
+                        return bad_parameters(
+                            "Failed to extract mnemonic prefixes from parameters",
+                        );
+                    };
+                    match core::str::from_utf8(mnemonic_bytes) {
+                        Ok(mnemonic) if !mnemonic.is_empty() => mnemonic.to_string(),
+                        _ => {
+                            return bad_parameters(
+                                "Failed to extract mnemonic prefixes from parameters",
+                            );
+                        }
+                    }
+                }
+            };
+            let passphrase = if params.contains("passphrase").unwrap_or(false) {
+                let Some(passphrase) = optional_str(params, "passphrase") else {
+                    return bad_parameters("Failed to extract valid passphrase from parameters");
+                };
+                if passphrase.is_empty() || passphrase.len() > 100 {
+                    return bad_parameters("Failed to extract valid passphrase from parameters");
+                }
+                passphrase
+            } else {
+                ""
+            };
+            let mnemonic = match bip39::Mnemonic::parse_in(bip39::Language::English, mnemonic) {
+                Ok(mnemonic) => mnemonic,
+                Err(_) => {
+                    return bad_parameters(
+                        "Failed to expand mnemonic prefixes into full mnemonic words",
+                    );
+                }
+            };
+            mnemonic.to_seed(passphrase).to_vec()
+        };
+
+        let Some(master_unblinding_key) =
+            jade_crypto::slip77_master_unblinding_key_from_seed(&seed)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to derive keychain from mnemonic".to_string(),
+            };
+        };
+
+        self.platform.set_debug_wallet_seed(seed);
+        self.platform
+            .set_master_unblinding_key(master_unblinding_key);
+        self.platform.set_confirm_export_blinding_key(true);
+        self.state.wallet = if temporary_wallet {
+            WalletLifecycle::Temporary
+        } else {
+            WalletLifecycle::Ready
+        };
+
+        V1Outcome::BoolResult { result: true }
+    }
 }
 
 fn missing_descriptor_result() -> V1Outcome {
@@ -1012,6 +1097,7 @@ pub struct HostPlatform {
     version: Cow<'static, str>,
     entropy_bytes_received: usize,
     epoch: Option<u64>,
+    wallet_seed: Option<Vec<u8>>,
     master_unblinding_key: [u8; 64],
     confirm_export_blinding_key: bool,
 }
@@ -1022,6 +1108,7 @@ impl Default for HostPlatform {
             version: Cow::Borrowed("rust-emulator"),
             entropy_bytes_received: 0,
             epoch: None,
+            wallet_seed: None,
             master_unblinding_key: [0; 64],
             confirm_export_blinding_key: false,
         }
@@ -1035,6 +1122,20 @@ impl HostPlatform {
 
     pub fn epoch(&self) -> Option<u64> {
         self.epoch
+    }
+
+    pub fn wallet_seed(&self) -> Option<&[u8]> {
+        self.wallet_seed.as_deref()
+    }
+
+    pub fn set_debug_wallet_seed(&mut self, seed: Vec<u8>) {
+        self.wallet_seed = Some(seed);
+    }
+
+    pub fn clear_debug_wallet(&mut self) {
+        self.wallet_seed = None;
+        self.master_unblinding_key = [0; 64];
+        self.confirm_export_blinding_key = false;
     }
 
     pub fn set_master_unblinding_key(&mut self, key: [u8; 64]) {
@@ -2859,9 +2960,155 @@ mod tests {
     }
 
     #[test]
+    fn debug_set_mnemonic_derives_seed_and_master_blinding_key() {
+        let mut emulator = Emulator::new();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("mnemonic")
+            .unwrap()
+            .str(mnemonic)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_set_mnemonic"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        let expected_seed = bip39::Mnemonic::parse_in(bip39::Language::English, mnemonic)
+            .unwrap()
+            .to_seed("");
+        let expected_master =
+            jade_crypto::slip77_master_unblinding_key_from_seed(&expected_seed).unwrap();
+
+        assert_eq!(emulator.state.wallet, jade_core::WalletLifecycle::Ready);
+        assert_eq!(emulator.platform().wallet_seed(), Some(&expected_seed[..]));
+        assert_eq!(emulator.platform().master_unblinding_key, expected_master);
+    }
+
+    #[test]
+    fn debug_set_mnemonic_seed_is_temporary_wallet() {
+        let mut emulator = Emulator::new();
+        let seed = [0x12; 32];
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("seed")
+            .unwrap()
+            .bytes(&seed)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_set_mnemonic"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.state.wallet, jade_core::WalletLifecycle::Temporary);
+        assert_eq!(emulator.platform().wallet_seed(), Some(&seed[..]));
+        assert_eq!(
+            emulator.platform().master_unblinding_key,
+            jade_crypto::slip77_master_unblinding_key_from_seed(&seed).unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_v1_debug_set_mnemonic_returns_true() {
+        let mut emulator = Emulator::new();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("d")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("debug_set_mnemonic")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(2)
+            .unwrap()
+            .str("mnemonic")
+            .unwrap()
+            .str(mnemonic)
+            .unwrap()
+            .str("temporary_wallet")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+
+        assert_eq!(
+            emulator.handle_v1_cbor(&request),
+            [0xa2, 0x62, b'i', b'd', 0x61, b'd', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
+        );
+        assert_eq!(emulator.state.wallet, jade_core::WalletLifecycle::Temporary);
+    }
+
+    #[test]
+    fn debug_set_mnemonic_rejects_invalid_inputs() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_set_mnemonic"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("seed")
+            .unwrap()
+            .bytes(&[0x12; 31])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_set_mnemonic"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid seed from parameters".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn debug_clean_reset_wipes_emulator_storage_and_state() {
         let mut emulator = Emulator::new();
         emulator.state.wallet = jade_core::WalletLifecycle::Ready;
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(vec![0x11; 64]);
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x22; 64]);
+        emulator
+            .platform_mut()
+            .set_confirm_export_blinding_key(true);
         emulator
             .storage_mut()
             .set_record(StorageRecord::EncryptedBlob, b"blob")
@@ -2894,6 +3141,8 @@ mod tests {
             V1Outcome::BoolResult { result: true }
         );
         assert_eq!(emulator.state.wallet, jade_core::WalletLifecycle::Uninit);
+        assert_eq!(emulator.platform().wallet_seed(), None);
+        assert_eq!(emulator.platform().master_unblinding_key, [0; 64]);
         assert_eq!(emulator.storage.count(StorageNamespace::Multisig), Ok(0));
         assert_eq!(emulator.storage.count(StorageNamespace::Descriptor), Ok(0));
         assert_eq!(emulator.storage.count(StorageNamespace::Otp), Ok(0));

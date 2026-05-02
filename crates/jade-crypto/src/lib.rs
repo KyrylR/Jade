@@ -5,6 +5,7 @@ extern crate alloc;
 use zeroize::Zeroize;
 
 pub const SHA256_LEN: usize = 32;
+pub const SHA512_LEN: usize = 64;
 pub const EC_PRIVATE_KEY_LEN: usize = 32;
 pub const EC_PUBLIC_KEY_COMPRESSED_LEN: usize = 33;
 
@@ -80,6 +81,28 @@ impl BlindingFactorBytes {
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
+}
+
+pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
+    if !matches!(seed.len(), 16 | 32 | 64) {
+        return None;
+    }
+
+    type HmacSha512 = hmac::Hmac<sha2::Sha512>;
+
+    let mut root_mac =
+        <HmacSha512 as hmac::digest::KeyInit>::new_from_slice(b"Symmetric key seed").ok()?;
+    hmac::Mac::update(&mut root_mac, seed);
+    let root = hmac::Mac::finalize(root_mac).into_bytes();
+
+    let mut child_mac =
+        <HmacSha512 as hmac::digest::KeyInit>::new_from_slice(&root[..SHA512_LEN / 2]).ok()?;
+    hmac::Mac::update(&mut child_mac, b"\x00SLIP-0077");
+    hmac::Mac::finalize(child_mac)
+        .into_bytes()
+        .as_slice()
+        .try_into()
+        .ok()
 }
 
 #[cfg(feature = "pure-rust-curves")]
@@ -185,6 +208,21 @@ pub mod pure_rust {
 #[cfg(all(test, feature = "pure-rust-curves"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slip77_master_unblinding_key_from_seed_matches_wally_symmetric_derivation() {
+        assert_eq!(
+            slip77_master_unblinding_key_from_seed(&[0u8; SHA512_LEN]).unwrap(),
+            [
+                0x19, 0x9d, 0x6a, 0xdf, 0x6b, 0xe1, 0x4d, 0x06, 0x66, 0x36, 0xaf, 0xae, 0x63, 0xb6,
+                0xa1, 0x69, 0xb2, 0x5a, 0xda, 0xb0, 0x6e, 0xf5, 0xbe, 0xbe, 0x1f, 0x65, 0x87, 0x57,
+                0x35, 0x38, 0x9a, 0x52, 0x4b, 0x4c, 0xa9, 0x49, 0x22, 0x1f, 0x7c, 0xdf, 0x23, 0xad,
+                0x07, 0x39, 0x90, 0xc1, 0xc9, 0x68, 0x57, 0x8b, 0xad, 0xa6, 0x21, 0x85, 0xf9, 0xe5,
+                0x52, 0xd1, 0x9f, 0x05, 0x89, 0xa1, 0xd6, 0x33,
+            ]
+        );
+        assert_eq!(slip77_master_unblinding_key_from_seed(&[0u8; 31]), None);
+    }
 
     #[test]
     fn derives_compressed_public_key_from_private_key_one() {
