@@ -2,15 +2,19 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
-use jade_protocol_v2::{OperationActivity, Response, ResponseBody};
+use alloc::{borrow::Cow, boxed::Box};
+use jade_protocol_v2::{
+    OperationActivity, Request as V2Request, RequestBody as V2RequestBody, RequestKind, Response,
+    ResponseBody,
+};
 
 pub mod allocation;
 pub mod platform;
 pub mod state;
 
 pub use allocation::{AllocationBudget, AllocationFailure};
-pub use platform::{NetworkRestriction, Platform, VersionDebugInfo, VersionInfo, VersionInfoState};
+pub use jade_protocol_v2::{NetworkRestriction, VersionDebugInfo, VersionInfo, VersionInfoState};
+pub use platform::Platform;
 pub use state::{InterfaceKind, InterfaceSession, OperationState, WalletLifecycle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,45 @@ impl CoreState {
         platform.set_epoch(epoch)
     }
 
+    pub fn handle_v2<'a>(
+        &'a mut self,
+        platform: &'a mut impl Platform,
+        request: V2Request<'a>,
+    ) -> Response<'a> {
+        let body = match (request.kind, request.body) {
+            (RequestKind::Ping, V2RequestBody::Empty) => {
+                return self.ping_response(request.id);
+            }
+            (RequestKind::GetVersionInfo, V2RequestBody::GetVersionInfo { .. }) => {
+                ResponseBody::VersionInfo {
+                    info: Box::new(self.version_info(platform)),
+                }
+            }
+            (RequestKind::AddEntropy, V2RequestBody::AddEntropy { entropy }) => {
+                match self.add_entropy(platform, &entropy) {
+                    Ok(()) => ResponseBody::Ok,
+                    Err(err) => v2_error_body(err),
+                }
+            }
+            (RequestKind::SetEpoch, V2RequestBody::SetEpoch { epoch }) => {
+                match self.set_epoch(platform, epoch) {
+                    Ok(()) => ResponseBody::Ok,
+                    Err(err) => v2_error_body(err),
+                }
+            }
+            (RequestKind::Logout, V2RequestBody::Logout) => {
+                self.logout();
+                ResponseBody::Ok
+            }
+            _ => v2_error_body(CoreError::BadParameters),
+        };
+
+        Response {
+            id: request.id,
+            body,
+        }
+    }
+
     pub fn ping_response<'a>(&self, id: Cow<'a, str>) -> Response<'a> {
         Response {
             id,
@@ -79,9 +122,35 @@ impl CoreState {
     }
 }
 
+fn v2_error_body(err: CoreError) -> ResponseBody<'static> {
+    let (code, message) = match err {
+        CoreError::InvalidRequest => (
+            jade_protocol_v2::ErrorCode::InvalidRequest,
+            "invalid request",
+        ),
+        CoreError::UnknownMethod => (jade_protocol_v2::ErrorCode::UnknownMethod, "unknown method"),
+        CoreError::BadParameters => (jade_protocol_v2::ErrorCode::BadParameters, "bad parameters"),
+        CoreError::InternalError => (jade_protocol_v2::ErrorCode::InternalError, "internal error"),
+        CoreError::HardwareLocked => (
+            jade_protocol_v2::ErrorCode::HardwareLocked,
+            "hardware locked",
+        ),
+        CoreError::OutOfMemory => (jade_protocol_v2::ErrorCode::OutOfMemory, "out of memory"),
+        CoreError::Deferred(method) => (jade_protocol_v2::ErrorCode::Unsupported, method),
+        CoreError::Unsupported(feature) => (jade_protocol_v2::ErrorCode::Unsupported, feature),
+    };
+    ResponseBody::Error {
+        code,
+        message: Cow::Borrowed(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use jade_protocol_v2::{Request, RequestBody, RequestKind};
+    use minicbor::bytes::ByteVec;
 
     #[test]
     fn logout_clears_active_operation_and_locks_wallet() {
@@ -163,5 +232,53 @@ mod tests {
             state.add_entropy(&mut platform, b""),
             Err(CoreError::BadParameters)
         );
+    }
+
+    #[test]
+    fn v2_handles_same_management_surface_without_v1_adapter() {
+        let mut state = CoreState::default();
+        let mut platform = TestPlatform::default();
+
+        let add_entropy = Request {
+            id: Cow::Borrowed("e"),
+            kind: RequestKind::AddEntropy,
+            session: None,
+            body: RequestBody::AddEntropy {
+                entropy: ByteVec::from(vec![b'n', b'o', b'i', b's', b'e']),
+            },
+        };
+        assert_eq!(
+            state.handle_v2(&mut platform, add_entropy).body,
+            ResponseBody::Ok
+        );
+
+        let set_epoch = Request {
+            id: Cow::Borrowed("t"),
+            kind: RequestKind::SetEpoch,
+            session: None,
+            body: RequestBody::SetEpoch {
+                epoch: 1_700_000_000,
+            },
+        };
+        assert_eq!(
+            state.handle_v2(&mut platform, set_epoch).body,
+            ResponseBody::Ok
+        );
+
+        let version = Request {
+            id: Cow::Borrowed("v"),
+            kind: RequestKind::GetVersionInfo,
+            session: None,
+            body: RequestBody::GetVersionInfo { nonblocking: true },
+        };
+        let response = state.handle_v2(&mut platform, version);
+        let version_state = match response.body {
+            ResponseBody::VersionInfo { info } => info.jade_state,
+            _ => panic!("expected version info"),
+        };
+
+        assert_eq!(platform.entropy_bytes, 5);
+        assert_eq!(platform.epoch, Some(1_700_000_000));
+        assert_eq!(version_state, VersionInfoState::Uninit);
     }
 }
