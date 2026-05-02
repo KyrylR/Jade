@@ -1304,7 +1304,52 @@ pub mod pure_rust {
             ));
         }
 
+        if let Some(witness_script) = input.single_value(0x05) {
+            if script_contains_pubkey(witness_script, pubkey) {
+                let witness_script_hash = Sha256::digest(witness_script);
+                let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
+                if witness_program == prev_output.script
+                    || (input.single_value(0x04) == Some(witness_program.as_slice())
+                        && p2sh_script_pubkey(&hash160(&witness_program)) == prev_output.script)
+                {
+                    return Ok(segwit_v0_sighash_all(
+                        tx.version,
+                        tx.lock_time,
+                        tx.inputs,
+                        tx.outputs,
+                        signing_input,
+                        witness_script,
+                        prev_output.amount,
+                    ));
+                }
+            }
+        }
+
+        if let Some(redeem_script) = input.single_value(0x04) {
+            if script_contains_pubkey(redeem_script, pubkey)
+                && p2sh_script_pubkey(&hash160(redeem_script)) == prev_output.script
+            {
+                return Ok(legacy_sighash_all(
+                    tx.version,
+                    tx.lock_time,
+                    tx.inputs,
+                    tx.outputs,
+                    signing_input,
+                    redeem_script,
+                ));
+            }
+        }
+
         Err(PsbtSignError::Unsupported)
+    }
+
+    fn script_contains_pubkey(script: &[u8], pubkey: &[u8]) -> bool {
+        pubkey.len() == EC_PUBLIC_KEY_COMPRESSED_LEN
+            && script
+                .windows(1 + EC_PUBLIC_KEY_COMPRESSED_LEN)
+                .any(|window| {
+                    window[0] == EC_PUBLIC_KEY_COMPRESSED_LEN as u8 && &window[1..] == pubkey
+                })
     }
 
     fn p2tr_script_pubkey(output_key: &[u8; SHA256_LEN]) -> Vec<u8> {
