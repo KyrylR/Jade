@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
 use jade_core::{
-    bip32_path::MAX_PATH_LEN, CoreError, CoreResult, CoreState, NetworkRestriction, OperationState,
-    OtaHashType, OtaRequest, Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
+    bip32_path::{JadeDerivationPath, MAX_PATH_LEN},
+    CoreError, CoreResult, CoreState, NetworkRestriction, OperationState, OtaHashType, OtaRequest,
+    Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
 };
 use jade_protocol_v1::{
     decode_request, encode_bool_result, encode_bytes_result, encode_error_response,
@@ -177,6 +178,9 @@ impl Emulator {
             }
             Some(MethodClass::Authenticated) if request.method == "get_otp_code" => {
                 self.otp_code_result(request)
+            }
+            Some(MethodClass::Authenticated) if request.method == "sign_message" => {
+                self.sign_message_result(request)
             }
             Some(MethodClass::Authenticated) if request.method == "get_xpub" => {
                 self.xpub_result(request)
@@ -870,6 +874,99 @@ impl Emulator {
                 message: "Failed to calculate otp token".to_string(),
             },
         }
+    }
+
+    fn sign_message_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+
+        if params.contains("message_file").unwrap_or(false) {
+            let message_file = match params.str("message_file") {
+                Ok(Some(message_file)) if !message_file.is_empty() => message_file,
+                Ok(_) | Err(_) => return bad_parameters("Invalid sign message file data"),
+            };
+            return self.sign_message_file_result(message_file);
+        }
+
+        let message = match params.str("message") {
+            Ok(Some(message)) if !message.is_empty() => message,
+            Ok(_) | Err(_) => return bad_parameters("Failed to extract message from parameters"),
+        };
+        let path = match params.u32_array("path", MAX_PATH_LEN) {
+            Ok(Some(path)) if !path.is_empty() => path,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid path from parameters")
+            }
+        };
+
+        if params.contains("ae_host_commitment").unwrap_or(false) {
+            match params.bytes("ae_host_commitment") {
+                Ok(Some(commitment)) if commitment.len() == 32 => {
+                    return V1Outcome::DeferredToCore {
+                        method: "sign_message anti-exfil".to_string(),
+                    };
+                }
+                Ok(_) | Err(_) => {
+                    return bad_parameters(
+                        "Failed to extract valid host commitment from parameters",
+                    );
+                }
+            }
+        }
+
+        self.sign_message_bytes(message.as_bytes(), &path)
+    }
+
+    fn sign_message_file_result(&self, message_file: &str) -> V1Outcome {
+        let Some((prefix, rest)) = split_once_byte(message_file, b' ') else {
+            return bad_parameters("Invalid prefix");
+        };
+        if !prefix.eq_ignore_ascii_case("signmessage") {
+            return bad_parameters("Invalid prefix");
+        }
+
+        let Some((path_str, rest)) = split_once_byte(rest, b' ') else {
+            return bad_parameters("Invalid bip32 path");
+        };
+        let path = match JadeDerivationPath::parse(path_str) {
+            Ok(path) => path.to_u32_vec(),
+            Err(_) => return bad_parameters("Invalid bip32 path"),
+        };
+
+        let Some((label, message)) = split_once_byte(rest, b':') else {
+            return bad_parameters("Invalid message prefix");
+        };
+        if !label.eq_ignore_ascii_case("ascii") {
+            return bad_parameters("Invalid message prefix");
+        }
+        if message.is_empty() {
+            return bad_parameters("Invalid message bytes");
+        }
+
+        self.sign_message_bytes(message.as_bytes(), &path)
+    }
+
+    fn sign_message_bytes(&self, message: &[u8], path: &[u32]) -> V1Outcome {
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Feature requires resetting Jade".to_string(),
+            };
+        };
+        let Some(signature) =
+            jade_crypto::pure_rust::sign_bitcoin_message_from_seed(seed, path, message)
+        else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to sign message".to_string(),
+            };
+        };
+
+        V1Outcome::TextResult { result: signature }
     }
 
     fn identity_pubkey_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -1747,6 +1844,11 @@ fn current_unix_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+fn split_once_byte(value: &str, byte: u8) -> Option<(&str, &str)> {
+    let index = value.as_bytes().iter().position(|item| *item == byte)?;
+    Some((&value[..index], &value[index + 1..]))
+}
+
 fn hash32_param(
     params: jade_protocol_v1::Params<'_>,
     field: &str,
@@ -2313,6 +2415,13 @@ mod tests {
             b'A'..=b'F' => byte - b'A' + 10,
             _ => panic!("invalid hex"),
         }
+    }
+
+    fn test_mnemonic_seed() -> [u8; 64] {
+        decode_hex(
+            "f1d56befd46eddfc31cda129dc76cd4a2b41d2cf86f10a5ccf0787617afa3869\
+             967aab0224742ccc002056747ea09b68598ddf79c027c37a7c3ec923004593da",
+        )
     }
 
     #[test]
@@ -2939,6 +3048,133 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Failed to parse otp record".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_message_returns_legacy_recoverable_signature() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .str("message")
+            .unwrap()
+            .str("Jade is cool")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("msg"),
+            method: Cow::Borrowed("sign_message"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "IHd2/Y65d1P7Gq6I6gTDoRql9eEsFEh7B8RtAJm+g+AdHuxT5hbMKN28Jlotxfp0LO3WLxPlJh61BQYPYL1uikw=".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_message_file_parses_specter_style_payload() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("message_file")
+            .unwrap()
+            .str("signmessage M/0 ascii:Jade is cool")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("msg"),
+            method: Cow::Borrowed("sign_message"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "IHd2/Y65d1P7Gq6I6gTDoRql9eEsFEh7B8RtAJm+g+AdHuxT5hbMKN28Jlotxfp0LO3WLxPlJh61BQYPYL1uikw=".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_message_rejects_bad_params_and_defers_anti_exfil() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .str("message")
+            .unwrap()
+            .str("XYZ")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("msg"),
+            method: Cow::Borrowed("sign_message"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid path from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .str("message")
+            .unwrap()
+            .str("XYZ")
+            .unwrap()
+            .str("ae_host_commitment")
+            .unwrap()
+            .bytes(&[0x11; 32])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("msg"),
+            method: Cow::Borrowed("sign_message"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "sign_message anti-exfil".to_string(),
             }
         );
     }

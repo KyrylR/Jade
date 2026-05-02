@@ -4,6 +4,8 @@ extern crate alloc;
 
 use zeroize::Zeroize;
 
+use sha2::Digest;
+
 pub const SHA256_LEN: usize = 32;
 pub const SHA512_LEN: usize = 64;
 pub const EC_PRIVATE_KEY_LEN: usize = 32;
@@ -12,6 +14,7 @@ pub const OTP_MAX_NAME_LEN: usize = 16;
 pub const OTP_MAX_URI_LEN: usize = 256;
 pub const OTP_MAX_TOKEN_LEN: usize = 12;
 pub const OTP_MAX_RECORDS: usize = 16;
+pub const BITCOIN_MESSAGE_MAX_LEN: usize = 64 * 1024 - 64;
 
 pub trait SecretKeyMaterial: Zeroize {
     fn expose_secret_bytes(&self) -> &[u8];
@@ -413,6 +416,52 @@ fn format_otp_code(code: u32, digits: u8) -> alloc::string::String {
     }
 }
 
+pub fn bitcoin_message_hash(message: &[u8]) -> Option<[u8; SHA256_LEN]> {
+    if message.is_empty() || message.len() > BITCOIN_MESSAGE_MAX_LEN {
+        return None;
+    }
+
+    let varint_len = if message.len() < 0xfd { 1 } else { 3 };
+    let mut formatted = alloc::vec::Vec::with_capacity(25 + varint_len + message.len());
+    formatted.extend_from_slice(b"\x18Bitcoin Signed Message:\n");
+    if message.len() < 0xfd {
+        formatted.push(message.len() as u8);
+    } else {
+        formatted.push(0xfd);
+        formatted.push((message.len() & 0xff) as u8);
+        formatted.push((message.len() >> 8) as u8);
+    }
+    formatted.extend_from_slice(message);
+
+    let first = sha2::Sha256::digest(&formatted);
+    sha2::Sha256::digest(first).as_slice().try_into().ok()
+}
+
+fn base64_encode(bytes: &[u8]) -> alloc::string::String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = alloc::string::String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512_LEN]> {
     if !matches!(seed.len(), 16 | 32 | 64) {
         return None;
@@ -448,6 +497,7 @@ pub mod pure_rust {
     use alloc::vec::Vec;
     use hmac::{Hmac, KeyInit, Mac};
     pub use k256;
+    use k256::ecdsa::SigningKey as K256SigningKey;
     use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
@@ -463,6 +513,34 @@ pub mod pure_rust {
 
     type HmacSha256 = Hmac<Sha256>;
     type HmacSha512 = Hmac<Sha512>;
+
+    pub fn sign_bitcoin_message_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        message: &[u8],
+    ) -> Option<String> {
+        if path.is_empty() {
+            return None;
+        }
+
+        let message_hash = super::bitcoin_message_hash(message)?;
+        let mut derivation_path = bip32::DerivationPath::default();
+        for value in path {
+            let hardened = value & bip32::ChildNumber::HARDENED_FLAG != 0;
+            let child =
+                bip32::ChildNumber::new(value & !bip32::ChildNumber::HARDENED_FLAG, hardened)
+                    .ok()?;
+            derivation_path.push(child);
+        }
+        let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
+        let signing_key = K256SigningKey::from_slice(private_key.to_bytes().as_ref()).ok()?;
+        let (signature, recid) = signing_key.sign_prehash_recoverable(&message_hash).ok()?;
+
+        let mut recoverable = [0u8; 65];
+        recoverable[0] = 27 + recid.to_byte() + 4;
+        recoverable[1..].copy_from_slice(signature.to_bytes().as_ref());
+        Some(super::base64_encode(&recoverable))
+    }
 
     pub fn xpub_from_seed(seed: &[u8], path: &[u32], prefix: XpubPrefix) -> Option<String> {
         let mut derivation_path = bip32::DerivationPath::default();
@@ -1168,6 +1246,33 @@ mod tests {
                 .unwrap()
                 .starts_with("tpub")
         );
+    }
+
+    #[test]
+    fn bitcoin_message_signatures_match_jade_fixtures() {
+        let seed = decode_hex_64(
+            "f1d56befd46eddfc31cda129dc76cd4a2b41d2cf86f10a5ccf0787617afa3869\
+             967aab0224742ccc002056747ea09b68598ddf79c027c37a7c3ec923004593da",
+        );
+
+        for (path, message, expected) in [
+            (
+                &[0u32][..],
+                "Jade is cool",
+                "IHd2/Y65d1P7Gq6I6gTDoRql9eEsFEh7B8RtAJm+g+AdHuxT5hbMKN28Jlotxfp0LO3WLxPlJh61BQYPYL1uikw=",
+            ),
+            (
+                &[2_147_483_651, 2_147_483_648][..],
+                "The above path initially failed with Jade, this proves it now works.",
+                "IKS4r0mTB21NqFv57yxphyD69zBT2yMXVXmseLJh9mZGB8qoMeeK8bAmcplMRvWAY9DuXmbqEIcQsDZRhRhFLAU=",
+            ),
+        ] {
+            assert_eq!(
+                pure_rust::sign_bitcoin_message_from_seed(&seed, path, message.as_bytes())
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
