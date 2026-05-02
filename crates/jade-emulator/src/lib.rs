@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::boxed::Box;
+use std::string::String;
 use std::vec::Vec;
 
 use jade_core::{
@@ -12,9 +13,10 @@ use jade_protocol_v1::{
     MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry, V1Value,
 };
 use jade_storage::{
-    key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_summary,
-    JadeStorage, MemoryStorage, RecordAuthenticator, StorageLimits, StorageNamespace,
-    StorageRecord, HMAC_SHA256_LEN,
+    key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
+    parse_multisig_summary, JadeStorage, MemoryStorage, MultisigDetails, MultisigSignerDetails,
+    MultisigVariant, RecordAuthenticator, StorageLimits, StorageNamespace, StorageRecord,
+    HMAC_SHA256_LEN,
 };
 
 #[derive(Debug)]
@@ -114,6 +116,9 @@ impl Emulator {
             }
             Some(MethodClass::Authenticated) if request.method == "get_registered_multisigs" => {
                 self.registered_wallets_result(StorageNamespace::Multisig, "multisig")
+            }
+            Some(MethodClass::Authenticated) if request.method == "get_registered_multisig" => {
+                self.registered_multisig_details(request)
             }
             Some(MethodClass::Authenticated) if request.method == "get_registered_descriptors" => {
                 self.registered_wallets_result(StorageNamespace::Descriptor, "descriptor")
@@ -300,6 +305,133 @@ impl Emulator {
         V1Outcome::OwnedMapResult { entries }
     }
 
+    fn registered_multisig_details(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let multisig_name = match params.str("multisig_name") {
+            Ok(Some(name)) if key_name_valid(name) => name,
+            Ok(_) | Err(_) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: "Missing or invalid multisig name parameter".to_string(),
+                };
+            }
+        };
+        let as_file = match params.bool("as_file") {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: "Failed to extract valid as_file parameter".to_string(),
+                };
+            }
+        };
+
+        let mut record = Vec::new();
+        if self
+            .storage
+            .get_record(
+                StorageRecord::MultisigRegistration {
+                    name: multisig_name,
+                },
+                &mut record,
+            )
+            .is_err()
+        {
+            return missing_multisig_result();
+        }
+
+        let Ok(details) = parse_multisig_details(&record, &HostRecordAuthenticator) else {
+            return missing_multisig_result();
+        };
+        let Some(signers) = details.signers.as_ref() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Named multisig too old include detailed signer data".to_string(),
+            };
+        };
+        if signers.len() != details.summary.num_signers as usize {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Named multisig too old include detailed signer data".to_string(),
+            };
+        }
+
+        if as_file {
+            return match multisig_export_file(multisig_name, &details) {
+                Some(multisig_file) => V1Outcome::OwnedMapResult {
+                    entries: vec![
+                        OwnedResultMapEntry {
+                            key: "multisig_name".to_string(),
+                            value: OwnedV1Value::Text(multisig_name.to_string()),
+                        },
+                        OwnedResultMapEntry {
+                            key: "multisig_file".to_string(),
+                            value: OwnedV1Value::Text(multisig_file),
+                        },
+                    ],
+                },
+                None => V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to produce multisig export file".to_string(),
+                },
+            };
+        }
+
+        V1Outcome::OwnedMapResult {
+            entries: vec![
+                OwnedResultMapEntry {
+                    key: "multisig_name".to_string(),
+                    value: OwnedV1Value::Text(multisig_name.to_string()),
+                },
+                OwnedResultMapEntry {
+                    key: "descriptor".to_string(),
+                    value: OwnedV1Value::Map(vec![
+                        OwnedResultMapEntry {
+                            key: "variant".to_string(),
+                            value: OwnedV1Value::Text(
+                                details.summary.variant.as_v1_str().to_string(),
+                            ),
+                        },
+                        OwnedResultMapEntry {
+                            key: "sorted".to_string(),
+                            value: OwnedV1Value::Bool(details.summary.sorted),
+                        },
+                        OwnedResultMapEntry {
+                            key: "threshold".to_string(),
+                            value: OwnedV1Value::U64(details.summary.threshold.into()),
+                        },
+                        OwnedResultMapEntry {
+                            key: "master_blinding_key".to_string(),
+                            value: OwnedV1Value::Bytes(
+                                details
+                                    .summary
+                                    .master_blinding_key
+                                    .map(|key| key.to_vec())
+                                    .unwrap_or_default(),
+                            ),
+                        },
+                        OwnedResultMapEntry {
+                            key: "signers".to_string(),
+                            value: OwnedV1Value::Array(
+                                signers
+                                    .iter()
+                                    .map(|signer| {
+                                        OwnedV1Value::Map(multisig_signer_entries(signer))
+                                    })
+                                    .collect(),
+                            ),
+                        },
+                    ]),
+                },
+            ],
+        }
+    }
+
     fn registered_descriptor_details(&self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -368,6 +500,125 @@ fn missing_descriptor_result() -> V1Outcome {
         code: ErrorCode::BadParameters,
         message: "Named descriptor wallet does not exist for this signer".to_string(),
     }
+}
+
+fn missing_multisig_result() -> V1Outcome {
+    V1Outcome::Reject {
+        code: ErrorCode::BadParameters,
+        message: "Named multisig wallet does not exist for this signer".to_string(),
+    }
+}
+
+fn multisig_signer_entries(signer: &MultisigSignerDetails) -> Vec<OwnedResultMapEntry> {
+    vec![
+        OwnedResultMapEntry {
+            key: "fingerprint".to_string(),
+            value: OwnedV1Value::Bytes(signer.fingerprint.to_vec()),
+        },
+        OwnedResultMapEntry {
+            key: "derivation".to_string(),
+            value: owned_u32_array(&signer.derivation),
+        },
+        OwnedResultMapEntry {
+            key: "xpub".to_string(),
+            value: OwnedV1Value::Text(base58ck::encode_check(&signer.xpub)),
+        },
+        OwnedResultMapEntry {
+            key: "path".to_string(),
+            value: owned_u32_array(&signer.path),
+        },
+    ]
+}
+
+fn owned_u32_array(values: &[u32]) -> OwnedV1Value {
+    OwnedV1Value::Array(
+        values
+            .iter()
+            .map(|value| OwnedV1Value::U64((*value).into()))
+            .collect(),
+    )
+}
+
+fn multisig_export_file(multisig_name: &str, details: &MultisigDetails) -> Option<String> {
+    let signers = details.signers.as_ref()?;
+    if signers.iter().any(|signer| !signer.path.is_empty()) {
+        return None;
+    }
+
+    let mut output = String::new();
+    output.push_str("# Exported by Blockstream Jade\n");
+    push_key_value_line(&mut output, "Name", multisig_name);
+    push_key_value_line(
+        &mut output,
+        "Policy",
+        &format!(
+            "{} of {}",
+            details.summary.threshold, details.summary.num_signers
+        ),
+    );
+    push_key_value_line(
+        &mut output,
+        "Format",
+        multisig_export_format(details.summary.variant),
+    );
+    if !details.summary.sorted {
+        push_key_value_line(&mut output, "Sorted", "False");
+    }
+    if let Some(master_blinding_key) = details.summary.master_blinding_key {
+        push_key_value_line(&mut output, "BlindingKey", &hex_lower(&master_blinding_key));
+    }
+    for signer in signers {
+        push_key_value_line(
+            &mut output,
+            "Derivation",
+            &bip32_path_to_string(&signer.derivation),
+        );
+        push_key_value_line(
+            &mut output,
+            &hex_lower(&signer.fingerprint),
+            &base58ck::encode_check(&signer.xpub),
+        );
+    }
+
+    Some(output)
+}
+
+fn multisig_export_format(variant: MultisigVariant) -> &'static str {
+    match variant {
+        MultisigVariant::P2wsh => "P2WSH",
+        MultisigVariant::P2sh => "P2SH",
+        MultisigVariant::P2wshP2sh => "P2SH-P2WSH",
+    }
+}
+
+fn push_key_value_line(output: &mut String, key: &str, value: &str) {
+    output.push_str(key);
+    output.push_str(": ");
+    output.push_str(value);
+    output.push('\n');
+}
+
+fn bip32_path_to_string(path: &[u32]) -> String {
+    let mut output = String::from("m");
+    for value in path {
+        output.push('/');
+        let hardened = value & 0x8000_0000 != 0;
+        output.push_str(&(value & !0x8000_0000).to_string());
+        if hardened {
+            output.push('\'');
+        }
+    }
+    output
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -852,6 +1103,260 @@ mod tests {
                         },
                     ]),
                 }]
+            }
+        );
+    }
+
+    fn current_multisig_payload(path: &[u32]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 0, 1]);
+        payload.push(0);
+        payload.push(1);
+        payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        payload.push(2);
+        payload.extend_from_slice(&(48u32 | 0x8000_0000).to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&[1; BIP32_SERIALIZED_LEN]);
+        payload.push(path.len() as u8);
+        for value in path {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload
+    }
+
+    #[test]
+    fn registered_multisig_detail_requires_valid_params() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("m"),
+            method: Cow::Borrowed("get_registered_multisig"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("bad name")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("m"),
+            method: Cow::Borrowed("get_registered_multisig"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Missing or invalid multisig name parameter".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap()
+            .str("as_file")
+            .unwrap()
+            .str("yes")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("m"),
+            method: Cow::Borrowed("get_registered_multisig"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid as_file parameter".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn registered_multisig_detail_returns_structured_signer_metadata() {
+        let mut emulator = Emulator::new();
+        emulator
+            .storage_mut()
+            .set_multisig_registration(
+                "wallet-a",
+                &authenticated_record(current_multisig_payload(&[3, 1])),
+            )
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("m"),
+            method: Cow::Borrowed("get_registered_multisig"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "multisig_name".to_string(),
+                        value: OwnedV1Value::Text("wallet-a".to_string()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "descriptor".to_string(),
+                        value: OwnedV1Value::Map(vec![
+                            OwnedResultMapEntry {
+                                key: "variant".to_string(),
+                                value: OwnedV1Value::Text("wsh(multi(k))".to_string()),
+                            },
+                            OwnedResultMapEntry {
+                                key: "sorted".to_string(),
+                                value: OwnedV1Value::Bool(false),
+                            },
+                            OwnedResultMapEntry {
+                                key: "threshold".to_string(),
+                                value: OwnedV1Value::U64(1),
+                            },
+                            OwnedResultMapEntry {
+                                key: "master_blinding_key".to_string(),
+                                value: OwnedV1Value::Bytes(vec![]),
+                            },
+                            OwnedResultMapEntry {
+                                key: "signers".to_string(),
+                                value: OwnedV1Value::Array(vec![OwnedV1Value::Map(vec![
+                                    OwnedResultMapEntry {
+                                        key: "fingerprint".to_string(),
+                                        value: OwnedV1Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+                                    },
+                                    OwnedResultMapEntry {
+                                        key: "derivation".to_string(),
+                                        value: OwnedV1Value::Array(vec![
+                                            OwnedV1Value::U64(48u64 | 0x8000_0000),
+                                            OwnedV1Value::U64(0),
+                                        ]),
+                                    },
+                                    OwnedResultMapEntry {
+                                        key: "xpub".to_string(),
+                                        value: OwnedV1Value::Text(base58ck::encode_check(
+                                            &[1; BIP32_SERIALIZED_LEN]
+                                        )),
+                                    },
+                                    OwnedResultMapEntry {
+                                        key: "path".to_string(),
+                                        value: OwnedV1Value::Array(vec![
+                                            OwnedV1Value::U64(3),
+                                            OwnedV1Value::U64(1),
+                                        ]),
+                                    },
+                                ])]),
+                            },
+                        ]),
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn registered_multisig_detail_exports_flat_file() {
+        let mut emulator = Emulator::new();
+        emulator
+            .storage_mut()
+            .set_multisig_registration(
+                "wallet-a",
+                &authenticated_record(current_multisig_payload(&[])),
+            )
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap()
+            .str("as_file")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("m"),
+            method: Cow::Borrowed("get_registered_multisig"),
+            params: Some(&params),
+        };
+
+        let xpub = base58ck::encode_check(&[1; BIP32_SERIALIZED_LEN]);
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::OwnedMapResult {
+                entries: vec![
+                    OwnedResultMapEntry {
+                        key: "multisig_name".to_string(),
+                        value: OwnedV1Value::Text("wallet-a".to_string()),
+                    },
+                    OwnedResultMapEntry {
+                        key: "multisig_file".to_string(),
+                        value: OwnedV1Value::Text(format!(
+                            "# Exported by Blockstream Jade\nName: wallet-a\nPolicy: 1 of 1\nFormat: P2WSH\nSorted: False\nDerivation: m/48'/0\ndeadbeef: {xpub}\n"
+                        )),
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn registered_multisig_detail_rejects_legacy_summary_only_records() {
+        let mut emulator = Emulator::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[2, MultisigVariant::P2wsh as u8, 1, 1, 0]);
+        payload.extend_from_slice(&[0; BIP32_SERIALIZED_LEN]);
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", &authenticated_record(payload))
+            .unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str("wallet-a")
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("m"),
+            method: Cow::Borrowed("get_registered_multisig"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Named multisig too old include detailed signer data".to_string(),
             }
         );
     }

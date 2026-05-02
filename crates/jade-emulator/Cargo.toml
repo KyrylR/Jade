@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base58ck.workspace = true
 jade-core.workspace = true
 jade-protocol-v1.workspace = true
 jade-protocol-v2.workspace = true

@@ -360,6 +360,7 @@ pub enum OwnedV1Value {
     Text(String),
     Bytes(Vec<u8>),
     Map(Vec<OwnedResultMapEntry>),
+    Array(Vec<OwnedV1Value>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +664,50 @@ fn encode_owned_entry(encoder: &mut Encoder<&mut Vec<u8>>, entry: &OwnedResultMa
             }
             encoder
         }
+        OwnedV1Value::Array(values) => {
+            encoder
+                .array(values.len() as u64)
+                .expect("Vec-backed CBOR encoding is infallible");
+            for value in values {
+                encode_owned_value(encoder, value);
+            }
+            encoder
+        }
+    };
+}
+
+fn encode_owned_value(encoder: &mut Encoder<&mut Vec<u8>>, value: &OwnedV1Value) {
+    match value {
+        OwnedV1Value::Bool(value) => encoder
+            .bool(*value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::U64(value) => encoder
+            .u64(*value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::Text(value) => encoder
+            .str(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::Bytes(value) => encoder
+            .bytes(value)
+            .expect("Vec-backed CBOR encoding is infallible"),
+        OwnedV1Value::Map(entries) => {
+            encoder
+                .map(entries.len() as u64)
+                .expect("Vec-backed CBOR encoding is infallible");
+            for entry in entries {
+                encode_owned_entry(encoder, entry);
+            }
+            encoder
+        }
+        OwnedV1Value::Array(values) => {
+            encoder
+                .array(values.len() as u64)
+                .expect("Vec-backed CBOR encoding is infallible");
+            for value in values {
+                encode_owned_value(encoder, value);
+            }
+            encoder
+        }
     };
 }
 
@@ -880,5 +925,45 @@ mod tests {
         assert_eq!(decoder.u64().unwrap(), 2);
         assert_eq!(decoder.str().unwrap(), "sorted");
         assert!(decoder.bool().unwrap());
+    }
+
+    #[test]
+    fn encodes_owned_array_results() {
+        let encoded = encode_owned_map_result(
+            "w",
+            &[OwnedResultMapEntry {
+                key: String::from("signers"),
+                value: OwnedV1Value::Array(vec![
+                    OwnedV1Value::Map(vec![OwnedResultMapEntry {
+                        key: String::from("path"),
+                        value: OwnedV1Value::Array(vec![
+                            OwnedV1Value::U64(1),
+                            OwnedV1Value::U64(2),
+                        ]),
+                    }]),
+                    OwnedV1Value::Map(vec![OwnedResultMapEntry {
+                        key: String::from("path"),
+                        value: OwnedV1Value::Array(vec![]),
+                    }]),
+                ]),
+            }],
+        );
+
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "id");
+        assert_eq!(decoder.str().unwrap(), "w");
+        assert_eq!(decoder.str().unwrap(), "result");
+        assert_eq!(decoder.map().unwrap(), Some(1));
+        assert_eq!(decoder.str().unwrap(), "signers");
+        assert_eq!(decoder.array().unwrap(), Some(2));
+        assert_eq!(decoder.map().unwrap(), Some(1));
+        assert_eq!(decoder.str().unwrap(), "path");
+        assert_eq!(decoder.array().unwrap(), Some(2));
+        assert_eq!(decoder.u64().unwrap(), 1);
+        assert_eq!(decoder.u64().unwrap(), 2);
+        assert_eq!(decoder.map().unwrap(), Some(1));
+        assert_eq!(decoder.str().unwrap(), "path");
+        assert_eq!(decoder.array().unwrap(), Some(0));
     }
 }

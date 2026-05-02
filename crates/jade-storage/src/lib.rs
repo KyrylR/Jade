@@ -82,6 +82,20 @@ pub struct MultisigSummary {
     pub master_blinding_key: Option<[u8; MULTISIG_MASTER_BLINDING_KEY_SIZE]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultisigDetails {
+    pub summary: MultisigSummary,
+    pub signers: Option<Vec<MultisigSignerDetails>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultisigSignerDetails {
+    pub fingerprint: [u8; 4],
+    pub derivation: Vec<u32>,
+    pub xpub: [u8; BIP32_SERIALIZED_LEN],
+    pub path: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MultisigVariant {
@@ -170,6 +184,13 @@ pub fn parse_multisig_summary(
     record: &[u8],
     authenticator: &impl RecordAuthenticator,
 ) -> StorageResult<MultisigSummary> {
+    parse_multisig_details(record, authenticator).map(|details| details.summary)
+}
+
+pub fn parse_multisig_details(
+    record: &[u8],
+    authenticator: &impl RecordAuthenticator,
+) -> StorageResult<MultisigDetails> {
     let payload = authenticated_payload(record, authenticator)?;
     let mut reader = RecordReader::new(payload);
 
@@ -197,25 +218,29 @@ pub fn parse_multisig_summary(
         None
     };
 
-    let num_signers = if version < 3 {
+    let (num_signers, signers) = if version < 3 {
         let remaining_len = reader.remaining().len();
         let num_signers = parse_legacy_multisig_signer_count(reader.remaining())?;
         reader.skip(remaining_len)?;
-        num_signers
+        (num_signers, None)
     } else {
-        parse_current_multisig_signer_count(&mut reader)?
+        let signers = parse_current_multisig_signers(&mut reader)?;
+        (signers.len() as u8, Some(signers))
     };
     if threshold == 0 || threshold > num_signers {
         return Err(StorageError::InvalidRecord);
     }
     reader.finish()?;
 
-    Ok(MultisigSummary {
-        variant,
-        sorted,
-        threshold,
-        num_signers,
-        master_blinding_key,
+    Ok(MultisigDetails {
+        summary: MultisigSummary {
+            variant,
+            sorted,
+            threshold,
+            num_signers,
+            master_blinding_key,
+        },
+        signers,
     })
 }
 
@@ -545,31 +570,41 @@ fn parse_legacy_multisig_signer_count(signer_bytes: &[u8]) -> StorageResult<u8> 
     Ok(num_signers as u8)
 }
 
-fn parse_current_multisig_signer_count(reader: &mut RecordReader<'_>) -> StorageResult<u8> {
+fn parse_current_multisig_signers(
+    reader: &mut RecordReader<'_>,
+) -> StorageResult<Vec<MultisigSignerDetails>> {
     let num_signers = reader.u8()?;
     if num_signers == 0 || num_signers as usize > MAX_ALLOWED_SIGNERS {
         return Err(StorageError::InvalidRecord);
     }
 
+    let mut signers = Vec::with_capacity(num_signers as usize);
     for _ in 0..num_signers {
-        reader.skip(4)?;
+        let fingerprint = reader.array4()?;
 
         let derivation_len = reader.u8()? as usize;
         if derivation_len > MAX_PATH_LEN {
             return Err(StorageError::InvalidRecord);
         }
-        reader.skip(derivation_len * core::mem::size_of::<u32>())?;
+        let derivation = reader.u32_vec(derivation_len)?;
 
-        reader.skip(BIP32_SERIALIZED_LEN)?;
+        let xpub = reader.array78()?;
 
         let path_len = reader.u8()? as usize;
         if path_len > MAX_PATH_LEN {
             return Err(StorageError::InvalidRecord);
         }
-        reader.skip(path_len * core::mem::size_of::<u32>())?;
+        let path = reader.u32_vec(path_len)?;
+
+        signers.push(MultisigSignerDetails {
+            fingerprint,
+            derivation,
+            xpub,
+            path,
+        });
     }
 
-    Ok(num_signers)
+    Ok(signers)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -601,8 +636,33 @@ impl<'a> RecordReader<'a> {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
+    fn u32_le(&mut self) -> StorageResult<u32> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u32_vec(&mut self, len: usize) -> StorageResult<Vec<u32>> {
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(self.u32_le()?);
+        }
+        Ok(values)
+    }
+
+    fn array4(&mut self) -> StorageResult<[u8; 4]> {
+        self.take(4)?
+            .try_into()
+            .map_err(|_| StorageError::InvalidRecord)
+    }
+
     fn array32(&mut self) -> StorageResult<[u8; 32]> {
         self.take(32)?
+            .try_into()
+            .map_err(|_| StorageError::InvalidRecord)
+    }
+
+    fn array78(&mut self) -> StorageResult<[u8; BIP32_SERIALIZED_LEN]> {
+        self.take(BIP32_SERIALIZED_LEN)?
             .try_into()
             .map_err(|_| StorageError::InvalidRecord)
     }
@@ -842,8 +902,8 @@ mod tests {
             payload.extend_from_slice(&(signer as u32).to_le_bytes());
         }
 
-        let summary =
-            parse_multisig_summary(&authenticated_record(payload), &TestAuthenticator).unwrap();
+        let record = authenticated_record(payload);
+        let summary = parse_multisig_summary(&record, &TestAuthenticator).unwrap();
 
         assert_eq!(summary.variant.as_v1_str(), "wsh(multi(k))");
         assert!(summary.sorted);
@@ -853,6 +913,16 @@ mod tests {
             summary.master_blinding_key,
             Some([0x11; MULTISIG_MASTER_BLINDING_KEY_SIZE])
         );
+
+        let details = parse_multisig_details(&record, &TestAuthenticator).unwrap();
+        let signers = details.signers.unwrap();
+        assert_eq!(signers.len(), 3);
+        assert_eq!(signers[0].fingerprint, [0; 4]);
+        assert_eq!(signers[0].derivation, vec![48u32 | 0x8000_0000]);
+        assert_eq!(signers[0].xpub, [0; BIP32_SERIALIZED_LEN]);
+        assert_eq!(signers[0].path, vec![0, 0]);
+        assert_eq!(signers[2].fingerprint, [2; 4]);
+        assert_eq!(signers[2].path, vec![0, 2]);
     }
 
     #[test]
@@ -861,14 +931,18 @@ mod tests {
         payload.extend_from_slice(&[2, MultisigVariant::P2wshP2sh as u8, 0, 1, 0]);
         payload.extend_from_slice(&[0; BIP32_SERIALIZED_LEN * 2]);
 
-        let summary =
-            parse_multisig_summary(&authenticated_record(payload), &TestAuthenticator).unwrap();
+        let record = authenticated_record(payload);
+        let summary = parse_multisig_summary(&record, &TestAuthenticator).unwrap();
 
         assert_eq!(summary.variant.as_v1_str(), "sh(wsh(multi(k)))");
         assert!(!summary.sorted);
         assert_eq!(summary.threshold, 1);
         assert_eq!(summary.num_signers, 2);
         assert_eq!(summary.master_blinding_key, None);
+
+        let details = parse_multisig_details(&record, &TestAuthenticator).unwrap();
+        assert_eq!(details.summary, summary);
+        assert_eq!(details.signers, None);
     }
 
     #[test]
