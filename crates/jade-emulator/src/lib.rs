@@ -5571,6 +5571,114 @@ mod tests {
     }
 
     #[test]
+    fn sign_tx_staged_flow_signs_anti_exfil_singlesig_inputs() {
+        let fixtures = [
+            (
+                include_str!("../../../test_data/tx_ss_p2pkh.json"),
+                false,
+                &[
+                    &[2_147_483_692, 2_147_483_649, 2_147_483_648, 0, 3][..],
+                    &[2_147_483_692, 2_147_483_649, 2_147_483_648, 0, 2][..],
+                ][..],
+            ),
+            (
+                include_str!("../../../test_data/tx_ss_p2wpkh.json"),
+                true,
+                &[
+                    &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 2][..],
+                    &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 1][..],
+                ][..],
+            ),
+            (
+                include_str!("../../../test_data/tx_ss_p2sh_p2wpkh.json"),
+                true,
+                &[
+                    &[2_147_483_697, 2_147_483_649, 2_147_483_648, 0, 2][..],
+                    &[2_147_483_697, 2_147_483_649, 2_147_483_648, 0, 1][..],
+                ][..],
+            ),
+        ];
+
+        for (fixture, is_witness, paths) in fixtures {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let scripts: Vec<_> = fixture_hex_values(fixture, "script")
+                .into_iter()
+                .map(decode_hex_vec)
+                .collect();
+            let input_txs: Vec<_> = fixture_hex_values(fixture, "input_tx")
+                .into_iter()
+                .map(decode_hex_vec)
+                .collect();
+            let host_commitments: Vec<_> = fixture_hex_values(fixture, "ae_host_commitment")
+                .into_iter()
+                .map(decode_hex)
+                .collect();
+            let host_entropies: Vec<_> = fixture_hex_values(fixture, "ae_host_entropy")
+                .into_iter()
+                .map(decode_hex)
+                .collect();
+            let expected = fixture_expected_output_signatures(fixture);
+            assert_eq!(paths.len(), scripts.len());
+            assert_eq!(paths.len(), input_txs.len());
+            assert_eq!(paths.len(), host_commitments.len());
+            assert_eq!(paths.len(), host_entropies.len());
+            assert_eq!(paths.len() * 2, expected.len());
+
+            let start_params = sign_tx_start_params(&txn, paths.len() as u64, true);
+            let start_request = Request {
+                id: Cow::Borrowed("tx"),
+                method: Cow::Borrowed("sign_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            for index in 0..paths.len() {
+                let input_params = sign_tx_input_params_with_ae(
+                    is_witness,
+                    paths[index],
+                    &scripts[index],
+                    None,
+                    Some(&input_txs[index]),
+                    &host_commitments[index],
+                );
+                let input_request = Request {
+                    id: Cow::Borrowed("input"),
+                    method: Cow::Borrowed("tx_input"),
+                    params: Some(&input_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&input_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index * 2])
+                    }
+                );
+            }
+
+            for index in 0..paths.len() {
+                let signature_params = get_signature_params_with_entropy(&host_entropies[index]);
+                let signature_request = Request {
+                    id: Cow::Borrowed("sig"),
+                    method: Cow::Borrowed("get_signature"),
+                    params: Some(&signature_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&signature_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index * 2 + 1])
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sign_tx_staged_flow_signs_anti_exfil_legacy_p2pkh_inputs() {
         let mut emulator = Emulator::new();
         emulator

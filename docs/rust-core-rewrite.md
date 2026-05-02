@@ -126,12 +126,13 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures, and rejects non-empty
   Taproot anti-exfil host commitments with the v1-compatible error. Non-Taproot
   Bitcoin anti-exfil `sign_tx` now returns signer commitments from `tx_input`
-  and DER signatures from `get_signature`, matching the P2WSH and multi-input
-  legacy P2PKH anti-exfil fixtures, including empty responses for pathless
-  inputs. Bad anti-exfil host-entropy lengths now return the v1-compatible
-  protocol error before the commitment/entropy consistency check. PSBT
-  anti-exfil, Taproot anti-exfil signing, registered/generic multisig policy
-  validation, and Liquid `sign_liquid_tx` remain explicit defers.
+  and DER signatures from `get_signature`, matching P2PKH, P2WPKH,
+  P2SH-P2WPKH, P2WSH, and multi-input legacy P2PKH anti-exfil fixtures,
+  including empty responses for pathless inputs. Bad anti-exfil host-entropy
+  lengths now return the v1-compatible protocol error before the
+  commitment/entropy consistency check. PSBT anti-exfil, Taproot anti-exfil
+  signing, registered/generic multisig policy validation, and Liquid
+  `sign_liquid_tx` remain explicit defers.
 
 ## First Parity Gates
 
