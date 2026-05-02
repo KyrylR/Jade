@@ -89,7 +89,10 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   injection.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
   BIP85 RSA validation boundary, P-256 identity pubkey/sign/ECDH, OTP storage,
-  and legacy message signing.
+  and legacy plus anti-exfil message signing. Message anti-exfil now implements
+  host commitment validation, signer commitment generation, and the
+  `get_signature` continuation using pure-Rust sign-to-contract secp256k1
+  primitives matched against libsecp/Jade vectors.
 - Wallet registration and enumeration: current/legacy multisig records,
   multisig setup-file import/export, descriptor registration for Bitcoin
   networks, and registered wallet listing/details.
@@ -120,9 +123,11 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   behavior for unowned inputs and signs Green 2-of-2, Green 2-of-3, CSV, and
   multi-input Green multisig witness-script fixtures, including low-R ECDSA
   grinding compatible with libwally. Taproot key-path `sign_tx` signs
-  SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures. Real anti-exfil signatures,
-  registered/generic multisig policy validation, and Liquid `sign_liquid_tx`
-  remain explicit defers.
+  SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures. Non-Taproot Bitcoin
+  anti-exfil `sign_tx` now returns signer commitments from `tx_input` and DER
+  signatures from `get_signature`, matching the P2WSH anti-exfil fixture.
+  PSBT anti-exfil, Taproot anti-exfil, registered/generic multisig policy
+  validation, and Liquid `sign_liquid_tx` remain explicit defers.
 
 ## First Parity Gates
 

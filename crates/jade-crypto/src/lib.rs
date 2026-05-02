@@ -751,7 +751,7 @@ pub mod pure_rust {
     use k256::ecdsa::hazmat::{bits2field, SignPrimitive};
     use k256::ecdsa::signature::hazmat::PrehashSigner;
     use k256::ecdsa::SigningKey as K256SigningKey;
-    use k256::elliptic_curve::{bigint::U256, ops::Reduce, sec1::ToEncodedPoint};
+    use k256::elliptic_curve::{bigint::U256, ff::PrimeField, ops::Reduce, sec1::ToEncodedPoint};
     use k256::schnorr::SigningKey as K256SchnorrSigningKey;
     use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey};
     pub use p256;
@@ -761,6 +761,7 @@ pub mod pure_rust {
         PublicKey as P256PublicKey, Scalar as P256Scalar, SecretKey as P256SecretKey,
     };
     use sha2::{Digest, Sha256, Sha512};
+    use zeroize::Zeroize;
 
     type HmacSha256 = Hmac<Sha256>;
     type HmacSha512 = Hmac<Sha512>;
@@ -818,6 +819,36 @@ pub mod pure_rust {
         recoverable[0] = 27 + recid.to_byte() + 4;
         recoverable[1..].copy_from_slice(signature.to_bytes().as_ref());
         Some(super::base64_encode(&recoverable))
+    }
+
+    pub fn anti_exfil_host_commitment(host_entropy: &[u8; SHA256_LEN]) -> [u8; SHA256_LEN] {
+        tagged_hash(b"s2c/ecdsa/data", host_entropy)
+    }
+
+    pub fn anti_exfil_signer_commitment_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        digest: &[u8; SHA256_LEN],
+        host_commitment: &[u8; SHA256_LEN],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let private_key = private_key_from_seed_path(seed, path)?;
+        anti_exfil_signer_commitment_from_private_key(&private_key, digest, host_commitment)
+    }
+
+    pub fn sign_bitcoin_message_anti_exfil_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        message: &[u8],
+        host_entropy: &[u8; SHA256_LEN],
+    ) -> Option<String> {
+        if path.is_empty() {
+            return None;
+        }
+
+        let message_hash = super::bitcoin_message_hash(message)?;
+        let signature =
+            sign_digest_anti_exfil_compact_from_seed(seed, path, &message_hash, host_entropy)?;
+        Some(super::base64_encode(&signature))
     }
 
     pub fn sign_bitcoin_psbt_singlesig_from_seed(
@@ -1152,6 +1183,85 @@ pub mod pure_rust {
         }
 
         Ok(signatures)
+    }
+
+    pub fn bitcoin_tx_anti_exfil_signer_commitment_from_seed(
+        txn: &[u8],
+        seed: &[u8],
+        signing_input: &BitcoinTxSignInput<'_>,
+        host_commitment: &[u8; SHA256_LEN],
+    ) -> Result<Vec<u8>, TxSignError> {
+        let digest = bitcoin_tx_ecdsa_sighash(txn, signing_input)?;
+        anti_exfil_signer_commitment_from_seed(seed, signing_input.path, &digest, host_commitment)
+            .map(|commitment| commitment.to_vec())
+            .ok_or(TxSignError::Unsupported)
+    }
+
+    pub fn sign_bitcoin_tx_anti_exfil_from_seed(
+        txn: &[u8],
+        seed: &[u8],
+        signing_input: &BitcoinTxSignInput<'_>,
+        host_entropy: &[u8; SHA256_LEN],
+    ) -> Result<Vec<u8>, TxSignError> {
+        let digest = bitcoin_tx_ecdsa_sighash(txn, signing_input)?;
+        let signature = sign_digest_anti_exfil_compact_from_seed(
+            seed,
+            signing_input.path,
+            &digest,
+            host_entropy,
+        )
+        .ok_or(TxSignError::Unsupported)?;
+        let signature = k256::ecdsa::Signature::try_from(signature.as_slice())
+            .map_err(|_| TxSignError::Unsupported)?;
+        let mut output = signature.to_der().as_bytes().to_vec();
+        output.push(signing_input.sighash as u8);
+        Ok(output)
+    }
+
+    fn bitcoin_tx_ecdsa_sighash(
+        txn: &[u8],
+        signing_input: &BitcoinTxSignInput<'_>,
+    ) -> Result<[u8; SHA256_LEN], TxSignError> {
+        let tx = bitcoin_transaction_view(txn).ok_or(TxSignError::Invalid)?;
+        if signing_input.path.is_empty()
+            || signing_input.script_code.is_empty()
+            || signing_input.tx_input_index >= tx.inputs.len()
+        {
+            return Err(TxSignError::Invalid);
+        }
+        if signing_input.sighash != 1 {
+            return Err(TxSignError::Unsupported);
+        }
+        if is_p2tr_script_pubkey(signing_input.script_code) {
+            return Err(TxSignError::Unsupported);
+        }
+        let sighash_tx = SighashTx {
+            version: tx.version,
+            lock_time: tx.lock_time,
+            inputs: &tx.inputs,
+            outputs: &tx.outputs,
+        };
+        if signing_input.is_witness {
+            let amount = signing_input.satoshi.ok_or(TxSignError::Invalid)?;
+            Ok(segwit_v0_sighash_all(
+                sighash_tx.version,
+                sighash_tx.lock_time,
+                sighash_tx.inputs,
+                sighash_tx.outputs,
+                signing_input.tx_input_index,
+                signing_input.script_code,
+                amount,
+            ))
+        } else {
+            Ok(legacy_sighash_all(
+                sighash_tx.version,
+                sighash_tx.lock_time,
+                sighash_tx.inputs,
+                sighash_tx.outputs,
+                signing_input.tx_input_index,
+                signing_input.script_code,
+            ))
+        }
     }
 
     fn taproot_prev_outputs<'a>(
@@ -1789,6 +1899,218 @@ pub mod pure_rust {
             extra_entropy = [0u8; 32];
             extra_entropy[..4].copy_from_slice(&counter.to_le_bytes());
         }
+    }
+
+    pub(crate) fn sign_digest_anti_exfil_compact_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        digest: &[u8; SHA256_LEN],
+        host_entropy: &[u8; SHA256_LEN],
+    ) -> Option<[u8; 64]> {
+        let private_key = private_key_from_seed_path(seed, path)?;
+        sign_digest_anti_exfil_compact_from_private_key(&private_key, digest, host_entropy)
+    }
+
+    fn sign_digest_anti_exfil_compact_from_private_key(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        digest: &[u8; SHA256_LEN],
+        host_entropy: &[u8; SHA256_LEN],
+    ) -> Option<[u8; 64]> {
+        let secret = SecretKey::from_slice(private_key).ok()?;
+        let secret_scalar = *secret.to_nonzero_scalar().as_ref();
+        let nonce_data = anti_exfil_host_commitment(host_entropy);
+        let z = bits2field::<k256::Secp256k1>(digest).ok()?;
+
+        let mut counter = 0u32;
+        loop {
+            let nonce =
+                rfc6979_secp256k1_nonce_scalar(private_key, digest, Some(&nonce_data), counter)?;
+            let opening = public_key_from_scalar(&nonce)?;
+            let tweak = s2c_point_tweak(&opening, host_entropy)?;
+            let tweaked_nonce = nonce + tweak;
+            if bool::from(tweaked_nonce.is_zero()) {
+                return None;
+            }
+
+            match secret_scalar.try_sign_prehashed::<Scalar>(tweaked_nonce, &z) {
+                Ok((signature, _)) => {
+                    let bytes = signature.to_bytes();
+                    let mut output = [0u8; 64];
+                    output.copy_from_slice(&bytes);
+                    return Some(output);
+                }
+                Err(_) => {
+                    counter = counter.checked_add(1)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn anti_exfil_signer_commitment_from_private_key(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        digest: &[u8; SHA256_LEN],
+        host_commitment: &[u8; SHA256_LEN],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        SecretKey::from_slice(private_key).ok()?;
+
+        let mut counter = 0u32;
+        loop {
+            let nonce = rfc6979_secp256k1_nonce_scalar(
+                private_key,
+                digest,
+                Some(host_commitment),
+                counter,
+            )?;
+            if let Some(public_key) = public_key_from_scalar(&nonce) {
+                return Some(public_key);
+            }
+            counter = counter.checked_add(1)?;
+        }
+    }
+
+    fn rfc6979_secp256k1_nonce_scalar(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        digest: &[u8; SHA256_LEN],
+        extra_data: Option<&[u8; SHA256_LEN]>,
+        counter: u32,
+    ) -> Option<Scalar> {
+        let mut nonce = rfc6979_secp256k1_nonce_bytes(private_key, digest, extra_data, counter);
+        let scalar =
+            scalar_from_bytes_strict(&nonce).filter(|scalar| !bool::from(scalar.is_zero()));
+        nonce.zeroize();
+        scalar
+    }
+
+    fn rfc6979_secp256k1_nonce_bytes(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        digest: &[u8; SHA256_LEN],
+        extra_data: Option<&[u8; SHA256_LEN]>,
+        counter: u32,
+    ) -> [u8; SHA256_LEN] {
+        let digest_bytes: FieldBytes = (*digest).into();
+        let msg_scalar = <Scalar as Reduce<U256>>::reduce_bytes(&digest_bytes);
+        let msgmod32 = msg_scalar.to_repr();
+
+        let mut keydata = [0u8; SHA256_LEN * 3];
+        let mut offset = 0usize;
+        keydata[offset..offset + SHA256_LEN].copy_from_slice(private_key);
+        offset += SHA256_LEN;
+        keydata[offset..offset + SHA256_LEN].copy_from_slice(&msgmod32);
+        offset += SHA256_LEN;
+        if let Some(extra_data) = extra_data {
+            keydata[offset..offset + SHA256_LEN].copy_from_slice(extra_data);
+            offset += SHA256_LEN;
+        }
+
+        let mut rng = Rfc6979HmacSha256::new(&keydata[..offset]);
+        keydata.zeroize();
+
+        let mut nonce = [0u8; SHA256_LEN];
+        for _ in 0..=counter {
+            nonce = rng.generate_32();
+        }
+        rng.zeroize();
+        nonce
+    }
+
+    struct Rfc6979HmacSha256 {
+        k: [u8; SHA256_LEN],
+        v: [u8; SHA256_LEN],
+        retry: bool,
+    }
+
+    impl Rfc6979HmacSha256 {
+        fn new(keydata: &[u8]) -> Self {
+            let mut rng = Self {
+                k: [0u8; SHA256_LEN],
+                v: [1u8; SHA256_LEN],
+                retry: false,
+            };
+
+            rng.k = hmac_sha256_concat(&rng.k, &[&rng.v, &[0x00], keydata]);
+            rng.v = hmac_sha256_concat(&rng.k, &[&rng.v]);
+            rng.k = hmac_sha256_concat(&rng.k, &[&rng.v, &[0x01], keydata]);
+            rng.v = hmac_sha256_concat(&rng.k, &[&rng.v]);
+            rng
+        }
+
+        fn generate_32(&mut self) -> [u8; SHA256_LEN] {
+            if self.retry {
+                self.k = hmac_sha256_concat(&self.k, &[&self.v, &[0x00]]);
+                self.v = hmac_sha256_concat(&self.k, &[&self.v]);
+            }
+
+            self.v = hmac_sha256_concat(&self.k, &[&self.v]);
+            self.retry = true;
+            self.v
+        }
+    }
+
+    impl Zeroize for Rfc6979HmacSha256 {
+        fn zeroize(&mut self) {
+            self.k.zeroize();
+            self.v.zeroize();
+            self.retry = false;
+        }
+    }
+
+    fn hmac_sha256_concat(key: &[u8; SHA256_LEN], parts: &[&[u8]]) -> [u8; SHA256_LEN] {
+        let mut hmac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        for part in parts {
+            hmac.update(part);
+        }
+        hmac.finalize().into_bytes().into()
+    }
+
+    fn public_key_from_scalar(scalar: &Scalar) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let public_point = (ProjectivePoint::GENERATOR * scalar).to_affine();
+        if bool::from(
+            k256::elliptic_curve::group::prime::PrimeCurveAffine::is_identity(&public_point),
+        ) {
+            return None;
+        }
+        public_point
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .ok()
+    }
+
+    fn s2c_point_tweak(
+        opening: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        data: &[u8; SHA256_LEN],
+    ) -> Option<Scalar> {
+        let mut preimage = Vec::with_capacity(EC_PUBLIC_KEY_COMPRESSED_LEN + SHA256_LEN);
+        preimage.extend_from_slice(opening);
+        preimage.extend_from_slice(data);
+        let tweak = tagged_hash(b"s2c/ecdsa/point", &preimage);
+        scalar_from_bytes_strict(&tweak)
+    }
+
+    fn scalar_from_bytes_strict(bytes: &[u8; SHA256_LEN]) -> Option<Scalar> {
+        Scalar::from_repr((*bytes).into()).into()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn anti_exfil_verify_commitment(
+        signature: &[u8; 64],
+        host_entropy: &[u8; SHA256_LEN],
+        opening: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<bool> {
+        let r_bytes: [u8; SHA256_LEN] = signature[..SHA256_LEN].try_into().ok()?;
+        let signature_r = scalar_from_bytes_strict(&r_bytes)?;
+        let opening_pubkey = PublicKey::from_sec1_bytes(opening).ok()?;
+        let opening_point = ProjectivePoint::from(*opening_pubkey.as_affine());
+        let tweak = s2c_point_tweak(opening, host_entropy)?;
+        let committed = (opening_point + ProjectivePoint::GENERATOR * tweak).to_affine();
+        if bool::from(k256::elliptic_curve::group::prime::PrimeCurveAffine::is_identity(&committed))
+        {
+            return None;
+        }
+        let encoded = committed.to_encoded_point(true);
+        let x_bytes: [u8; SHA256_LEN] = encoded.as_bytes()[1..].try_into().ok()?;
+        let committed_r = <Scalar as Reduce<U256>>::reduce_bytes(&x_bytes.into());
+        Some(signature_r == committed_r)
     }
 
     fn sign_taproot_key_spend_from_seed(
@@ -3127,6 +3449,87 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn anti_exfil_signer_commitment_matches_secp256k1_s2c_vectors() {
+        let private_key = [0x55; EC_PRIVATE_KEY_LEN];
+        let digest = [0x88; SHA256_LEN];
+
+        for (host_commitment, expected_opening) in [
+            (
+                "1bf6fb42f41eb876c4d7aa0d67242b00baab99dc2084493e4e63277fa1f77f22",
+                "02df63755d1f3292bffed82986b106497c93b1f8bdc0454b6b0b0a4779c0ef7188",
+            ),
+            (
+                "35199a8fbf84ad6ef69a184c1b19285befbe06e60b6264e6d373893f6855e24a",
+                "02c04ac7f771e8ebdbf315ff5e58b7fe9516102103500066172c4fac5b20f9e0ea",
+            ),
+        ] {
+            assert_eq!(
+                pure_rust::anti_exfil_signer_commitment_from_private_key(
+                    &private_key,
+                    &digest,
+                    &decode_hex_32(host_commitment)
+                )
+                .unwrap(),
+                decode_hex_33(expected_opening)
+            );
+        }
+    }
+
+    #[test]
+    fn anti_exfil_message_signatures_match_jade_fixture() {
+        let seed = decode_hex_64(
+            "f1d56befd46eddfc31cda129dc76cd4a2b41d2cf86f10a5ccf0787617afa3869\
+             967aab0224742ccc002056747ea09b68598ddf79c027c37a7c3ec923004593da",
+        );
+        let path = [1u32, 2, 3];
+        let message = b"Message to test Anti-Exfil signatures work as expected.";
+        let message_hash = bitcoin_message_hash(message).unwrap();
+        let host_commitment =
+            decode_hex_32("953c84f6fc33c14938899b1ecca09c6a3848951fbd48b472004d4377b73b7046");
+        let host_entropy =
+            decode_hex_32("c2e58dc572a47c579f539cfb8dc09501c128d193919fef8945199b12ce778c89");
+        let signer_commitment =
+            decode_hex_33("020a5522522ffa999669e140095d40eb6e7fd047375654ce589ce83b6786c3eea7");
+
+        assert_eq!(
+            pure_rust::anti_exfil_host_commitment(&host_entropy),
+            host_commitment
+        );
+        assert_eq!(
+            pure_rust::anti_exfil_signer_commitment_from_seed(
+                &seed,
+                &path,
+                &message_hash,
+                &host_commitment
+            )
+            .unwrap(),
+            signer_commitment
+        );
+        assert_eq!(
+            pure_rust::sign_bitcoin_message_anti_exfil_from_seed(
+                &seed,
+                &path,
+                message,
+                &host_entropy
+            )
+            .unwrap(),
+            "ewh7wY10jyK3C5xyqtedw6zOKM3wYp5PDo6s6jLvFos+pMD7pdnFekTCBC9jnvLOnFd58JGw85MuXUvMcb3IbA=="
+        );
+
+        let signature = pure_rust::sign_digest_anti_exfil_compact_from_seed(
+            &seed,
+            &path,
+            &message_hash,
+            &host_entropy,
+        )
+        .unwrap();
+        assert_eq!(
+            pure_rust::anti_exfil_verify_commitment(&signature, &host_entropy, &signer_commitment),
+            Some(true)
+        );
     }
 
     #[test]

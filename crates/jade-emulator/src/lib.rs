@@ -33,6 +33,7 @@ pub struct Emulator {
     storage: JadeStorage<MemoryStorage>,
     ota: Option<HostOtaSession>,
     sign_tx: Option<BitcoinSignTxSession>,
+    sign_message_ae: Option<BitcoinSignMessageAeSession>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,12 @@ struct BitcoinSignTxSession {
     inputs: Vec<BitcoinTxInputParams>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BitcoinSignMessageAeSession {
+    message: Vec<u8>,
+    path: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BitcoinSignTxFlow {
     Legacy,
@@ -69,6 +76,7 @@ impl Default for Emulator {
             storage: JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT),
             ota: None,
             sign_tx: None,
+            sign_message_ae: None,
         }
     }
 }
@@ -178,6 +186,8 @@ impl Emulator {
                         self.state = CoreState::default();
                         self.platform.clear_debug_wallet();
                         self.ota = None;
+                        self.sign_tx = None;
+                        self.sign_message_ae = None;
                         V1Outcome::BoolResult { result: true }
                     }
                     Err(_) => V1Outcome::Reject {
@@ -1471,7 +1481,7 @@ impl Emulator {
         }
     }
 
-    fn sign_message_result(&self, request: &Request<'_>) -> V1Outcome {
+    fn sign_message_result(&mut self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
@@ -1497,12 +1507,48 @@ impl Emulator {
                 return bad_parameters("Failed to extract valid path from parameters")
             }
         };
+        let message_hash = match jade_crypto::bitcoin_message_hash(message.as_bytes()) {
+            Some(hash) => hash,
+            None => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to convert message to btc hex format".to_string(),
+                };
+            }
+        };
 
         if params.contains("ae_host_commitment").unwrap_or(false) {
             match params.bytes("ae_host_commitment") {
                 Ok(Some(commitment)) if commitment.len() == 32 => {
-                    return V1Outcome::DeferredToCore {
-                        method: "sign_message anti-exfil".to_string(),
+                    let host_commitment: [u8; jade_crypto::SHA256_LEN] =
+                        commitment.try_into().expect("checked commitment length");
+                    let Some(seed) = self.platform.wallet_seed() else {
+                        return V1Outcome::Reject {
+                            code: ErrorCode::InternalError,
+                            message: "Wallet seed is not available".to_string(),
+                        };
+                    };
+                    let signer_commitment =
+                        match jade_crypto::pure_rust::anti_exfil_signer_commitment_from_seed(
+                            seed,
+                            &path,
+                            &message_hash,
+                            &host_commitment,
+                        ) {
+                            Some(commitment) => commitment,
+                            None => {
+                                return V1Outcome::Reject {
+                                    code: ErrorCode::InternalError,
+                                    message: "Failed to make ae signer commitment".to_string(),
+                                };
+                            }
+                        };
+                    self.sign_message_ae = Some(BitcoinSignMessageAeSession {
+                        message: message.as_bytes().to_vec(),
+                        path,
+                    });
+                    return V1Outcome::BytesResult {
+                        result: signer_commitment.to_vec(),
                     };
                 }
                 Ok(_) | Err(_) => {
@@ -1513,6 +1559,7 @@ impl Emulator {
             }
         }
 
+        self.sign_message_ae = None;
         self.sign_message_bytes(message.as_bytes(), &path)
     }
 
@@ -2019,13 +2066,32 @@ impl Emulator {
                 message: "Too many tx_input messages".to_string(),
             };
         }
-        if input.uses_ae {
-            return V1Outcome::DeferredToCore {
-                method: "sign_tx anti-exfil flow".to_string(),
-            };
-        }
-
         let tx_input_index = session.received_inputs;
+        let ae_signer_commitment = if let Some(host_commitment) = input.ae_host_commitment.as_ref()
+        {
+            if session.flow != BitcoinSignTxFlow::Staged {
+                return bad_parameters("Failed to extract valid host commitment from parameters");
+            }
+            match bitcoin_tx_signer_commitment(
+                &session.txn,
+                seed,
+                tx_input_index,
+                &input,
+                host_commitment,
+            ) {
+                Ok(commitment) => commitment,
+                Err(jade_crypto::TxSignError::Invalid) => {
+                    return bad_parameters("Failed to extract tx input from parameters");
+                }
+                Err(jade_crypto::TxSignError::Unsupported) => {
+                    return V1Outcome::DeferredToCore {
+                        method: "sign_tx signing".to_string(),
+                    };
+                }
+            }
+        } else {
+            Vec::new()
+        };
         session.received_inputs += 1;
 
         match session.flow {
@@ -2049,12 +2115,18 @@ impl Emulator {
             }
             BitcoinSignTxFlow::Staged => {
                 session.inputs.push(input);
-                V1Outcome::BytesResult { result: Vec::new() }
+                V1Outcome::BytesResult {
+                    result: ae_signer_commitment,
+                }
             }
         }
     }
 
     fn get_signature_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        if self.sign_tx.is_none() && self.sign_message_ae.is_some() {
+            return self.get_message_signature_result(request);
+        }
+
         let Some(session) = self.sign_tx.as_ref() else {
             return V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
@@ -2084,11 +2156,6 @@ impl Emulator {
                 };
             }
         };
-        if ae_host_entropy.is_some_and(|entropy| !entropy.is_empty()) {
-            return V1Outcome::DeferredToCore {
-                method: "sign_tx anti-exfil flow".to_string(),
-            };
-        }
         let Some(seed) = self.platform.wallet_seed() else {
             return V1Outcome::Reject {
                 code: ErrorCode::InternalError,
@@ -2100,22 +2167,73 @@ impl Emulator {
             .as_mut()
             .expect("checked active sign_tx session");
         let signature_index = session.next_signature;
-        let signatures = match sign_bitcoin_tx_inputs(&session.txn, seed, &session.inputs) {
-            Ok(signatures) => signatures,
-            Err(jade_crypto::TxSignError::Invalid) => {
-                return bad_parameters("Failed to extract tx input from parameters");
-            }
-            Err(jade_crypto::TxSignError::Unsupported) => {
-                return V1Outcome::DeferredToCore {
-                    method: "sign_tx signing".to_string(),
-                };
-            }
-        };
-        let Some(signature) = signatures.get(signature_index).cloned() else {
+        let Some(input) = session.inputs.get(signature_index).cloned() else {
             return V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string(),
             };
+        };
+        let signature = if input.path.is_none() {
+            Vec::new()
+        } else if input.ae_host_commitment.is_some() {
+            let host_entropy = match ae_host_entropy {
+                Some(entropy) if entropy.len() == jade_crypto::SHA256_LEN => {
+                    let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                    bytes.copy_from_slice(entropy);
+                    bytes
+                }
+                _ => {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::ProtocolError,
+                        message:
+                            "Failed to extract valid host commitment and entropy from parameters"
+                                .to_string(),
+                    };
+                }
+            };
+            match sign_bitcoin_tx_input_anti_exfil(
+                &session.txn,
+                seed,
+                signature_index,
+                &input,
+                &host_entropy,
+            ) {
+                Ok(signature) => signature,
+                Err(jade_crypto::TxSignError::Invalid) => {
+                    return bad_parameters("Failed to extract tx input from parameters");
+                }
+                Err(jade_crypto::TxSignError::Unsupported) => {
+                    return V1Outcome::DeferredToCore {
+                        method: "sign_tx signing".to_string(),
+                    };
+                }
+            }
+        } else {
+            if ae_host_entropy.is_some_and(|entropy| !entropy.is_empty()) {
+                return V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Failed to extract valid host commitment and entropy from parameters"
+                        .to_string(),
+                };
+            }
+            let signatures = match sign_bitcoin_tx_inputs(&session.txn, seed, &session.inputs) {
+                Ok(signatures) => signatures,
+                Err(jade_crypto::TxSignError::Invalid) => {
+                    return bad_parameters("Failed to extract tx input from parameters");
+                }
+                Err(jade_crypto::TxSignError::Unsupported) => {
+                    return V1Outcome::DeferredToCore {
+                        method: "sign_tx signing".to_string(),
+                    };
+                }
+            };
+            let Some(signature) = signatures.get(signature_index).cloned() else {
+                return V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Unexpected method".to_string(),
+                };
+            };
+            signature
         };
         session.next_signature += 1;
         if session.next_signature == session.expected_inputs {
@@ -2123,6 +2241,52 @@ impl Emulator {
         }
 
         V1Outcome::BytesResult { result: signature }
+    }
+
+    fn get_message_signature_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            self.sign_message_ae = None;
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let host_entropy = match params.bytes("ae_host_entropy") {
+            Ok(Some(entropy)) if entropy.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(entropy);
+                bytes
+            }
+            Ok(_) | Err(_) => {
+                self.sign_message_ae = None;
+                return bad_parameters("Failed to extract host entropy from parameters");
+            }
+        };
+        let Some(session) = self.sign_message_ae.take() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Wallet seed is not available".to_string(),
+            };
+        };
+
+        match jade_crypto::pure_rust::sign_bitcoin_message_anti_exfil_from_seed(
+            seed,
+            &session.path,
+            &session.message,
+            &host_entropy,
+        ) {
+            Some(result) => V1Outcome::TextResult { result },
+            None => V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to sign message".to_string(),
+            },
+        }
     }
 
     fn sign_psbt_result(&self, request: &Request<'_>) -> V1Outcome {
@@ -3142,7 +3306,7 @@ struct BitcoinTxInputParams {
     is_witness: bool,
     satoshi: Option<u64>,
     input_tx: Option<Vec<u8>>,
-    uses_ae: bool,
+    ae_host_commitment: Option<[u8; jade_crypto::SHA256_LEN]>,
 }
 
 fn parse_bitcoin_tx_input_params(
@@ -3180,17 +3344,21 @@ fn parse_bitcoin_tx_input_params(
         Ok(Some(_)) | Ok(None) => None,
         Err(()) => return Err("Failed to extract input_tx from parameters"),
     };
-    let uses_ae = if path.is_some() {
+    let ae_host_commitment = if path.is_some() {
         match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
-            Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
-            Ok(Some(commitment)) if commitment.is_empty() => false,
+            Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(commitment);
+                Some(bytes)
+            }
+            Ok(Some(commitment)) if commitment.is_empty() => None,
             Ok(Some(_)) | Err(()) => {
                 return Err("Failed to extract valid host commitment from parameters")
             }
-            Ok(None) => false,
+            Ok(None) => None,
         }
     } else {
-        false
+        None
     };
 
     Ok(BitcoinTxInputParams {
@@ -3200,7 +3368,7 @@ fn parse_bitcoin_tx_input_params(
         is_witness,
         satoshi,
         input_tx,
-        uses_ae,
+        ae_host_commitment,
     })
 }
 
@@ -3216,6 +3384,42 @@ fn sign_bitcoin_tx_input(
     let mut signatures =
         jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &[signing_input])?;
     Ok(signatures.remove(0))
+}
+
+fn bitcoin_tx_signer_commitment(
+    txn: &[u8],
+    seed: &[u8],
+    tx_input_index: usize,
+    input: &BitcoinTxInputParams,
+    host_commitment: &[u8; jade_crypto::SHA256_LEN],
+) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let Some(signing_input) = bitcoin_tx_sign_input(txn, tx_input_index, input)? else {
+        return Ok(Vec::new());
+    };
+    jade_crypto::pure_rust::bitcoin_tx_anti_exfil_signer_commitment_from_seed(
+        txn,
+        seed,
+        &signing_input,
+        host_commitment,
+    )
+}
+
+fn sign_bitcoin_tx_input_anti_exfil(
+    txn: &[u8],
+    seed: &[u8],
+    tx_input_index: usize,
+    input: &BitcoinTxInputParams,
+    host_entropy: &[u8; jade_crypto::SHA256_LEN],
+) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let Some(signing_input) = bitcoin_tx_sign_input(txn, tx_input_index, input)? else {
+        return Ok(Vec::new());
+    };
+    jade_crypto::pure_rust::sign_bitcoin_tx_anti_exfil_from_seed(
+        txn,
+        seed,
+        &signing_input,
+        host_entropy,
+    )
 }
 
 fn sign_bitcoin_tx_inputs(
@@ -3234,8 +3438,7 @@ fn sign_bitcoin_tx_inputs(
     if signing_inputs.is_empty() {
         return Ok(vec![Vec::new(); inputs.len()]);
     }
-    let signatures =
-        jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &signing_inputs)?;
+    let signatures = jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &signing_inputs)?;
     if signatures.len() != signing_indexes.len() {
         return Err(jade_crypto::TxSignError::Invalid);
     }
@@ -4882,6 +5085,65 @@ mod tests {
         params
     }
 
+    fn sign_tx_input_params_with_ae(
+        is_witness: bool,
+        path: &[u32],
+        script: &[u8],
+        satoshi: Option<u64>,
+        input_tx: Option<&[u8]>,
+        ae_host_commitment: &[u8; jade_crypto::SHA256_LEN],
+    ) -> Vec<u8> {
+        let field_count = 5 + u64::from(satoshi.is_some()) + u64::from(input_tx.is_some());
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(field_count)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(is_witness)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(path.len() as u64)
+            .unwrap();
+        for child in path {
+            encoder.u32(*child).unwrap();
+        }
+        encoder
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("ae_host_commitment")
+            .unwrap()
+            .bytes(ae_host_commitment)
+            .unwrap();
+        if let Some(satoshi) = satoshi {
+            encoder.str("satoshi").unwrap().u64(satoshi).unwrap();
+        }
+        if let Some(input_tx) = input_tx {
+            encoder.str("input_tx").unwrap().bytes(input_tx).unwrap();
+        }
+        params
+    }
+
+    fn get_signature_params_with_entropy(host_entropy: &[u8; jade_crypto::SHA256_LEN]) -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("ae_host_entropy")
+            .unwrap()
+            .bytes(host_entropy)
+            .unwrap();
+        params
+    }
+
     fn sign_tx_unsigned_input_params(
         is_witness: bool,
         satoshi: Option<u64>,
@@ -5206,6 +5468,67 @@ mod tests {
                 result: decode_hex_vec(
                     "304402206bebf8a137c9447e60ea079497ffc2e5d6fdd267e70a5742d1f4beb91a47ee7b02204fc4779b1293b53e5c32903943b6b12f9f3c46d8df559097aefb95be04a0836001"
                 )
+            }
+        );
+    }
+
+    #[test]
+    fn sign_tx_staged_flow_signs_anti_exfil_p2wsh_input() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/txn_segwit_ae.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let script = decode_hex_vec(fixture_hex_values(fixture, "script")[0]);
+        let expected = fixture_expected_output_signatures(fixture);
+        assert_eq!(expected.len(), 2);
+
+        let start_params = sign_tx_start_params(&txn, 1, true);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let host_commitment =
+            decode_hex("71df1b3c631a0209b58e5ba3103a8f84ec5a2addb2a2993fa99a65d98cd933ae");
+        let input_params = sign_tx_input_params_with_ae(
+            true,
+            &[1, 674],
+            &script,
+            Some(2_200_000),
+            None,
+            &host_commitment,
+        );
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[0])
+            }
+        );
+
+        let host_entropy =
+            decode_hex("854003465b0f98e3216d893a2d3eec7445ae802994fc3efbc9471e5338d37aad");
+        let signature_params = get_signature_params_with_entropy(&host_entropy);
+        let signature_request = Request {
+            id: Cow::Borrowed("sig"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&signature_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[1])
             }
         );
     }
@@ -6445,7 +6768,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_message_rejects_bad_params_and_defers_anti_exfil() {
+    fn sign_message_rejects_bad_params_and_handles_anti_exfil() {
         let mut emulator = Emulator::new();
         emulator
             .platform_mut()
@@ -6482,17 +6805,23 @@ mod tests {
             .unwrap()
             .str("path")
             .unwrap()
-            .array(1)
+            .array(3)
             .unwrap()
-            .u32(0)
+            .u32(1)
+            .unwrap()
+            .u32(2)
+            .unwrap()
+            .u32(3)
             .unwrap()
             .str("message")
             .unwrap()
-            .str("XYZ")
+            .str("Message to test Anti-Exfil signatures work as expected.")
             .unwrap()
             .str("ae_host_commitment")
             .unwrap()
-            .bytes(&[0x11; 32])
+            .bytes(&decode_hex::<32>(
+                "953c84f6fc33c14938899b1ecca09c6a3848951fbd48b472004d4377b73b7046",
+            ))
             .unwrap();
         let request = Request {
             id: Cow::Borrowed("msg"),
@@ -6501,8 +6830,33 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "sign_message anti-exfil".to_string(),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(
+                    "020a5522522ffa999669e140095d40eb6e7fd047375654ce589ce83b6786c3eea7"
+                ),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("ae_host_entropy")
+            .unwrap()
+            .bytes(&decode_hex::<32>(
+                "c2e58dc572a47c579f539cfb8dc09501c128d193919fef8945199b12ce778c89",
+            ))
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("sig"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: "ewh7wY10jyK3C5xyqtedw6zOKM3wYp5PDo6s6jLvFos+pMD7pdnFekTCBC9jnvLOnFd58JGw85MuXUvMcb3IbA=="
+                    .to_string(),
             }
         );
     }
