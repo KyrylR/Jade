@@ -895,7 +895,7 @@ pub mod pure_rust {
             for (input, tx_input) in inputs.iter().zip(&view.inputs) {
                 let prev_tx = input.single_value(0x00);
                 if let Some(prev_tx) = prev_tx {
-                    if &double_sha256(prev_tx) != tx_input.prev_txid {
+                    if bitcoin_transaction_txid(prev_tx).as_ref() != Some(tx_input.prev_txid) {
                         return Err(PsbtSignError::Invalid);
                     }
                 }
@@ -919,7 +919,7 @@ pub mod pure_rust {
                     .and_then(le_u32)
                     .unwrap_or(u32::MAX);
                 if let Some(prev_tx) = prev_tx {
-                    if &double_sha256(prev_tx) != prev_txid {
+                    if bitcoin_transaction_txid(prev_tx).as_ref() != Some(prev_txid) {
                         return Err(PsbtSignError::Invalid);
                     }
                 }
@@ -1042,6 +1042,22 @@ pub mod pure_rust {
         bitcoin_transaction_view(txn)
             .map(|tx| tx.inputs.len())
             .ok_or(TxSignError::Invalid)
+    }
+
+    pub fn bitcoin_prevout_amount(
+        txn: &[u8],
+        tx_input_index: usize,
+        input_tx: &[u8],
+    ) -> Result<u64, TxSignError> {
+        let tx = bitcoin_transaction_view(txn).ok_or(TxSignError::Invalid)?;
+        let input = tx.inputs.get(tx_input_index).ok_or(TxSignError::Invalid)?;
+        let input_txid = bitcoin_transaction_txid(input_tx).ok_or(TxSignError::Invalid)?;
+        if &input_txid != input.prev_txid {
+            return Err(TxSignError::Invalid);
+        }
+        let prev_output =
+            bitcoin_tx_output(input_tx, input.prev_vout as usize).ok_or(TxSignError::Invalid)?;
+        Ok(prev_output.amount)
     }
 
     pub fn sign_bitcoin_tx_from_seed(
@@ -1377,27 +1393,72 @@ pub mod pure_rust {
         })
     }
 
-    fn bitcoin_tx_output(tx: &[u8], output_index: usize) -> Option<TxOutputView<'_>> {
+    fn bitcoin_transaction_txid(tx: &[u8]) -> Option<[u8; SHA256_LEN]> {
         let mut pos = 0;
-        super::read_exact_opt(tx, &mut pos, 4)?;
-        let input_count = super::read_compact_size_opt(tx, &mut pos)?;
+        let mut stripped = Vec::new();
+        stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, 4)?);
+        let has_witness = match tx.get(pos).copied() {
+            Some(0) => {
+                pos += 1;
+                if super::read_exact_opt(tx, &mut pos, 1)? != [1] {
+                    return None;
+                }
+                true
+            }
+            Some(_) => false,
+            None => return None,
+        };
+
+        let (input_count, input_count_bytes) = read_compact_size_with_bytes(tx, &mut pos)?;
+        if input_count == 0 {
+            return None;
+        }
+        stripped.extend_from_slice(input_count_bytes);
         for _ in 0..input_count {
-            super::read_exact_opt(tx, &mut pos, 36)?;
-            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
-            super::read_exact_opt(tx, &mut pos, script_len)?;
-            super::read_exact_opt(tx, &mut pos, 4)?;
+            stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, 36)?);
+            let (script_len, script_len_bytes) = read_compact_size_with_bytes(tx, &mut pos)?;
+            stripped.extend_from_slice(script_len_bytes);
+            stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, script_len)?);
+            stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, 4)?);
         }
 
-        let output_count = super::read_compact_size_opt(tx, &mut pos)?;
-        for index in 0..output_count {
-            let amount = le_u64(super::read_exact_opt(tx, &mut pos, 8)?)?;
-            let script_len = super::read_compact_size_opt(tx, &mut pos)?;
-            let script = super::read_exact_opt(tx, &mut pos, script_len)?;
-            if index == output_index {
-                return Some(TxOutputView { amount, script });
+        let (output_count, output_count_bytes) = read_compact_size_with_bytes(tx, &mut pos)?;
+        stripped.extend_from_slice(output_count_bytes);
+        for _ in 0..output_count {
+            stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, 8)?);
+            let (script_len, script_len_bytes) = read_compact_size_with_bytes(tx, &mut pos)?;
+            stripped.extend_from_slice(script_len_bytes);
+            stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, script_len)?);
+        }
+
+        if has_witness {
+            for _ in 0..input_count {
+                let item_count = super::read_compact_size_opt(tx, &mut pos)?;
+                for _ in 0..item_count {
+                    let item_len = super::read_compact_size_opt(tx, &mut pos)?;
+                    super::read_exact_opt(tx, &mut pos, item_len)?;
+                }
             }
         }
-        None
+
+        stripped.extend_from_slice(super::read_exact_opt(tx, &mut pos, 4)?);
+        (pos == tx.len()).then(|| double_sha256(&stripped))
+    }
+
+    fn bitcoin_tx_output(tx: &[u8], output_index: usize) -> Option<TxOutputView<'_>> {
+        bitcoin_transaction_view(tx)?
+            .outputs
+            .get(output_index)
+            .copied()
+    }
+
+    fn read_compact_size_with_bytes<'a>(
+        bytes: &'a [u8],
+        pos: &mut usize,
+    ) -> Option<(usize, &'a [u8])> {
+        let start = *pos;
+        let value = super::read_compact_size_opt(bytes, pos)?;
+        Some((value, &bytes[start..*pos]))
     }
 
     fn singlesig_sighash(

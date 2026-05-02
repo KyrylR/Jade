@@ -114,8 +114,11 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   single-sig P2PKH and single-input P2WPKH legacy-output fixtures. The staged
   non-anti-exfil flow returns an empty signer commitment from `tx_input` and
   the signature from `get_signature`, matching the current client protocol.
-  Real anti-exfil signatures, Taproot `sign_tx`, multisig `sign_tx`, and
-  Liquid `sign_liquid_tx` remain explicit defers.
+  Rust also validates full Bitcoin `input_tx` prevouts by txid, extracts
+  witness amounts from them, and matches the multi-input P2WPKH and
+  P2SH-P2WPKH legacy-output fixtures. Real anti-exfil signatures, Taproot
+  `sign_tx`, multisig `sign_tx`, and Liquid `sign_liquid_tx` remain explicit
+  defers.
 
 ## First Parity Gates
 

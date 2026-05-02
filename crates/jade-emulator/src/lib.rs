@@ -3141,6 +3141,7 @@ struct BitcoinTxInputParams {
     sighash: u32,
     is_witness: bool,
     satoshi: Option<u64>,
+    input_tx: Option<Vec<u8>>,
     uses_ae: bool,
 }
 
@@ -3168,6 +3169,11 @@ fn parse_bitcoin_tx_input_params(
         Ok(value) => value,
         Err(_) => return Err("Failed to extract satoshi from parameters"),
     };
+    let input_tx = match cbor_map_bytes_or_null(params.raw(), "input_tx") {
+        Ok(Some(input_tx)) if !input_tx.is_empty() => Some(input_tx.to_vec()),
+        Ok(Some(_)) | Ok(None) => None,
+        Err(()) => return Err("Failed to extract input_tx from parameters"),
+    };
     let uses_ae = match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
         Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
         Ok(Some(commitment)) if commitment.is_empty() => false,
@@ -3183,6 +3189,7 @@ fn parse_bitcoin_tx_input_params(
         sighash,
         is_witness,
         satoshi,
+        input_tx,
         uses_ae,
     })
 }
@@ -3193,13 +3200,22 @@ fn sign_bitcoin_tx_input(
     tx_input_index: usize,
     input: &BitcoinTxInputParams,
 ) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let satoshi = match (input.satoshi, input.input_tx.as_deref()) {
+        (Some(satoshi), _) => Some(satoshi),
+        (None, Some(input_tx)) => Some(jade_crypto::pure_rust::bitcoin_prevout_amount(
+            txn,
+            tx_input_index,
+            input_tx,
+        )?),
+        (None, None) => None,
+    };
     let signing_input = jade_crypto::pure_rust::BitcoinTxSignInput {
         tx_input_index,
         path: &input.path,
         script_code: &input.script,
         sighash: input.sighash,
         is_witness: input.is_witness,
-        satoshi: input.satoshi,
+        satoshi,
     };
     let mut signatures =
         jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &[signing_input])?;
@@ -4670,6 +4686,39 @@ mod tests {
         fixture_psbt_base64(&fixture[start..])
     }
 
+    fn fixture_hex_values<'a>(fixture: &'a str, field: &str) -> Vec<&'a str> {
+        let marker = format!("\"{field}\": \"");
+        let mut values = Vec::new();
+        let mut rest = fixture;
+        while let Some(start) = rest.find(&marker) {
+            let value_start = start + marker.len();
+            let value_rest = &rest[value_start..];
+            let value_end = value_rest.find('"').unwrap();
+            values.push(&value_rest[..value_end]);
+            rest = &value_rest[value_end..];
+        }
+        values
+    }
+
+    fn fixture_legacy_signatures(fixture: &str) -> Vec<&str> {
+        let marker = "\"expected_legacy_output\"";
+        let start = fixture.find(marker).unwrap();
+        let legacy_block = &fixture[start..];
+        let end = legacy_block.find(']').unwrap();
+        let mut values = Vec::new();
+        let mut rest = &legacy_block[..end];
+        while let Some(start) = rest.find('"') {
+            let value_rest = &rest[start + 1..];
+            let value_end = value_rest.find('"').unwrap();
+            let value = &value_rest[..value_end];
+            if value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+                values.push(value);
+            }
+            rest = &value_rest[value_end + 1..];
+        }
+        values
+    }
+
     fn sign_tx_start_params(txn: &[u8], num_inputs: u64, use_ae_signatures: bool) -> Vec<u8> {
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
@@ -4711,8 +4760,9 @@ mod tests {
         path: &[u32],
         script: &[u8],
         satoshi: Option<u64>,
+        input_tx: Option<&[u8]>,
     ) -> Vec<u8> {
-        let field_count = if satoshi.is_some() { 5 } else { 4 };
+        let field_count = 4 + u64::from(satoshi.is_some()) + u64::from(input_tx.is_some());
         let mut params = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut params);
         encoder
@@ -4740,6 +4790,9 @@ mod tests {
             .unwrap();
         if let Some(satoshi) = satoshi {
             encoder.str("satoshi").unwrap().u64(satoshi).unwrap();
+        }
+        if let Some(input_tx) = input_tx {
+            encoder.str("input_tx").unwrap().bytes(input_tx).unwrap();
         }
         params
     }
@@ -4938,7 +4991,7 @@ mod tests {
                 "304402201a1942a4002c7d1112e54a1d5b068a2d504cc10464d59775c08ff1128c0061fe022000da1b6d41732db58e6cb2e308cebedf5d989ced9fe1782833fa0358862f231301",
             ),
         ] {
-            let input_params = sign_tx_input_params(false, path, &decode_hex_vec(script), None);
+            let input_params = sign_tx_input_params(false, path, &decode_hex_vec(script), None, None);
             let input_request = Request {
                 id: Cow::Borrowed("input"),
                 method: Cow::Borrowed("tx_input"),
@@ -4978,6 +5031,7 @@ mod tests {
             &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 2],
             &decode_hex_vec("76a914faaba4d82b92371198437bc6fc7f995834fdf25a88ac"),
             Some(10_000),
+            None,
         );
         let input_request = Request {
             id: Cow::Borrowed("input"),
@@ -5019,6 +5073,7 @@ mod tests {
             &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 2],
             &decode_hex_vec("76a914faaba4d82b92371198437bc6fc7f995834fdf25a88ac"),
             Some(10_000),
+            None,
         );
         let input_request = Request {
             id: Cow::Borrowed("input"),
@@ -5044,6 +5099,67 @@ mod tests {
                 )
             }
         );
+    }
+
+    #[test]
+    fn sign_tx_legacy_flow_extracts_witness_amounts_from_input_tx() {
+        for (fixture, paths) in [
+            (
+                include_str!("../../../test_data/tx_ss_p2wpkh.json"),
+                &[
+                    &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 2][..],
+                    &[2_147_483_732, 2_147_483_649, 2_147_483_648, 0, 1][..],
+                ][..],
+            ),
+            (
+                include_str!("../../../test_data/tx_ss_p2sh_p2wpkh.json"),
+                &[
+                    &[2_147_483_697, 2_147_483_649, 2_147_483_648, 0, 2][..],
+                    &[2_147_483_697, 2_147_483_649, 2_147_483_648, 0, 1][..],
+                ][..],
+            ),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let scripts = fixture_hex_values(fixture, "script");
+            let input_txs = fixture_hex_values(fixture, "input_tx");
+            let expected = fixture_legacy_signatures(fixture);
+            assert_eq!(paths.len(), scripts.len());
+            assert_eq!(paths.len(), input_txs.len());
+            assert_eq!(paths.len(), expected.len());
+
+            let start_params = sign_tx_start_params(&txn, paths.len() as u64, false);
+            let start_request = Request {
+                id: Cow::Borrowed("tx"),
+                method: Cow::Borrowed("sign_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            for index in 0..paths.len() {
+                let script = decode_hex_vec(scripts[index]);
+                let input_tx = decode_hex_vec(input_txs[index]);
+                let input_params =
+                    sign_tx_input_params(true, paths[index], &script, None, Some(&input_tx));
+                let input_request = Request {
+                    id: Cow::Borrowed("input"),
+                    method: Cow::Borrowed("tx_input"),
+                    params: Some(&input_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&input_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index])
+                    }
+                );
+            }
+        }
     }
 
     #[test]
