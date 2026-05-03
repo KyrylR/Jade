@@ -152,7 +152,11 @@ The hard parts are hard for concrete compatibility reasons:
   and legacy plus anti-exfil message signing. Message anti-exfil now implements
   host commitment validation, signer commitment generation, and the
   `get_signature` continuation using pure-Rust sign-to-contract secp256k1
-  primitives matched against libsecp/Jade vectors.
+  primitives matched against libsecp/Jade vectors. Rust emulator coverage now
+  directly imports the original message JSON fixtures, valid and invalid
+  message-file fixtures, and the full identity JSON fixture set, including
+  SLIP-0013 public keys/signatures, SLIP-0017 public keys, and ECDH symmetry
+  checks against the Trezor-compatible fixture.
 - Wallet registration and enumeration: current/legacy multisig records,
   multisig setup-file import/export, descriptor registration for Bitcoin
   networks, and registered wallet listing/details.
@@ -271,7 +275,10 @@ The hard parts are hard for concrete compatibility reasons:
 3. `jade-emulator` routes immediate/pre-auth/authenticated calls through Rust
    where parity is implemented and tracks remaining signing and Liquid
    transaction flows as active implementation work.
-4. Existing Python/libjade tests remain the oracle for subsequent ports.
+4. Existing Python/libjade tests remain the oracle for subsequent ports. The
+   Rust fixture gate now directly references 107 of 210 original `test_data`
+   files; unreferenced fixtures remain active parity work rather than retired
+   coverage.
 
 ## C/C++ Removal Rule
 

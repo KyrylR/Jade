@@ -7193,6 +7193,14 @@ mod tests {
         &rest[..end]
     }
 
+    fn fixture_expected_output_string(fixture: &str) -> &str {
+        fixture_object_string_value(fixture, "expected_output").unwrap()
+    }
+
+    fn fixture_expected_error(fixture: &str) -> &str {
+        fixture_object_string_value(fixture, "expected_error").unwrap()
+    }
+
     fn fixture_expected_output_psbt_base64(fixture: &str) -> &str {
         let marker = "\"expected_output\":";
         let start = fixture.find(marker).unwrap() + marker.len();
@@ -11800,6 +11808,48 @@ mod tests {
     }
 
     #[test]
+    fn sign_message_matches_original_json_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/msg_simple.json"),
+            include_str!("../../../test_data/msg_large.json"),
+            include_str!("../../../test_data/msg_path.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let path = fixture_object_path(fixture);
+            let message = fixture_object_string_value(fixture, "message").unwrap();
+
+            let mut params = Vec::new();
+            let mut encoder = minicbor::Encoder::new(&mut params);
+            encoder
+                .map(2)
+                .unwrap()
+                .str("path")
+                .unwrap()
+                .array(path.len() as u64)
+                .unwrap();
+            for value in &path {
+                encoder.u32(*value).unwrap();
+            }
+            encoder.str("message").unwrap().str(message).unwrap();
+            let request = Request {
+                id: Cow::Borrowed("msg"),
+                method: Cow::Borrowed("sign_message"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::TextResult {
+                    result: fixture_expected_output_string(fixture).to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn sign_message_file_parses_specter_style_payload() {
         let mut emulator = Emulator::new();
         emulator
@@ -11826,6 +11876,83 @@ mod tests {
                 result: "IHd2/Y65d1P7Gq6I6gTDoRql9eEsFEh7B8RtAJm+g+AdHuxT5hbMKN28Jlotxfp0LO3WLxPlJh61BQYPYL1uikw=".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn sign_message_file_matches_original_json_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/msgfile_simple.json"),
+            include_str!("../../../test_data/msgfile_large.json"),
+            include_str!("../../../test_data/msgfile_hardened1.json"),
+            include_str!("../../../test_data/msgfile_hardened2.json"),
+            include_str!("../../../test_data/msgfile_hardened3.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(1)
+                .unwrap()
+                .str("message_file")
+                .unwrap()
+                .str(fixture_object_string_value(fixture, "filedata").unwrap())
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("msg"),
+                method: Cow::Borrowed("sign_message"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::TextResult {
+                    result: fixture_expected_output_string(fixture).to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn sign_message_file_rejects_original_bad_json_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/msgfile_bad_empty.json"),
+            include_str!("../../../test_data/msgfile_bad_message1.json"),
+            include_str!("../../../test_data/msgfile_bad_message2.json"),
+            include_str!("../../../test_data/msgfile_bad_path1.json"),
+            include_str!("../../../test_data/msgfile_bad_path2.json"),
+            include_str!("../../../test_data/msgfile_bad_path3.json"),
+            include_str!("../../../test_data/msgfile_bad_path4.json"),
+            include_str!("../../../test_data/msgfile_bad_prefix1.json"),
+            include_str!("../../../test_data/msgfile_bad_prefix2.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(1)
+                .unwrap()
+                .str("message_file")
+                .unwrap()
+                .str(fixture_object_string_value(fixture, "filedata").unwrap())
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("msg"),
+                method: Cow::Borrowed("sign_message"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: fixture_expected_error(fixture).to_string(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -11918,6 +12045,76 @@ mod tests {
             V1Outcome::TextResult {
                 result: "ewh7wY10jyK3C5xyqtedw6zOKM3wYp5PDo6s6jLvFos+pMD7pdnFekTCBC9jnvLOnFd58JGw85MuXUvMcb3IbA=="
                     .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_message_anti_exfil_matches_original_json_fixture() {
+        let fixture = include_str!("../../../test_data/msg_simple_ae.json");
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let path = fixture_object_path(fixture);
+        let expected = fixture_expected_output_items(fixture);
+
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(3)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(path.len() as u64)
+            .unwrap();
+        for value in &path {
+            encoder.u32(*value).unwrap();
+        }
+        encoder
+            .str("message")
+            .unwrap()
+            .str(fixture_object_string_value(fixture, "message").unwrap())
+            .unwrap()
+            .str("ae_host_commitment")
+            .unwrap()
+            .bytes(&decode_hex::<32>(fixture_object_required_hex_value(
+                fixture,
+                "ae_host_commitment",
+            )))
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("msg"),
+            method: Cow::Borrowed("sign_message"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[0]),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("ae_host_entropy")
+            .unwrap()
+            .bytes(&decode_hex::<32>(fixture_object_required_hex_value(
+                fixture,
+                "ae_host_entropy",
+            )))
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("sig"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::TextResult {
+                result: expected[1].to_string(),
             }
         );
     }
@@ -13256,6 +13453,196 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn identity_methods_match_original_json_fixtures() {
+        let trezor_fixture =
+            include_str!("../../../test_data/identity_ssh_nist_matches_trezor.json");
+        let trezor_identity = fixture_object_string_value(trezor_fixture, "identity").unwrap();
+        let trezor_curve = fixture_object_string_value(trezor_fixture, "curve").unwrap();
+        let trezor_index = fixture_object_u64_value(trezor_fixture, "index").unwrap();
+        let trezor_slip17 = decode_hex::<65>(fixture_hex_values(trezor_fixture, "slip-0017")[0]);
+        let mnemonic = bip39::Mnemonic::parse(
+            "alcohol woman abuse must during monitor noble actual mixed trade anger aisle",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("").to_vec();
+
+        for fixture in [
+            include_str!("../../../test_data/identity_ssh_nist_matches_trezor.json"),
+            include_str!("../../../test_data/identity_ssh_nist_index.json"),
+            include_str!("../../../test_data/identity_ssh_nist_noindex.json"),
+            include_str!("../../../test_data/identity_gpg_nist_index.json"),
+            include_str!("../../../test_data/identity_gpg_nist_noindex.json"),
+        ] {
+            let identity = fixture_object_string_value(fixture, "identity").unwrap();
+            let curve = fixture_object_string_value(fixture, "curve").unwrap();
+            let index = fixture_object_u64_value(fixture, "index").unwrap();
+
+            for key_type in ["slip-0013", "slip-0017"] {
+                let mut emulator = Emulator::new();
+                emulator.platform_mut().set_debug_wallet_seed(seed.clone());
+                let mut params = Vec::new();
+                minicbor::Encoder::new(&mut params)
+                    .map(4)
+                    .unwrap()
+                    .str("identity")
+                    .unwrap()
+                    .str(identity)
+                    .unwrap()
+                    .str("curve")
+                    .unwrap()
+                    .str(curve)
+                    .unwrap()
+                    .str("type")
+                    .unwrap()
+                    .str(key_type)
+                    .unwrap()
+                    .str("index")
+                    .unwrap()
+                    .u64(index)
+                    .unwrap();
+                let request = Request {
+                    id: Cow::Borrowed("id"),
+                    method: Cow::Borrowed("get_identity_pubkey"),
+                    params: Some(&params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(fixture_hex_values(fixture, key_type)[0]),
+                    },
+                    "{identity} {key_type}"
+                );
+            }
+
+            let mut emulator = Emulator::new();
+            emulator.platform_mut().set_debug_wallet_seed(seed.clone());
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(4)
+                .unwrap()
+                .str("identity")
+                .unwrap()
+                .str(identity)
+                .unwrap()
+                .str("curve")
+                .unwrap()
+                .str(curve)
+                .unwrap()
+                .str("challenge")
+                .unwrap()
+                .bytes(&decode_hex::<32>(fixture_object_required_hex_value(
+                    fixture,
+                    "challenge",
+                )))
+                .unwrap()
+                .str("index")
+                .unwrap()
+                .u64(index)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("id"),
+                method: Cow::Borrowed("sign_identity"),
+                params: Some(&params),
+            };
+            let V1Outcome::OwnedMapResult { entries } = emulator.handle_v1_request(&request) else {
+                panic!("expected sign_identity result map for {identity}");
+            };
+            let mut signature = None;
+            let mut pubkey = None;
+            for entry in entries {
+                match (entry.key.as_str(), entry.value) {
+                    ("signature", OwnedV1Value::Bytes(bytes)) => signature = Some(bytes),
+                    ("pubkey", OwnedV1Value::Bytes(bytes)) => pubkey = Some(bytes),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                signature,
+                Some(decode_hex_vec(fixture_hex_values(fixture, "signature")[0])),
+                "{identity}"
+            );
+            assert_eq!(
+                pubkey,
+                Some(decode_hex_vec(fixture_hex_values(fixture, "slip-0013")[0])),
+                "{identity}"
+            );
+
+            let expected_shared =
+                decode_hex_vec(fixture_hex_values(fixture, "ecdh_with_trezor")[0]);
+            let mut emulator = Emulator::new();
+            emulator.platform_mut().set_debug_wallet_seed(seed.clone());
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(4)
+                .unwrap()
+                .str("identity")
+                .unwrap()
+                .str(identity)
+                .unwrap()
+                .str("curve")
+                .unwrap()
+                .str(curve)
+                .unwrap()
+                .str("their_pubkey")
+                .unwrap()
+                .bytes(&trezor_slip17)
+                .unwrap()
+                .str("index")
+                .unwrap()
+                .u64(index)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("id"),
+                method: Cow::Borrowed("get_identity_shared_key"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult {
+                    result: expected_shared.clone(),
+                },
+                "{identity}"
+            );
+
+            let mut emulator = Emulator::new();
+            emulator.platform_mut().set_debug_wallet_seed(seed.clone());
+            let their_pubkey = decode_hex::<65>(fixture_hex_values(fixture, "slip-0017")[0]);
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(4)
+                .unwrap()
+                .str("identity")
+                .unwrap()
+                .str(trezor_identity)
+                .unwrap()
+                .str("curve")
+                .unwrap()
+                .str(trezor_curve)
+                .unwrap()
+                .str("their_pubkey")
+                .unwrap()
+                .bytes(&their_pubkey)
+                .unwrap()
+                .str("index")
+                .unwrap()
+                .u64(trezor_index)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("id"),
+                method: Cow::Borrowed("get_identity_shared_key"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult {
+                    result: expected_shared,
+                },
+                "{identity} ecdh symmetry"
+            );
+        }
     }
 
     #[test]
