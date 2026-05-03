@@ -3536,32 +3536,110 @@ impl Emulator {
         V1Outcome::BoolResult { result: true }
     }
 
-    fn register_attestation_result(&self, request: &Request<'_>) -> V1Outcome {
-        if request.params().is_none() {
+    fn register_attestation_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
             return V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Expecting parameters map".to_string(),
             };
-        }
+        };
 
-        V1Outcome::Reject {
-            code: ErrorCode::InternalError,
-            message: "Attestation not supported".to_string(),
-        }
+        let privkey_pem = match params.str("privkey_pem") {
+            Ok(Some(value))
+                if !value.is_empty()
+                    && value.len() < jade_crypto::ATTESTATION_RSA_PRIVKEY_PEM_MAX_LEN =>
+            {
+                value
+            }
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid private key from parameters");
+            }
+        };
+        let ext_pubkey_pem = match params.str("ext_pubkey_pem") {
+            Ok(Some(value))
+                if !value.is_empty()
+                    && value.len() < jade_crypto::ATTESTATION_RSA_PUBKEY_PEM_MAX_LEN =>
+            {
+                value
+            }
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid external pubkey from parameters");
+            }
+        };
+        let ext_signature = match params.bytes("ext_signature") {
+            Ok(Some(value)) if !value.is_empty() => value,
+            Ok(_) | Err(_) => {
+                return bad_parameters(
+                    "Failed to extract valid external signature from parameters",
+                );
+            }
+        };
+
+        let Some(material) = jade_crypto::pure_rust::register_attestation_material(
+            privkey_pem,
+            ext_pubkey_pem,
+            ext_signature,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to initialise attestation parameters".to_string(),
+            };
+        };
+
+        let Some(reply) = jade_crypto::pure_rust::sign_attestation_challenge(
+            privkey_pem,
+            &material.pubkey_pem,
+            &material.ext_signature,
+            ext_signature,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to sign attestation".to_string(),
+            };
+        };
+
+        self.platform.attestation.replace(HostAttestationData {
+            private_key_pem: privkey_pem.to_string(),
+            pubkey_pem: material.pubkey_pem,
+            ext_signature: material.ext_signature,
+        });
+
+        attestation_reply_outcome(reply)
     }
 
     fn sign_attestation_result(&self, request: &Request<'_>) -> V1Outcome {
-        if request.params().is_none() {
+        let Some(params) = request.params() else {
             return V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Expecting parameters map".to_string(),
             };
-        }
+        };
+        let Some(attestation) = &self.platform.attestation else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Attestation data not initialised".to_string(),
+            };
+        };
+        let challenge = match params.bytes("challenge") {
+            Ok(Some(value)) if !value.is_empty() => value,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid challenge from parameters");
+            }
+        };
 
-        V1Outcome::Reject {
-            code: ErrorCode::InternalError,
-            message: "Attestation not supported".to_string(),
-        }
+        let Some(reply) = jade_crypto::pure_rust::sign_attestation_challenge(
+            &attestation.private_key_pem,
+            &attestation.pubkey_pem,
+            &attestation.ext_signature,
+            challenge,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to sign attestation".to_string(),
+            };
+        };
+
+        attestation_reply_outcome(reply)
     }
 
     fn auth_user_result(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -6130,12 +6208,20 @@ impl fmt::Debug for HostOtaSession {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct HostAttestationData {
+    private_key_pem: String,
+    pubkey_pem: String,
+    ext_signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPlatform {
     version: Cow<'static, str>,
     entropy_bytes_received: usize,
     epoch: Option<u64>,
     wallet_seed: Option<Vec<u8>>,
     master_unblinding_key: [u8; 64],
+    attestation: Option<HostAttestationData>,
     bip85_ephemeral_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
     bip85_iv: [u8; 16],
     confirm_export_blinding_key: bool,
@@ -6149,6 +6235,7 @@ impl Default for HostPlatform {
             epoch: None,
             wallet_seed: None,
             master_unblinding_key: [0; 64],
+            attestation: None,
             bip85_ephemeral_private_key: [
                 0x0b, 0x6b, 0x3d, 0xc9, 0x0d, 0x20, 0x3d, 0x85, 0x41, 0x00, 0x11, 0x07, 0x88, 0xac,
                 0x87, 0xd4, 0x3a, 0xa0, 0x06, 0x20, 0xc9, 0xcd, 0xb3, 0x61, 0xb2, 0x81, 0xb0, 0x90,
@@ -6188,6 +6275,7 @@ impl HostPlatform {
         self.wallet_seed = None;
         self.master_unblinding_key = [0; 64];
         self.confirm_export_blinding_key = false;
+        self.attestation = None;
     }
 
     pub fn set_master_unblinding_key(&mut self, key: [u8; 64]) {
@@ -6214,7 +6302,7 @@ impl Platform for HostPlatform {
             idf_version: Cow::Borrowed("host"),
             chip_features: Cow::Borrowed("00000000"),
             efusemac: Cow::Borrowed("000000000000"),
-            attestation_initialised: false,
+            attestation_initialised: self.attestation.is_some(),
             battery_status: 0,
             battery_millivolts: 0,
             battery_charging: false,
@@ -6269,6 +6357,25 @@ fn reject_core_error(err: CoreError) -> V1Outcome {
     V1Outcome::Reject {
         code,
         message: message.to_string(),
+    }
+}
+
+fn attestation_reply_outcome(reply: jade_crypto::AttestationReply) -> V1Outcome {
+    V1Outcome::OwnedMapResult {
+        entries: vec![
+            OwnedResultMapEntry {
+                key: "signature".to_string(),
+                value: OwnedV1Value::Bytes(reply.signature),
+            },
+            OwnedResultMapEntry {
+                key: "pubkey_pem".to_string(),
+                value: OwnedV1Value::Text(reply.pubkey_pem),
+            },
+            OwnedResultMapEntry {
+                key: "ext_signature".to_string(),
+                value: OwnedV1Value::Bytes(reply.ext_signature),
+            },
+        ],
     }
 }
 
@@ -14707,7 +14814,7 @@ mod tests {
     }
 
     #[test]
-    fn attestation_methods_are_explicit_platform_boundaries_on_host() {
+    fn attestation_methods_validate_params_and_initialisation_state() {
         let mut emulator = Emulator::new();
 
         for method in ["register_attestation", "sign_attestation"] {
@@ -14723,22 +14830,35 @@ mod tests {
                     message: "Expecting parameters map".to_string(),
                 }
             );
-
-            let mut params = Vec::new();
-            minicbor::Encoder::new(&mut params).map(0).unwrap();
-            let request = Request {
-                id: Cow::Borrowed("att"),
-                method: Cow::Borrowed(method),
-                params: Some(&params),
-            };
-            assert_eq!(
-                emulator.handle_v1_request(&request),
-                V1Outcome::Reject {
-                    code: ErrorCode::InternalError,
-                    message: "Attestation not supported".to_string(),
-                }
-            );
         }
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params).map(0).unwrap();
+        let request = Request {
+            id: Cow::Borrowed("att"),
+            method: Cow::Borrowed("register_attestation"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid private key from parameters".to_string(),
+            }
+        );
+
+        let request = Request {
+            id: Cow::Borrowed("att"),
+            method: Cow::Borrowed("sign_attestation"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Attestation data not initialised".to_string(),
+            }
+        );
     }
 
     #[test]

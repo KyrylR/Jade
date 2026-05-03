@@ -16,6 +16,9 @@ pub const OTP_MAX_URI_LEN: usize = 256;
 pub const OTP_MAX_TOKEN_LEN: usize = 12;
 pub const OTP_MAX_RECORDS: usize = 16;
 pub const BITCOIN_MESSAGE_MAX_LEN: usize = 64 * 1024 - 64;
+pub const ATTESTATION_RSA_KEY_LEN: usize = 512;
+pub const ATTESTATION_RSA_PUBKEY_PEM_MAX_LEN: usize = 832;
+pub const ATTESTATION_RSA_PRIVKEY_PEM_MAX_LEN: usize = 3264;
 
 pub trait SecretKeyMaterial: Zeroize {
     fn expose_secret_bytes(&self) -> &[u8];
@@ -217,6 +220,19 @@ pub enum PsbtSignError {
 pub enum TxSignError {
     Invalid,
     Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationMaterial {
+    pub pubkey_pem: alloc::string::String,
+    pub ext_signature: alloc::vec::Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationReply {
+    pub signature: alloc::vec::Vec<u8>,
+    pub pubkey_pem: alloc::string::String,
+    pub ext_signature: alloc::vec::Vec<u8>,
 }
 
 pub fn psbt_envelope(bytes: &[u8]) -> Option<PsbtEnvelope> {
@@ -759,15 +775,17 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 #[cfg(feature = "pure-rust-curves")]
 pub mod pure_rust {
     use super::{
-        Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
-        IdentityKeyType, LiquidCommitmentData, LiquidNetwork, LiquidOutputCommitment,
-        MultisigScriptVariant, PsbtEnvelope, PsbtSignError, SinglesigScriptVariant, TxSignError,
-        XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, LIQUID_COMMITMENT_LEN,
-        SHA256_LEN, SHA512_LEN,
+        AttestationMaterial, AttestationReply, Bip85EncryptedEntropy, BitcoinNetwork,
+        BlindingFactorBytes, BlindingFactorKind, IdentityKeyType, LiquidCommitmentData,
+        LiquidNetwork, LiquidOutputCommitment, MultisigScriptVariant, PsbtEnvelope, PsbtSignError,
+        SinglesigScriptVariant, TxSignError, XpubPrefix, ATTESTATION_RSA_KEY_LEN,
+        ATTESTATION_RSA_PRIVKEY_PEM_MAX_LEN, ATTESTATION_RSA_PUBKEY_PEM_MAX_LEN,
+        EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, LIQUID_COMMITMENT_LEN, SHA256_LEN,
+        SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
-    use alloc::string::String;
+    use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use bech32::{ByteIterExt, Fe32IterExt};
     use hmac::{Hmac, KeyInit, Mac};
@@ -785,7 +803,9 @@ pub mod pure_rust {
         PublicKey as P256PublicKey, Scalar as P256Scalar, SecretKey as P256SecretKey,
     };
     use rand_core::{CryptoRng, Error as RandError, RngCore};
-    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey};
+    use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey, LineEnding};
+    use rsa::traits::PublicKeyParts;
     use rsa::{BigUint, Pss, RsaPrivateKey, RsaPublicKey};
     use sha2::{Digest, Sha256, Sha512};
     use sha3::digest::{ExtendableOutput, Update as Sha3Update, XofReader};
@@ -3831,6 +3851,143 @@ pub mod pure_rust {
         Some(signatures)
     }
 
+    pub fn register_attestation_material(
+        privkey_pem: &str,
+        ext_pubkey_pem: &str,
+        ext_signature: &[u8],
+    ) -> Option<AttestationMaterial> {
+        register_attestation_material_for_key_len(
+            privkey_pem,
+            ext_pubkey_pem,
+            ext_signature,
+            ATTESTATION_RSA_KEY_LEN,
+        )
+    }
+
+    pub(crate) fn register_attestation_material_for_key_len(
+        privkey_pem: &str,
+        ext_pubkey_pem: &str,
+        ext_signature: &[u8],
+        key_len: usize,
+    ) -> Option<AttestationMaterial> {
+        if privkey_pem.is_empty()
+            || privkey_pem.len() >= ATTESTATION_RSA_PRIVKEY_PEM_MAX_LEN
+            || ext_pubkey_pem.is_empty()
+            || ext_pubkey_pem.len() >= ATTESTATION_RSA_PUBKEY_PEM_MAX_LEN
+            || ext_signature.is_empty()
+            || ext_signature.len() > ATTESTATION_RSA_KEY_LEN
+        {
+            return None;
+        }
+
+        let private_key = rsa_private_key_from_pem(privkey_pem)?;
+        if RsaPublicKey::from(&private_key).size() != key_len {
+            return None;
+        }
+        let pubkey_pem = RsaPublicKey::from(&private_key)
+            .to_public_key_pem(LineEnding::LF)
+            .ok()?;
+        if pubkey_pem.len() >= ATTESTATION_RSA_PUBKEY_PEM_MAX_LEN {
+            return None;
+        }
+
+        let ext_public_key = rsa_public_key_from_pem(ext_pubkey_pem)?;
+        attestation_verify_pkcs1v15_sha256(&ext_public_key, pubkey_pem.as_bytes(), ext_signature)?;
+        Some(AttestationMaterial {
+            pubkey_pem,
+            ext_signature: ext_signature.to_vec(),
+        })
+    }
+
+    pub fn sign_attestation_challenge(
+        privkey_pem: &str,
+        pubkey_pem: &str,
+        ext_signature: &[u8],
+        challenge: &[u8],
+    ) -> Option<AttestationReply> {
+        sign_attestation_challenge_for_key_len(
+            privkey_pem,
+            pubkey_pem,
+            ext_signature,
+            challenge,
+            ATTESTATION_RSA_KEY_LEN,
+        )
+    }
+
+    pub(crate) fn sign_attestation_challenge_for_key_len(
+        privkey_pem: &str,
+        pubkey_pem: &str,
+        ext_signature: &[u8],
+        challenge: &[u8],
+        key_len: usize,
+    ) -> Option<AttestationReply> {
+        if challenge.is_empty()
+            || pubkey_pem.is_empty()
+            || pubkey_pem.len() >= ATTESTATION_RSA_PUBKEY_PEM_MAX_LEN
+            || ext_signature.is_empty()
+            || ext_signature.len() > ATTESTATION_RSA_KEY_LEN
+        {
+            return None;
+        }
+
+        let private_key = rsa_private_key_from_pem(privkey_pem)?;
+        if private_key.size() != key_len {
+            return None;
+        }
+        let derived_pubkey_pem = RsaPublicKey::from(&private_key)
+            .to_public_key_pem(LineEnding::LF)
+            .ok()?;
+        if derived_pubkey_pem != pubkey_pem {
+            return None;
+        }
+        let signature = attestation_sign_pkcs1v15_sha256(&private_key, challenge)?;
+        if signature.len() != private_key.size() {
+            return None;
+        }
+        Some(AttestationReply {
+            signature,
+            pubkey_pem: pubkey_pem.to_string(),
+            ext_signature: ext_signature.to_vec(),
+        })
+    }
+
+    fn rsa_private_key_from_pem(pem: &str) -> Option<RsaPrivateKey> {
+        RsaPrivateKey::from_pkcs8_pem(pem)
+            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
+            .ok()
+    }
+
+    fn rsa_public_key_from_pem(pem: &str) -> Option<RsaPublicKey> {
+        RsaPublicKey::from_public_key_pem(pem)
+            .or_else(|_| RsaPublicKey::from_pkcs1_pem(pem))
+            .ok()
+    }
+
+    fn attestation_sign_pkcs1v15_sha256(
+        private_key: &RsaPrivateKey,
+        data: &[u8],
+    ) -> Option<Vec<u8>> {
+        let digest = Sha256::digest(data);
+        private_key
+            .sign(rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), &digest)
+            .ok()
+    }
+
+    fn attestation_verify_pkcs1v15_sha256(
+        public_key: &RsaPublicKey,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Option<()> {
+        let digest = Sha256::digest(data);
+        public_key
+            .verify(
+                rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                &digest,
+                signature,
+            )
+            .ok()
+    }
+
     pub fn bip85_rsa_encrypted_entropy_from_seed(
         seed: &[u8],
         key_bits: u32,
@@ -4941,9 +5098,12 @@ mod otp_tests {
 #[cfg(all(test, feature = "pure-rust-curves"))]
 mod tests {
     use super::*;
-    use alloc::string::ToString;
+    use alloc::string::{String, ToString};
     use alloc::vec::Vec;
-    use rsa::pkcs8::DecodePublicKey;
+    use rand_core::{CryptoRng, Error as RandError, RngCore};
+    use rsa::pkcs8::{
+        DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
+    };
 
     #[test]
     fn slip77_master_unblinding_key_from_seed_matches_wally_symmetric_derivation() {
@@ -5555,6 +5715,148 @@ mod tests {
             )
             .unwrap();
     }
+
+    #[test]
+    fn attestation_registration_verifies_external_signature_and_signs_challenge() {
+        let signer_private_pem = test_rsa_private_key_pem(1024, b"jade-attestation-signer");
+        let authority_private_pem = test_rsa_private_key_pem(1024, b"jade-attestation-authority");
+
+        let signer_private = rsa::RsaPrivateKey::from_pkcs8_pem(&signer_private_pem).unwrap();
+        let signer_pubkey_pem = rsa::RsaPublicKey::from(&signer_private)
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let authority_private = rsa::RsaPrivateKey::from_pkcs8_pem(&authority_private_pem).unwrap();
+        let authority_pubkey_pem = rsa::RsaPublicKey::from(&authority_private)
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let ext_signature = authority_private
+            .sign(
+                rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                &sha2::Sha256::digest(signer_pubkey_pem.as_bytes()),
+            )
+            .unwrap();
+
+        let material = pure_rust::register_attestation_material_for_key_len(
+            &signer_private_pem,
+            &authority_pubkey_pem,
+            &ext_signature,
+            128,
+        )
+        .unwrap();
+        assert_eq!(material.pubkey_pem, signer_pubkey_pem);
+        assert_eq!(material.ext_signature, ext_signature);
+        assert!(pure_rust::register_attestation_material(
+            &signer_private_pem,
+            &authority_pubkey_pem,
+            &ext_signature,
+        )
+        .is_none());
+
+        let reply = pure_rust::sign_attestation_challenge_for_key_len(
+            &signer_private_pem,
+            &material.pubkey_pem,
+            &material.ext_signature,
+            b"challenge",
+            128,
+        )
+        .unwrap();
+        assert_eq!(reply.pubkey_pem, signer_pubkey_pem);
+        assert_eq!(reply.ext_signature, ext_signature);
+        assert_eq!(reply.signature.len(), 128);
+
+        let signer_pubkey = rsa::RsaPublicKey::from_public_key_pem(&reply.pubkey_pem).unwrap();
+        signer_pubkey
+            .verify(
+                rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                &sha2::Sha256::digest(b"challenge"),
+                &reply.signature,
+            )
+            .unwrap();
+        assert!(pure_rust::register_attestation_material_for_key_len(
+            &signer_private_pem,
+            &authority_pubkey_pem,
+            b"bad signature",
+            128,
+        )
+        .is_none());
+        assert!(pure_rust::sign_attestation_challenge_for_key_len(
+            &signer_private_pem,
+            "wrong pem",
+            &material.ext_signature,
+            b"challenge",
+            128,
+        )
+        .is_none());
+    }
+
+    fn test_rsa_private_key_pem(bits: usize, seed: &[u8]) -> String {
+        let mut rng = TestRng::new(seed);
+        let private_key =
+            rsa::RsaPrivateKey::new_with_exp(&mut rng, bits, &rsa::BigUint::from(65_537u32))
+                .unwrap();
+        private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .to_string()
+    }
+
+    struct TestRng {
+        seed: Vec<u8>,
+        counter: u64,
+        block: [u8; SHA256_LEN],
+        offset: usize,
+    }
+
+    impl TestRng {
+        fn new(seed: &[u8]) -> Self {
+            Self {
+                seed: seed.to_vec(),
+                counter: 0,
+                block: [0; SHA256_LEN],
+                offset: SHA256_LEN,
+            }
+        }
+
+        fn refill(&mut self) {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&self.seed);
+            hasher.update(self.counter.to_le_bytes());
+            self.block.copy_from_slice(&hasher.finalize());
+            self.counter += 1;
+            self.offset = 0;
+        }
+    }
+
+    impl RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut bytes = [0u8; 4];
+            self.fill_bytes(&mut bytes);
+            u32::from_le_bytes(bytes)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut bytes = [0u8; 8];
+            self.fill_bytes(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for byte in dest {
+                if self.offset == SHA256_LEN {
+                    self.refill();
+                }
+                *byte = self.block[self.offset];
+                self.offset += 1;
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for TestRng {}
 
     #[test]
     fn identity_public_keys_match_jade_fixtures() {
