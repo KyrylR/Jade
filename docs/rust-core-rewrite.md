@@ -142,10 +142,12 @@ The hard parts are hard for concrete compatibility reasons:
   the existing `http_request`/`on-reply` shape while keeping HTTP transport and
   PIN entry as platform boundaries. Adapter-only debug handshake, QR image
   capture, and QR scan calls now route through Rust host platform byte hooks
-  instead of the C debug handlers. ESP32-S3 eFuse/DS burning and real camera/QR
-  backends remain target firmware platform shims, but the v1 core response
-  shapes and request validation no longer require Jade-owned C application
-  code.
+  instead of the C debug handlers. The Rust QR adapter now references every
+  original QVGA JSON/DAT fixture pair and validates the expected text/hex
+  payload shape through the host scanner hook. ESP32-S3 eFuse/DS burning and
+  real camera/QR decoder backends remain target firmware platform shims, but
+  the v1 core response shapes and request validation no longer require
+  Jade-owned C application code.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
   BIP85 RSA public-key PEM export and RSA-PSS digest signing, P-256 identity
   pubkey/sign/ECDH, OTP storage,
@@ -245,9 +247,13 @@ The hard parts are hard for concrete compatibility reasons:
   Bitcoin anti-exfil `sign_tx` now returns signer commitments from `tx_input`
   and DER signatures from `get_signature`, matching P2PKH, P2WPKH,
   P2SH-P2WPKH, P2WSH, and multi-input legacy P2PKH anti-exfil fixtures,
-  including empty responses for pathless inputs. Bad anti-exfil host-entropy
-  lengths now return the v1-compatible protocol error before the
-  commitment/entropy consistency check. Liquid `sign_liquid_tx` now enters the
+  including empty responses for pathless inputs. All original Bitcoin
+  transaction JSON fixtures are now referenced directly from Rust tests,
+  including large/pathless inputs, OP_RETURN and pay-to-Taproot output cases,
+  no-output-script segwit, explicit sighashes, malformed anti-exfil requests,
+  missing `input_tx`, and total-input-less-than-output rejection. Bad
+  anti-exfil host-entropy lengths now return the v1-compatible protocol error
+  before the commitment/entropy consistency check. Liquid `sign_liquid_tx` now enters the
   Rust v1 adapter for network validation, public `elements` transaction
   parsing, input-count validation, trusted-commitment array checks, factor
   or explicit-proof verification against output asset/value commitments, change
@@ -290,9 +296,10 @@ The hard parts are hard for concrete compatibility reasons:
    where parity is implemented and tracks remaining signing and Liquid
    transaction flows as active implementation work.
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
-   Rust fixture gate now directly references 171 of 210 original `test_data`
-   files; unreferenced fixtures remain active parity work rather than retired
-   coverage.
+   Rust fixture gate now directly references all 210 original `test_data`
+   files. QR image recognition remains a platform-backend responsibility, but
+   the Rust v1 debug adapter and all non-image fixture payloads are covered by
+   host tests.
 
 ## C/C++ Removal Rule
 

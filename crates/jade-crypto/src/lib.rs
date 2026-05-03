@@ -1361,6 +1361,16 @@ pub mod pure_rust {
             .ok_or(TxSignError::Invalid)
     }
 
+    pub fn bitcoin_tx_output_amount_sum(txn: &[u8]) -> Result<u64, TxSignError> {
+        bitcoin_transaction_view(txn)
+            .and_then(|tx| {
+                tx.outputs
+                    .into_iter()
+                    .try_fold(0u64, |sum, output| sum.checked_add(output.amount))
+            })
+            .ok_or(TxSignError::Invalid)
+    }
+
     pub fn bitcoin_prevout_amount(
         txn: &[u8],
         tx_input_index: usize,

@@ -67,6 +67,7 @@ struct BitcoinSignTxSession {
     txn: Vec<u8>,
     expected_inputs: usize,
     received_inputs: usize,
+    received_input_satoshi: Option<u64>,
     next_signature: usize,
     flow: BitcoinSignTxFlow,
     liquid_network: Option<jade_crypto::LiquidNetwork>,
@@ -2275,6 +2276,7 @@ impl Emulator {
             txn,
             expected_inputs,
             received_inputs: 0,
+            received_input_satoshi: Some(0),
             next_signature: 0,
             flow,
             liquid_network: None,
@@ -2342,6 +2344,7 @@ impl Emulator {
             txn: txn.to_vec(),
             expected_inputs,
             received_inputs: 0,
+            received_input_satoshi: Some(0),
             next_signature: 0,
             flow,
             liquid_network: Some(liquid_network),
@@ -2392,6 +2395,38 @@ impl Emulator {
             };
         }
         let tx_input_index = session.received_inputs;
+        if session.flow == BitcoinSignTxFlow::Legacy
+            && session.expected_inputs > 1
+            && input.path.is_some()
+            && input.is_witness
+            && input.input_tx.is_none()
+        {
+            return bad_parameters("Failed to extract input_tx from parameters");
+        }
+        let input_amount = match bitcoin_tx_input_amount(&session.txn, tx_input_index, &input) {
+            Ok(amount) => amount,
+            Err(jade_crypto::TxSignError::Invalid) => {
+                return bad_parameters("Failed to extract tx input from parameters")
+            }
+            Err(jade_crypto::TxSignError::Unsupported) => {
+                return V1Outcome::DeferredToCore {
+                    method: "sign_tx signing".to_string(),
+                }
+            }
+        };
+        session.received_input_satoshi = match (session.received_input_satoshi, input_amount) {
+            (Some(total), Some(amount)) => total.checked_add(amount),
+            _ => None,
+        };
+        if session.flow == BitcoinSignTxFlow::Legacy
+            && session.received_inputs + 1 == session.expected_inputs
+            && session.received_input_satoshi.is_some_and(|total| {
+                jade_crypto::pure_rust::bitcoin_tx_output_amount_sum(&session.txn)
+                    .is_ok_and(|outputs| total < outputs)
+            })
+        {
+            return bad_parameters("Total input amounts less than total output amounts");
+        }
         let ae_signer_commitment = if let Some(host_commitment) = input.ae_host_commitment.as_ref()
         {
             if session.flow != BitcoinSignTxFlow::Staged {
@@ -4958,6 +4993,20 @@ fn bitcoin_tx_sign_input<'a>(
         is_witness: input.is_witness,
         satoshi,
     }))
+}
+
+fn bitcoin_tx_input_amount(
+    txn: &[u8],
+    tx_input_index: usize,
+    input: &BitcoinTxInputParams,
+) -> Result<Option<u64>, jade_crypto::TxSignError> {
+    match (input.satoshi, input.input_tx.as_deref()) {
+        (Some(satoshi), _) => Ok(Some(satoshi)),
+        (None, Some(input_tx)) => {
+            jade_crypto::pure_rust::bitcoin_prevout_amount(txn, tx_input_index, input_tx).map(Some)
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn is_taproot_script_pubkey(script: &[u8]) -> bool {
@@ -7614,6 +7663,9 @@ mod tests {
         let end = rest
             .find(|byte: char| !byte.is_ascii_digit())
             .unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
         Some(rest[..end].parse().unwrap())
     }
 
@@ -7760,6 +7812,30 @@ mod tests {
         num_inputs: u64,
         use_ae_signatures: bool,
     ) -> Vec<u8> {
+        if fixture.contains("\"change\": null") {
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(4)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(fixture_network(fixture))
+                .unwrap()
+                .str("txn")
+                .unwrap()
+                .bytes(txn)
+                .unwrap()
+                .str("num_inputs")
+                .unwrap()
+                .u64(num_inputs)
+                .unwrap()
+                .str("use_ae_signatures")
+                .unwrap()
+                .bool(use_ae_signatures)
+                .unwrap();
+            return params;
+        }
+
         let change = fixture_array_entries(fixture, "change");
         let mut params = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut params);
@@ -8395,6 +8471,65 @@ mod tests {
         }
         if let Some(input_tx) = input_tx {
             encoder.str("input_tx").unwrap().bytes(input_tx).unwrap();
+        }
+        params
+    }
+
+    fn sign_tx_input_params_from_fixture(input: &str, use_ae_signatures: bool) -> Vec<u8> {
+        let is_witness = fixture_object_optional_bool_value(input, "is_witness").unwrap_or(false);
+        let satoshi = fixture_object_u64_value(input, "satoshi");
+        let input_tx = fixture_object_hex_value(input, "input_tx").map(decode_hex_vec);
+        if !input.contains("\"path\": [") || !input.contains("\"script\": \"") {
+            return sign_tx_unsigned_input_params(is_witness, satoshi, input_tx.as_deref());
+        }
+
+        let path = fixture_object_path(input);
+        let script = decode_hex_vec(fixture_object_required_hex_value(input, "script"));
+        let sighash = fixture_object_u64_value(input, "sighash").unwrap_or(1);
+        let host_commitment = fixture_object_hex_value(input, "ae_host_commitment");
+        let field_count = 4
+            + u64::from(satoshi.is_some())
+            + u64::from(input_tx.is_some())
+            + u64::from(use_ae_signatures && host_commitment.is_some());
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(field_count)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(is_witness)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(path.len() as u64)
+            .unwrap();
+        for child in &path {
+            encoder.u32(*child).unwrap();
+        }
+        encoder
+            .str("script")
+            .unwrap()
+            .bytes(&script)
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(sighash)
+            .unwrap();
+        if let Some(satoshi) = satoshi {
+            encoder.str("satoshi").unwrap().u64(satoshi).unwrap();
+        }
+        if let Some(input_tx) = &input_tx {
+            encoder.str("input_tx").unwrap().bytes(input_tx).unwrap();
+        }
+        if use_ae_signatures {
+            if let Some(host_commitment) = host_commitment {
+                encoder
+                    .str("ae_host_commitment")
+                    .unwrap()
+                    .bytes(&decode_hex_vec(host_commitment))
+                    .unwrap();
+            }
         }
         params
     }
@@ -9081,6 +9216,17 @@ mod tests {
             "sh(multi(k))" => MultisigVariant::P2sh,
             "sh(wsh(multi(k)))" => MultisigVariant::P2wshP2sh,
             variant => panic!("unexpected fixture multisig variant: {variant}"),
+        }
+    }
+
+    fn fixture_qr_expected_bytes(fixture: &str) -> Vec<u8> {
+        if let Some(hex) = fixture_object_hex_value(fixture, "hex") {
+            decode_hex_vec(hex)
+        } else {
+            fixture_object_string_value(fixture, "text")
+                .unwrap()
+                .as_bytes()
+                .to_vec()
         }
     }
 
@@ -10709,6 +10855,192 @@ mod tests {
             emulator.handle_v1_request(&input_request),
             V1Outcome::BytesResult { result: Vec::new() }
         );
+    }
+
+    #[test]
+    fn sign_tx_matches_original_json_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/tx_ss_p2wpkh_single_input.json"),
+            include_str!("../../../test_data/txn_large.json"),
+            include_str!("../../../test_data/txn_legacy.json"),
+            include_str!("../../../test_data/txn_legacy_p2sh_change.json"),
+            include_str!("../../../test_data/txn_op_return_output.json"),
+            include_str!("../../../test_data/txn_pay_to_tr.json"),
+            include_str!("../../../test_data/txn_segwit.json"),
+            include_str!("../../../test_data/txn_segwit2.json"),
+            include_str!("../../../test_data/txn_segwit_no_output_script.json"),
+            include_str!("../../../test_data/txn_segwit_sighashes.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let inputs = fixture_input_entries(fixture);
+            let first_path = fixture_object_path(inputs.first().unwrap().unwrap());
+            let seed = if first_path.first() == Some(&2_147_483_732) {
+                test_mnemonic_single_sig_seed()
+            } else {
+                test_mnemonic_seed()
+            };
+            emulator.platform_mut().set_debug_wallet_seed(seed.to_vec());
+            let use_ae_signatures =
+                fixture_object_optional_bool_value(fixture, "use_ae_signatures").unwrap_or(false);
+            let expected = fixture_expected_output_items(fixture);
+            if use_ae_signatures {
+                assert_eq!(inputs.len() * 2, expected.len());
+            } else {
+                assert_eq!(inputs.len(), expected.len());
+            }
+
+            let start_params = sign_tx_start_params_from_fixture(
+                fixture,
+                &txn,
+                inputs.len() as u64,
+                use_ae_signatures,
+            );
+            let start_request = Request {
+                id: Cow::Borrowed("tx"),
+                method: Cow::Borrowed("sign_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            if use_ae_signatures {
+                let mut expected = expected.into_iter();
+                for input in inputs {
+                    let input = input.unwrap();
+                    let expected_commitment = expected.next().unwrap();
+                    let expected_signature = expected.next().unwrap();
+                    let input_params = sign_tx_input_params_from_fixture(input, true);
+                    let input_request = Request {
+                        id: Cow::Borrowed("input"),
+                        method: Cow::Borrowed("tx_input"),
+                        params: Some(&input_params),
+                    };
+                    assert_eq!(
+                        emulator.handle_v1_request(&input_request),
+                        V1Outcome::BytesResult {
+                            result: decode_hex_vec(expected_commitment)
+                        }
+                    );
+                    let host_entropy =
+                        decode_hex_vec(fixture_object_required_hex_value(input, "ae_host_entropy"));
+                    let signature_params = get_signature_params_with_raw_entropy(&host_entropy);
+                    let signature_request = Request {
+                        id: Cow::Borrowed("sig"),
+                        method: Cow::Borrowed("get_signature"),
+                        params: Some(&signature_params),
+                    };
+                    assert_eq!(
+                        emulator.handle_v1_request(&signature_request),
+                        V1Outcome::BytesResult {
+                            result: decode_hex_vec(expected_signature)
+                        }
+                    );
+                }
+            } else {
+                for (input, expected_item) in inputs.into_iter().zip(expected) {
+                    let input_params = sign_tx_input_params_from_fixture(input.unwrap(), false);
+                    let input_request = Request {
+                        id: Cow::Borrowed("input"),
+                        method: Cow::Borrowed("tx_input"),
+                        params: Some(&input_params),
+                    };
+                    assert_eq!(
+                        emulator.handle_v1_request(&input_request),
+                        V1Outcome::BytesResult {
+                            result: decode_hex_vec(expected_item)
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sign_tx_rejects_original_bad_json_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/badtxn_segwit_multi_input.json"),
+            include_str!("../../../test_data/badtxn_segwit_zero_sats.json"),
+            include_str!("../../../test_data/tx_ss_bad_ae_1.json"),
+            include_str!("../../../test_data/tx_ss_bad_ae_2.json"),
+            include_str!("../../../test_data/tx_ss_bad_ae_3.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let inputs = fixture_input_entries(fixture);
+            let first_path = fixture_object_path(inputs.first().unwrap().unwrap());
+            let seed = if first_path.first() == Some(&2_147_483_732) {
+                test_mnemonic_single_sig_seed()
+            } else {
+                test_mnemonic_seed()
+            };
+            emulator.platform_mut().set_debug_wallet_seed(seed.to_vec());
+            let use_ae_signatures =
+                fixture_object_optional_bool_value(fixture, "use_ae_signatures").unwrap_or(false);
+            let start_params = sign_tx_start_params_from_fixture(
+                fixture,
+                &txn,
+                inputs.len() as u64,
+                use_ae_signatures,
+            );
+            let start_request = Request {
+                id: Cow::Borrowed("tx"),
+                method: Cow::Borrowed("sign_tx"),
+                params: Some(&start_params),
+            };
+            match emulator.handle_v1_request(&start_request) {
+                V1Outcome::BoolResult { result: true } => {}
+                outcome => {
+                    assert_eq!(
+                        outcome,
+                        V1Outcome::Reject {
+                            code: ErrorCode::BadParameters,
+                            message: fixture_expected_error(fixture).to_string(),
+                        }
+                    );
+                    continue;
+                }
+            }
+
+            let input_params = sign_tx_input_params_from_fixture(
+                inputs.first().unwrap().unwrap(),
+                use_ae_signatures,
+            );
+            let input_request = Request {
+                id: Cow::Borrowed("input"),
+                method: Cow::Borrowed("tx_input"),
+                params: Some(&input_params),
+            };
+            match emulator.handle_v1_request(&input_request) {
+                V1Outcome::Reject { code, message } => {
+                    assert_eq!(code, ErrorCode::BadParameters);
+                    assert_eq!(message, fixture_expected_error(fixture));
+                }
+                V1Outcome::BytesResult { .. } if use_ae_signatures => {
+                    let input = inputs.first().unwrap().unwrap();
+                    let signature_params =
+                        if let Some(entropy) = fixture_object_hex_value(input, "ae_host_entropy") {
+                            get_signature_params_with_raw_entropy(&decode_hex_vec(entropy))
+                        } else {
+                            get_signature_params()
+                        };
+                    let signature_request = Request {
+                        id: Cow::Borrowed("sig"),
+                        method: Cow::Borrowed("get_signature"),
+                        params: Some(&signature_params),
+                    };
+                    match emulator.handle_v1_request(&signature_request) {
+                        V1Outcome::Reject { message, .. } => {
+                            assert_eq!(message, fixture_expected_error(fixture));
+                        }
+                        outcome => panic!("expected fixture rejection, got {outcome:?}"),
+                    }
+                }
+                outcome => panic!("expected fixture rejection, got {outcome:?}"),
+            }
+        }
     }
 
     #[test]
@@ -17807,6 +18139,100 @@ mod tests {
                 result: b"jade-qr".to_vec(),
             }
         );
+    }
+
+    #[test]
+    fn debug_scan_qr_matches_original_qvga_fixture_payloads() {
+        for (fixture, image, image_name) in [
+            (
+                include_str!("../../../test_data/qr_qvga_bcur_psbt.json"),
+                include_bytes!("../../../test_data/qr_qvga_bcur_psbt.dat").as_slice(),
+                "qr_qvga_bcur_psbt.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_compactseedqr_vec1.json"),
+                include_bytes!("../../../test_data/qr_qvga_compactseedqr_vec1.dat").as_slice(),
+                "qr_qvga_compactseedqr_vec1.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_compactseedqr_vec7.json"),
+                include_bytes!("../../../test_data/qr_qvga_compactseedqr_vec7.dat").as_slice(),
+                "qr_qvga_compactseedqr_vec7.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_compactseedqr_vec8.json"),
+                include_bytes!("../../../test_data/qr_qvga_compactseedqr_vec8.dat").as_slice(),
+                "qr_qvga_compactseedqr_vec8.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_compactseedqr_vec9.json"),
+                include_bytes!("../../../test_data/qr_qvga_compactseedqr_vec9.dat").as_slice(),
+                "qr_qvga_compactseedqr_vec9.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_high_res.json"),
+                include_bytes!("../../../test_data/qr_qvga_high_res.dat").as_slice(),
+                "qr_qvga_high_res.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_hotp.json"),
+                include_bytes!("../../../test_data/qr_qvga_hotp.dat").as_slice(),
+                "qr_qvga_hotp.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_low_res.json"),
+                include_bytes!("../../../test_data/qr_qvga_low_res.dat").as_slice(),
+                "qr_qvga_low_res.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_mnemonic_prefixes.json"),
+                include_bytes!("../../../test_data/qr_qvga_mnemonic_prefixes.dat").as_slice(),
+                "qr_qvga_mnemonic_prefixes.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_seedqr_vec1.json"),
+                include_bytes!("../../../test_data/qr_qvga_seedqr_vec1.dat").as_slice(),
+                "qr_qvga_seedqr_vec1.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_test_mnemonic.json"),
+                include_bytes!("../../../test_data/qr_qvga_test_mnemonic.dat").as_slice(),
+                "qr_qvga_test_mnemonic.dat",
+            ),
+            (
+                include_str!("../../../test_data/qr_qvga_totp.json"),
+                include_bytes!("../../../test_data/qr_qvga_totp.dat").as_slice(),
+                "qr_qvga_totp.dat",
+            ),
+        ] {
+            assert_eq!(
+                fixture_object_string_value(fixture, "image"),
+                Some(image_name)
+            );
+            let expected = fixture_qr_expected_bytes(fixture);
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_scan_qr_result(image.to_vec(), expected.clone());
+
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(1)
+                .unwrap()
+                .str("image")
+                .unwrap()
+                .bytes(image)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("debug"),
+                method: Cow::Borrowed("debug_scan_qr"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult { result: expected }
+            );
+        }
     }
 
     #[test]
