@@ -13,8 +13,9 @@ be expanded under differential tests.
 - `jade-crypto`: backend traits for secp256k1, P-256, and BIP85 RSA behavior.
 - `jade-storage`: storage trait boundary for NVS/host backends.
 - `jade-emulator`: Rust v1 behavior engine and host emulator entrypoint. The
-  library now supports `no_std + alloc` with `default-features = false`; the
-  CLI binary keeps the default `std` feature for host conveniences.
+  library now exposes `JadeRuntime<P, B>` over platform and storage backend
+  types, supports `no_std + alloc` with `default-features = false`, and keeps
+  the CLI binary on the default `std` feature for host conveniences.
 - `jade-fw-esp32s3`: Jade v2/v2c platform shell with official target
   manifests, partition/OTA slot budgets, runtime constructor, and ESP32-S3
   capability traits for serial, BLE, USB, camera QR, touch, rollback, and
@@ -60,11 +61,14 @@ conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, and call
 the transport pollers from the board event loop.
 
 The large v1 wallet/signing implementation is also no longer intrinsically
-host-only: `cargo check -p jade-emulator --no-default-features --lib` passes, so
-that Rust behavior engine can be split further and linked into firmware crates
-without pulling in `std`. The remaining extraction work is to replace
-`HostPlatform`/`MemoryStorage` ownership with device-backed storage, entropy,
-clock, display, camera, and confirmation traits.
+host-only: `cargo check -p jade-emulator --no-default-features --lib` passes,
+and the implementation now has `JadeRuntime<P, B>` with a host `Emulator` alias
+for `JadeRuntime<HostPlatform, MemoryStorage>`. A device-style storage backend
+test instantiates the generic runtime without `MemoryStorage`, which is the
+first step toward using NVS-backed storage on hardware. The remaining extraction
+work is to move the full `handle_v1_request` implementation off the host alias
+and replace `HostPlatform` hooks with device-backed entropy, clock, display,
+camera, confirmation, OTA, and attestation traits.
 
 ## State Domains
 

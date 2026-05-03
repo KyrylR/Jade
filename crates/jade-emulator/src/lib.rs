@@ -28,23 +28,25 @@ use jade_protocol_v1::{
 use jade_storage::{
     key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
     parse_multisig_summary, DescriptorDataValue, DescriptorDetails, JadeStorage, MemoryStorage,
-    MultisigDetails, MultisigSignerDetails, MultisigVariant, RecordAuthenticator, StorageLimits,
-    StorageNamespace, StorageRecord, HMAC_SHA256_LEN,
+    MultisigDetails, MultisigSignerDetails, MultisigVariant, RecordAuthenticator, StorageBackend,
+    StorageLimits, StorageNamespace, StorageRecord, HMAC_SHA256_LEN,
 };
 use minicbor::{data::Type, Decoder};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
-pub struct Emulator {
+pub struct JadeRuntime<P, B> {
     state: CoreState,
-    platform: HostPlatform,
-    storage: JadeStorage<MemoryStorage>,
+    platform: P,
+    storage: JadeStorage<B>,
     ota: Option<HostOtaSession>,
     sign_tx: Option<BitcoinSignTxSession>,
     sign_message_ae: Option<BitcoinSignMessageAeSession>,
     pin: Option<PinClientSession>,
     extended_data: Option<ExtendedDataSession>,
 }
+
+pub type Emulator = JadeRuntime<HostPlatform, MemoryStorage>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultisigAddressNetwork {
@@ -131,18 +133,59 @@ impl BitcoinSignTxFlow {
 
 const EXTENDED_DATA_CHUNK_SIZE: usize = 3 * 1024 - 64;
 
-impl Default for Emulator {
-    fn default() -> Self {
+impl<P, B> JadeRuntime<P, B>
+where
+    B: StorageBackend,
+{
+    pub fn from_parts(platform: P, storage_backend: B, storage_limits: StorageLimits) -> Self {
         Self {
             state: CoreState::default(),
-            platform: HostPlatform::default(),
-            storage: JadeStorage::new(MemoryStorage::new(), StorageLimits::ESP32_NVS_DEFAULT),
+            platform,
+            storage: JadeStorage::new(storage_backend, storage_limits),
             ota: None,
             sign_tx: None,
             sign_message_ae: None,
             pin: None,
             extended_data: None,
         }
+    }
+
+    pub fn state(&self) -> &CoreState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut CoreState {
+        &mut self.state
+    }
+
+    pub fn runtime_platform(&self) -> &P {
+        &self.platform
+    }
+
+    pub fn runtime_platform_mut(&mut self) -> &mut P {
+        &mut self.platform
+    }
+
+    pub fn runtime_storage(&self) -> &JadeStorage<B> {
+        &self.storage
+    }
+
+    pub fn runtime_storage_mut(&mut self) -> &mut JadeStorage<B> {
+        &mut self.storage
+    }
+
+    pub fn into_parts(self) -> (CoreState, P, JadeStorage<B>) {
+        (self.state, self.platform, self.storage)
+    }
+}
+
+impl Default for Emulator {
+    fn default() -> Self {
+        Self::from_parts(
+            HostPlatform::default(),
+            MemoryStorage::new(),
+            StorageLimits::ESP32_NVS_DEFAULT,
+        )
     }
 }
 
@@ -5216,13 +5259,16 @@ fn optional_cbor_map_bytes_array<const N: usize>(
         .transpose()
 }
 
-fn validate_bitcoin_change_outputs(
+fn validate_bitcoin_change_outputs<B>(
     raw_params: &[u8],
     txn: &[u8],
     seed: &[u8],
     network_name: &str,
-    storage: &JadeStorage<MemoryStorage>,
-) -> Result<(), &'static str> {
+    storage: &JadeStorage<B>,
+) -> Result<(), &'static str>
+where
+    B: StorageBackend,
+{
     let Some(raw) = cbor_map_field(raw_params, "change")
         .map_err(|_| "Unexpected number of output entries for transaction")?
     else {
@@ -5301,12 +5347,15 @@ fn validate_bitcoin_change_outputs(
     Ok(())
 }
 
-fn registered_descriptor_change_script_pubkey(
-    storage: &JadeStorage<MemoryStorage>,
+fn registered_descriptor_change_script_pubkey<B>(
+    storage: &JadeStorage<B>,
     descriptor_name: &str,
     raw: &[u8],
     network: jade_crypto::BitcoinNetwork,
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Vec<u8>, &'static str>
+where
+    B: StorageBackend,
+{
     if !key_name_valid(descriptor_name) {
         return Err("Invalid descriptor name parameter");
     }
@@ -5336,11 +5385,14 @@ fn registered_descriptor_change_script_pubkey(
         .ok_or("Receive script cannot be constructed")
 }
 
-fn registered_multisig_change_script_pubkey(
-    storage: &JadeStorage<MemoryStorage>,
+fn registered_multisig_change_script_pubkey<B>(
+    storage: &JadeStorage<B>,
     multisig_name: &str,
     raw: &[u8],
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Vec<u8>, &'static str>
+where
+    B: StorageBackend,
+{
     if !key_name_valid(multisig_name) {
         return Err("Invalid multisig name parameter");
     }
@@ -18473,5 +18525,110 @@ mod tests {
             emulator.handle_v1_cbor(&request),
             [0xa2, 0x62, b'i', b'd', 0x61, b'3', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0xf5,]
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct DeviceStyleStorage {
+        records: Vec<(StorageNamespace, String, Vec<u8>)>,
+    }
+
+    impl StorageBackend for DeviceStyleStorage {
+        fn get(
+            &self,
+            namespace: StorageNamespace,
+            key: &str,
+            out: &mut Vec<u8>,
+        ) -> jade_storage::StorageResult<()> {
+            let Some((_, _, value)) =
+                self.records
+                    .iter()
+                    .find(|(record_namespace, record_key, _)| {
+                        *record_namespace == namespace && record_key == key
+                    })
+            else {
+                return Err(jade_storage::StorageError::NotFound);
+            };
+            out.clear();
+            out.extend_from_slice(value);
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            namespace: StorageNamespace,
+            key: &str,
+            value: &[u8],
+        ) -> jade_storage::StorageResult<()> {
+            if let Some((_, _, stored)) =
+                self.records
+                    .iter_mut()
+                    .find(|(record_namespace, record_key, _)| {
+                        *record_namespace == namespace && record_key == key
+                    })
+            {
+                stored.clear();
+                stored.extend_from_slice(value);
+            } else {
+                self.records
+                    .push((namespace, key.to_string(), value.to_vec()));
+            }
+            Ok(())
+        }
+
+        fn erase(
+            &mut self,
+            namespace: StorageNamespace,
+            key: &str,
+        ) -> jade_storage::StorageResult<()> {
+            let Some(index) = self
+                .records
+                .iter()
+                .position(|(record_namespace, record_key, _)| {
+                    *record_namespace == namespace && record_key == key
+                })
+            else {
+                return Err(jade_storage::StorageError::NotFound);
+            };
+            self.records.remove(index);
+            Ok(())
+        }
+
+        fn list(
+            &self,
+            namespace: StorageNamespace,
+            out: &mut Vec<String>,
+        ) -> jade_storage::StorageResult<()> {
+            out.clear();
+            out.extend(
+                self.records
+                    .iter()
+                    .filter(|(record_namespace, _, _)| *record_namespace == namespace)
+                    .map(|(_, key, _)| key.clone()),
+            );
+            out.sort();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn generic_runtime_accepts_device_style_storage_backend() {
+        let mut runtime = JadeRuntime::from_parts(
+            HostPlatform::default(),
+            DeviceStyleStorage::default(),
+            StorageLimits::ESP32_NVS_DEFAULT,
+        );
+
+        runtime
+            .runtime_storage_mut()
+            .set_record(StorageRecord::EncryptedBlob, b"device-backed")
+            .unwrap();
+        let mut value = Vec::new();
+        runtime
+            .runtime_storage()
+            .get_record(StorageRecord::EncryptedBlob, &mut value)
+            .unwrap();
+
+        assert_eq!(value, b"device-backed");
+        assert_eq!(runtime.state().wallet, WalletLifecycle::Uninit);
     }
 }
