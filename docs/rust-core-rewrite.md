@@ -134,7 +134,9 @@ delegating the repeated boot/tick/stop policy to the Rust firmware crate.
 The runners support both bounded host/test execution with `run_until_stop` and
 unbounded firmware execution with `run_until_hook_stop`, so production glue can
 run until the hook layer requests shutdown without inventing a synthetic tick
-limit.
+limit. Boot failures are also routed through `on_boot_error` before the loop
+returns, allowing a real device hook layer to show recovery UI or retry
+hardware readiness checks while keeping the default fail-stop behavior.
 The target crates also expose `run_board_stream_loop_from_storage` and
 `run_board_stream_loop_with_nvs_storage` helpers, which are the current
 Rust-side `app_main` contract: pass the concrete platform shim, concrete NVS

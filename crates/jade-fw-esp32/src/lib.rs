@@ -218,6 +218,10 @@ pub trait Esp32BoardLoopHooks {
         Esp32BoardLoopDecision::Continue
     }
 
+    fn on_boot_error(&mut self, _error: DeviceRuntimeError) -> Esp32BoardLoopDecision {
+        Esp32BoardLoopDecision::Stop
+    }
+
     fn on_tick(&mut self, _report: &Esp32BoardTickReport<'_>) -> Esp32BoardLoopDecision {
         Esp32BoardLoopDecision::Continue
     }
@@ -361,7 +365,15 @@ where
         H: Esp32BoardLoopHooks,
     {
         if !self.app.is_booted() {
-            let report = self.app.boot().map_err(Esp32BoardLoopError::Boot)?;
+            let report = match self.app.boot() {
+                Ok(report) => report,
+                Err(error) => {
+                    if hooks.on_boot_error(error) == Esp32BoardLoopDecision::Stop {
+                        return Err(Esp32BoardLoopError::Boot(error));
+                    }
+                    return Ok(Esp32BoardLoopDecision::Continue);
+                }
+            };
             if hooks.on_boot(&report) == Esp32BoardLoopDecision::Stop {
                 return Ok(Esp32BoardLoopDecision::Stop);
             }
@@ -1335,6 +1347,7 @@ mod tests {
         runtime_state: RuntimePlatformState,
         epoch: Option<u64>,
         manifest: DeviceManifest,
+        boot_report: jade_core::DeviceBootReport,
         serial_rx: Option<Vec<u8>>,
         serial_tx: Vec<Vec<u8>>,
         ble_rx: Option<Vec<u8>>,
@@ -1470,6 +1483,7 @@ mod tests {
                 runtime_state: RuntimePlatformState::default(),
                 epoch: None,
                 manifest,
+                boot_report: jade_core::DeviceBootReport::ok(manifest.target),
                 serial_rx: None,
                 serial_tx: Vec::new(),
                 ble_rx: None,
@@ -1552,7 +1566,7 @@ mod tests {
         }
 
         fn boot_report(&mut self) -> jade_core::DeviceBootReport {
-            jade_core::DeviceBootReport::ok(self.manifest.target)
+            self.boot_report
         }
 
         fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
@@ -2262,6 +2276,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct Esp32BootRetryHooks {
+        boot_errors: usize,
+        boots: usize,
+        ticks: usize,
+    }
+
+    impl Esp32BoardLoopHooks for Esp32BootRetryHooks {
+        fn on_boot_error(&mut self, error: DeviceRuntimeError) -> Esp32BoardLoopDecision {
+            assert_eq!(
+                error,
+                DeviceRuntimeError::Boot(DeviceBootFailure::EntropyUnavailable)
+            );
+            self.boot_errors += 1;
+            Esp32BoardLoopDecision::Continue
+        }
+
+        fn on_boot(&mut self, report: &jade_core::DeviceBootReport) -> Esp32BoardLoopDecision {
+            assert_eq!(report.target, DeviceTarget::Jade);
+            self.boots += 1;
+            Esp32BoardLoopDecision::Continue
+        }
+
+        fn on_tick(&mut self, _report: &Esp32BoardTickReport<'_>) -> Esp32BoardLoopDecision {
+            self.ticks += 1;
+            Esp32BoardLoopDecision::Stop
+        }
+    }
+
     #[test]
     fn esp32_board_stream_loop_boots_and_runs_until_hook_stop() {
         let mut serial_frames = vec![0; RX_BUFFER_BYTES];
@@ -2310,6 +2353,51 @@ mod tests {
             1
         );
         assert_eq!(event_loop.app().runtime().platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_stream_loop_can_retry_after_boot_error_hook() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut platform = TestPlatform::new(JADE_MANIFEST);
+        platform.boot_report = jade_core::DeviceBootReport {
+            entropy_ready: false,
+            ..jade_core::DeviceBootReport::ok(DeviceTarget::Jade)
+        };
+        let app = Esp32BoardStreamApp::new(
+            platform,
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+        let mut event_loop = Esp32BoardStreamLoop::new(app);
+        let mut hooks = Esp32BootRetryHooks::default();
+
+        assert_eq!(
+            event_loop.run_once(&mut hooks),
+            Ok(Esp32BoardLoopDecision::Continue)
+        );
+        assert!(!event_loop.app().is_booted());
+        assert_eq!(hooks.boot_errors, 1);
+        assert_eq!(hooks.boots, 0);
+        assert_eq!(hooks.ticks, 0);
+
+        event_loop
+            .app_mut()
+            .runtime_mut()
+            .platform_mut()
+            .boot_report = jade_core::DeviceBootReport::ok(DeviceTarget::Jade);
+        assert_eq!(
+            event_loop.run_once(&mut hooks),
+            Ok(Esp32BoardLoopDecision::Stop)
+        );
+        assert!(event_loop.app().is_booted());
+        assert_eq!(hooks.boot_errors, 1);
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 1);
     }
 
     #[test]
