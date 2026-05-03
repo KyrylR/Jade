@@ -164,6 +164,13 @@ where
         }
         poll_camera_qr(self.platform_mut(), out).map_err(FirmwareFrameError::Io)
     }
+
+    pub fn poll_touch(&mut self) -> Result<Option<TouchEvent>, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_touch(self.platform_mut()).map_err(FirmwareFrameError::Io)
+    }
 }
 
 pub fn runtime_for_v2<P>(platform: P) -> Esp32s3Runtime<P>
@@ -235,6 +242,13 @@ where
     out.get(..len)
         .ok_or(DeviceBootFailure::TransportUnavailable)
         .map(Some)
+}
+
+pub fn poll_touch<P>(platform: &mut P) -> Result<Option<TouchEvent>, DeviceBootFailure>
+where
+    P: Esp32s3PlatformShim,
+{
+    platform.touch_poll()
 }
 
 pub fn poll_serial_v1<P>(
@@ -468,6 +482,7 @@ mod tests {
         ble_rx: Option<Vec<u8>>,
         ble_tx: Vec<Vec<u8>>,
         camera_rx: Option<Vec<u8>>,
+        touch_rx: Option<TouchEvent>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,6 +544,7 @@ mod tests {
                 ble_rx: None,
                 ble_tx: Vec::new(),
                 camera_rx: None,
+                touch_rx: None,
             }
         }
 
@@ -638,7 +654,7 @@ mod tests {
         }
 
         fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure> {
-            Ok(None)
+            Ok(self.touch_rx.take())
         }
 
         fn hardware_attestation_available(&self) -> bool {
@@ -769,6 +785,23 @@ mod tests {
             poll_camera_qr(&mut platform, &mut qr),
             Err(DeviceBootFailure::TransportUnavailable)
         );
+    }
+
+    #[test]
+    fn s3_board_runtime_polls_touch_after_boot() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().touch_rx = Some(TouchEvent::Press { x: 123, y: 45 });
+
+        assert_eq!(board.poll_touch(), Err(FirmwareFrameError::BootRequired));
+        board.boot().unwrap();
+        assert_eq!(
+            board.poll_touch().unwrap(),
+            Some(TouchEvent::Press { x: 123, y: 45 })
+        );
+        assert_eq!(board.poll_touch(), Ok(None));
     }
 
     #[test]
