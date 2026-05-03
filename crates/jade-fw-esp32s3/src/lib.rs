@@ -9,9 +9,10 @@ use jade_core::{
     AllocationBudget, CborFrameBuffer, CoreResult, CoreState, DeviceBootFailure,
     DeviceBootReadiness, DeviceBootReport, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
     DevicePartitionLayout, DevicePlatform, DeviceRunningImage, DeviceRuntime, DeviceRuntimeError,
-    DeviceTarget, DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
-    OtaUploadVerifier, OtaWriteError, OtaWriteSession, Platform, StaticVersionContext,
-    UserConfirmation, UserConfirmationDecision, VersionDebugInfo, VersionInfo,
+    DeviceServiceReadiness, DeviceTarget, DisplayStatus, FirmwareFrameError, FirmwareProtocol,
+    OtaImageWriter, OtaRequest, OtaUploadVerifier, OtaWriteError, OtaWriteSession, Platform,
+    StaticVersionContext, UserConfirmation, UserConfirmationDecision, VersionDebugInfo,
+    VersionInfo,
 };
 use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
 
@@ -80,8 +81,12 @@ pub trait Esp32s3PlatformShim: DevicePlatform {
 
 pub trait Esp32s3Hardware {
     fn manifest(&self) -> DeviceManifest;
+    fn service_readiness(&mut self) -> DeviceServiceReadiness {
+        DeviceServiceReadiness::ready_for_manifest(self.manifest())
+    }
     fn boot_readiness(&mut self) -> DeviceBootReadiness {
-        DeviceBootReadiness::ready()
+        let manifest = self.manifest();
+        self.service_readiness().boot_readiness(manifest)
     }
     fn boot_report(&mut self) -> DeviceBootReport {
         DeviceBootReport::from_readiness(self.manifest().target, self.boot_readiness())
@@ -2529,6 +2534,12 @@ mod tests {
         readiness: DeviceBootReadiness,
     }
 
+    #[derive(Debug)]
+    struct ServiceReadinessHardware {
+        manifest: DeviceManifest,
+        services: DeviceServiceReadiness,
+    }
+
     impl Esp32s3Hardware for ReadinessHardware {
         fn manifest(&self) -> DeviceManifest {
             self.manifest
@@ -2621,6 +2632,98 @@ mod tests {
         }
     }
 
+    impl Esp32s3Hardware for ServiceReadinessHardware {
+        fn manifest(&self) -> DeviceManifest {
+            self.manifest
+        }
+
+        fn service_readiness(&mut self) -> DeviceServiceReadiness {
+            self.services
+        }
+
+        fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
+            out.fill(0x5a);
+            Ok(())
+        }
+
+        fn monotonic_millis(&self) -> u64 {
+            1
+        }
+
+        fn rollback_secure_version(&self) -> u32 {
+            1
+        }
+
+        fn serial_send(&mut self, _bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn serial_recv(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn usb_send(&mut self, _bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn usb_recv(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn ble_send(&mut self, _bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn ble_recv(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn camera_qr_scan(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure> {
+            Ok(None)
+        }
+
+        fn display_status(&mut self, _status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn confirm_user(
+            &mut self,
+            _request: UserConfirmation<'_>,
+        ) -> Result<UserConfirmationDecision, DeviceBootFailure> {
+            Ok(UserConfirmationDecision::Rejected)
+        }
+
+        fn hardware_attestation_available(&self) -> bool {
+            self.services.hardware_attestation_ready
+        }
+
+        fn hardware_attestation_public_key_pem(
+            &mut self,
+            _out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Err(DeviceBootFailure::TransportUnavailable)
+        }
+
+        fn hardware_attestation_ext_signature(
+            &mut self,
+            _out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Err(DeviceBootFailure::TransportUnavailable)
+        }
+
+        fn hardware_attestation_sign(
+            &mut self,
+            _challenge: &[u8],
+            _out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Err(DeviceBootFailure::TransportUnavailable)
+        }
+    }
+
     #[test]
     fn s3_manifests_match_shipping_targets() {
         assert_eq!(
@@ -2656,6 +2759,30 @@ mod tests {
         assert_eq!(
             runtime.platform_mut().boot_report(),
             DeviceBootReport::from_readiness(DeviceTarget::JadeV2, readiness)
+        );
+    }
+
+    #[test]
+    fn s3_device_platform_derives_boot_gate_from_service_readiness() {
+        let services = DeviceServiceReadiness {
+            signed_image_verifier_ready: false,
+            ..DeviceServiceReadiness::ready()
+        };
+        let mut runtime = runtime_for_v2(Esp32s3DevicePlatform::new(ServiceReadinessHardware {
+            manifest: JADE_V2_MANIFEST,
+            services,
+        }));
+
+        assert_eq!(
+            runtime.boot(),
+            Err(DeviceRuntimeError::Boot(DeviceBootFailure::OtaStateInvalid))
+        );
+        assert_eq!(
+            runtime.platform_mut().boot_report(),
+            DeviceBootReport::from_readiness(
+                DeviceTarget::JadeV2,
+                services.boot_readiness(JADE_V2_MANIFEST)
+            )
         );
     }
 

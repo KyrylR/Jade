@@ -229,6 +229,187 @@ pub enum DeviceBootFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceRequiredService {
+    Entropy,
+    NvsStorage,
+    OtaState,
+    OtaWriter,
+    OtaUploadVerifier,
+    SignedImageVerifier,
+    SecureBoot,
+    FlashEncryption,
+    SerialTransport,
+    BleTransport,
+    UsbTransport,
+    Display,
+    UserInput,
+    CameraQr,
+    Touch,
+    HardwareAttestation,
+    RollbackState,
+}
+
+impl DeviceRequiredService {
+    pub const fn boot_failure(self) -> DeviceBootFailure {
+        match self {
+            Self::Entropy => DeviceBootFailure::EntropyUnavailable,
+            Self::NvsStorage => DeviceBootFailure::StorageUnavailable,
+            Self::OtaState
+            | Self::OtaWriter
+            | Self::OtaUploadVerifier
+            | Self::SignedImageVerifier => DeviceBootFailure::OtaStateInvalid,
+            Self::SecureBoot => DeviceBootFailure::SecureBootDisabled,
+            Self::FlashEncryption => DeviceBootFailure::FlashEncryptionDisabled,
+            Self::SerialTransport | Self::BleTransport | Self::UsbTransport => {
+                DeviceBootFailure::TransportUnavailable
+            }
+            Self::Display
+            | Self::UserInput
+            | Self::CameraQr
+            | Self::Touch
+            | Self::HardwareAttestation => DeviceBootFailure::DisplayUnavailable,
+            Self::RollbackState => DeviceBootFailure::RollbackStateInvalid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceServiceReadiness {
+    pub entropy_ready: bool,
+    pub nvs_ready: bool,
+    pub ota_state_ready: bool,
+    pub ota_writer_ready: bool,
+    pub ota_upload_verifier_ready: bool,
+    pub signed_image_verifier_ready: bool,
+    pub secure_boot_ready: bool,
+    pub flash_encryption_ready: bool,
+    pub serial_ready: bool,
+    pub ble_ready: bool,
+    pub usb_ready: bool,
+    pub display_ready: bool,
+    pub user_input_ready: bool,
+    pub camera_qr_ready: bool,
+    pub touch_ready: bool,
+    pub hardware_attestation_ready: bool,
+    pub rollback_ready: bool,
+}
+
+impl DeviceServiceReadiness {
+    pub const fn ready() -> Self {
+        Self {
+            entropy_ready: true,
+            nvs_ready: true,
+            ota_state_ready: true,
+            ota_writer_ready: true,
+            ota_upload_verifier_ready: true,
+            signed_image_verifier_ready: true,
+            secure_boot_ready: true,
+            flash_encryption_ready: true,
+            serial_ready: true,
+            ble_ready: true,
+            usb_ready: true,
+            display_ready: true,
+            user_input_ready: true,
+            camera_qr_ready: true,
+            touch_ready: true,
+            hardware_attestation_ready: true,
+            rollback_ready: true,
+        }
+    }
+
+    pub const fn ready_for_manifest(_manifest: DeviceManifest) -> Self {
+        Self::ready()
+    }
+
+    pub const fn boot_readiness(self, manifest: DeviceManifest) -> DeviceBootReadiness {
+        let ota_required =
+            manifest.partitions.ota_slots > 0 && manifest.partitions.ota_app_bytes > 0;
+        DeviceBootReadiness {
+            entropy_ready: self.entropy_ready,
+            storage_ready: self.nvs_ready,
+            ota_ready: !ota_required
+                || (self.ota_state_ready
+                    && self.ota_writer_ready
+                    && self.ota_upload_verifier_ready
+                    && self.signed_image_verifier_ready),
+            secure_boot_ready: !manifest.features.secure_boot || self.secure_boot_ready,
+            flash_encryption_ready: !manifest.features.flash_encryption
+                || self.flash_encryption_ready,
+            transport_ready: (!manifest.features.serial || self.serial_ready)
+                && (!manifest.features.ble || self.ble_ready)
+                && (!manifest.features.usb || self.usb_ready),
+            display_ready: self.display_ready
+                && self.user_input_ready
+                && (!manifest.features.camera_qr || self.camera_qr_ready)
+                && (!manifest.features.touch || self.touch_ready)
+                && (!manifest.supports_real_attestation() || self.hardware_attestation_ready),
+            rollback_ready: !manifest.features.anti_rollback || self.rollback_ready,
+        }
+    }
+
+    pub const fn first_missing_required(
+        self,
+        manifest: DeviceManifest,
+    ) -> Option<DeviceRequiredService> {
+        if !self.entropy_ready {
+            Some(DeviceRequiredService::Entropy)
+        } else if !self.nvs_ready {
+            Some(DeviceRequiredService::NvsStorage)
+        } else if manifest.partitions.ota_slots > 0
+            && manifest.partitions.ota_app_bytes > 0
+            && !self.ota_state_ready
+        {
+            Some(DeviceRequiredService::OtaState)
+        } else if manifest.partitions.ota_slots > 0
+            && manifest.partitions.ota_app_bytes > 0
+            && !self.ota_writer_ready
+        {
+            Some(DeviceRequiredService::OtaWriter)
+        } else if manifest.partitions.ota_slots > 0
+            && manifest.partitions.ota_app_bytes > 0
+            && !self.ota_upload_verifier_ready
+        {
+            Some(DeviceRequiredService::OtaUploadVerifier)
+        } else if manifest.partitions.ota_slots > 0
+            && manifest.partitions.ota_app_bytes > 0
+            && !self.signed_image_verifier_ready
+        {
+            Some(DeviceRequiredService::SignedImageVerifier)
+        } else if manifest.features.secure_boot && !self.secure_boot_ready {
+            Some(DeviceRequiredService::SecureBoot)
+        } else if manifest.features.flash_encryption && !self.flash_encryption_ready {
+            Some(DeviceRequiredService::FlashEncryption)
+        } else if manifest.features.serial && !self.serial_ready {
+            Some(DeviceRequiredService::SerialTransport)
+        } else if manifest.features.ble && !self.ble_ready {
+            Some(DeviceRequiredService::BleTransport)
+        } else if manifest.features.usb && !self.usb_ready {
+            Some(DeviceRequiredService::UsbTransport)
+        } else if !self.display_ready {
+            Some(DeviceRequiredService::Display)
+        } else if !self.user_input_ready {
+            Some(DeviceRequiredService::UserInput)
+        } else if manifest.features.camera_qr && !self.camera_qr_ready {
+            Some(DeviceRequiredService::CameraQr)
+        } else if manifest.features.touch && !self.touch_ready {
+            Some(DeviceRequiredService::Touch)
+        } else if manifest.supports_real_attestation() && !self.hardware_attestation_ready {
+            Some(DeviceRequiredService::HardwareAttestation)
+        } else if manifest.features.anti_rollback && !self.rollback_ready {
+            Some(DeviceRequiredService::RollbackState)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for DeviceServiceReadiness {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceBootReadiness {
     pub entropy_ready: bool,
     pub storage_ready: bool,
@@ -789,6 +970,67 @@ mod tests {
         assert_eq!(
             report.first_failure(),
             Some(DeviceBootFailure::FlashEncryptionDisabled)
+        );
+    }
+
+    #[test]
+    fn service_readiness_maps_required_services_to_boot_gate() {
+        let services = DeviceServiceReadiness {
+            usb_ready: false,
+            touch_ready: false,
+            hardware_attestation_ready: false,
+            ..DeviceServiceReadiness::ready()
+        };
+
+        assert_eq!(
+            services.first_missing_required(TEST_MANIFEST),
+            Some(DeviceRequiredService::UsbTransport)
+        );
+        assert_eq!(
+            services.boot_readiness(TEST_MANIFEST).first_failure(),
+            Some(DeviceBootFailure::TransportUnavailable)
+        );
+    }
+
+    #[test]
+    fn service_readiness_ignores_services_not_required_by_target() {
+        let esp32_manifest = DeviceManifest {
+            target: DeviceTarget::Jade,
+            features: DeviceFeatureSet::ESP32_BASE,
+            ..TEST_MANIFEST
+        };
+        let services = DeviceServiceReadiness {
+            usb_ready: false,
+            touch_ready: false,
+            hardware_attestation_ready: false,
+            ..DeviceServiceReadiness::ready()
+        };
+
+        assert_eq!(services.first_missing_required(esp32_manifest), None);
+        assert_eq!(
+            services.boot_readiness(esp32_manifest),
+            DeviceBootReadiness::ready()
+        );
+    }
+
+    #[test]
+    fn service_readiness_requires_ota_writer_and_signed_image_verifier() {
+        let services = DeviceServiceReadiness {
+            signed_image_verifier_ready: false,
+            ..DeviceServiceReadiness::ready()
+        };
+
+        assert_eq!(
+            services.first_missing_required(TEST_MANIFEST),
+            Some(DeviceRequiredService::SignedImageVerifier)
+        );
+        assert_eq!(
+            DeviceRequiredService::SignedImageVerifier.boot_failure(),
+            DeviceBootFailure::OtaStateInvalid
+        );
+        assert_eq!(
+            services.boot_readiness(TEST_MANIFEST).first_failure(),
+            Some(DeviceBootFailure::OtaStateInvalid)
         );
     }
 

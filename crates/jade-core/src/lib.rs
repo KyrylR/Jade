@@ -23,8 +23,9 @@ pub use device::{
     default_version_debug_info, static_version_info, static_version_info_with_context,
     DeviceBootFailure, DeviceBootReadiness, DeviceBootReport, DeviceFeatureSet, DeviceManifest,
     DeviceMemoryBudget, DeviceOtaBootAction, DeviceOtaBootReport, DeviceOtaError,
-    DeviceOtaImageState, DevicePartitionLayout, DevicePlatform, DeviceRunningImage, DeviceRuntime,
-    DeviceRuntimeError, DeviceSoc, DeviceTarget, StaticVersionContext,
+    DeviceOtaImageState, DevicePartitionLayout, DevicePlatform, DeviceRequiredService,
+    DeviceRunningImage, DeviceRuntime, DeviceRuntimeError, DeviceServiceReadiness, DeviceSoc,
+    DeviceTarget, StaticVersionContext,
 };
 pub use firmware::{
     complete_cbor_frame_len, handle_v1_cbor, CborFrameBuffer, CborFrameBufferError,

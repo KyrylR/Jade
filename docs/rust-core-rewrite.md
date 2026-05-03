@@ -69,12 +69,16 @@ attestation. This is the intended real-device contract for replacing C/C++
 application code: board support code implements the small hardware trait, then
 the Rust firmware crate supplies the runtime state glue, version metadata,
 boot-gated board runtime, and stream-loop dispatch.
-`jade-core::DeviceBootReadiness` now gives those hardware backends a shared
-boot-readiness shape for entropy, storage, OTA state, transport, display, and
-rollback checks. The ESP32/ESP32-S3 hardware traits can derive the public
-`DeviceBootReport` from those booleans by default, so real board code does not
-need to hand-assemble the report or duplicate the first-failure ordering used
-by the boot gate.
+`jade-core::DeviceServiceReadiness` now gives those hardware backends a
+service-level boot-readiness contract for entropy, NVS storage, OTA state, OTA
+writer, compressed-upload verifier, signed-image verifier, secure boot, flash
+encryption, serial/BLE/USB transports, display, user input, camera QR, touch,
+ESP32-S3 attestation, and rollback state. The core derives the public
+`DeviceBootReadiness`/`DeviceBootReport` from that service status and the
+target `DeviceManifest`, so ESP32-only targets do not require USB, touch, or
+attestation while Jade v2/v2c do. Real board code can now report concrete
+service probes instead of hand-assembling the coarse boot report or duplicating
+the first-failure ordering used by the boot gate.
 Secure boot and flash-encryption readiness are also part of that boot gate,
 not only manifest metadata. A production backend must report the actual eFuse
 state, and the Rust runtime now fails closed with explicit boot errors before
@@ -215,10 +219,12 @@ NVS behavior. A device-style storage backend test instantiates the generic
 runtime without `MemoryStorage`, and both firmware crates now instantiate the
 bootable board runtime directly over `NvsStorage<B>`, proving the same type
 boundary can serve board I/O, NVS-backed records, and the Rust v1 behavior
-engine. The remaining extraction work is to implement production
-ESP32/ESP32-S3 hardware hook methods for entropy, clock, display driver
-rendering, camera decoding, confirmation input policy, OTA, and attestation,
-plus the concrete ESP NVS driver behind the storage shim.
+engine. The remaining extraction work is to bind production ESP32/ESP32-S3
+hardware hook methods for entropy, clock, display driver rendering, camera
+decoding, confirmation input policy, OTA, and attestation to real drivers, plus
+the concrete ESP NVS driver behind the storage shim. Each of those bindings now
+has an explicit readiness field that must be reported before the boot-gated
+runtime accepts client traffic.
 Version reporting is also now a board-service boundary instead of a fixed host
 placeholder. `StaticVersionContext` lets ESP backends supply the actual IDF
 version, chip feature bits, eFuse MAC, attestation-initialised state, battery
