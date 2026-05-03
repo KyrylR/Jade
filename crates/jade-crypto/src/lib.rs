@@ -1157,16 +1157,31 @@ pub mod pure_rust {
         for _ in 0..input_count {
             raw_inputs.push(parsed_psbt_map(pset_bytes, &mut pos)?);
         }
+        let mut raw_outputs = Vec::with_capacity(output_count);
         for _ in 0..output_count {
-            parsed_psbt_map(pset_bytes, &mut pos)?;
+            raw_outputs.push(parsed_psbt_map(pset_bytes, &mut pos)?);
         }
         if pos != pset_bytes.len() {
             return Err(PsbtSignError::Invalid);
         }
 
-        let pset: PartiallySignedTransaction =
-            encode::deserialize(pset_bytes).map_err(|_| PsbtSignError::Invalid)?;
-        let tx = pset.extract_tx().map_err(|_| PsbtSignError::Invalid)?;
+        let pset: PartiallySignedTransaction = match encode::deserialize(pset_bytes) {
+            Ok(pset) => pset,
+            Err(encode::Error::PsetError(elements::pset::Error::MissingBlindingInfo)) => {
+                // Partially blinded swap PSETs can be signed before all output
+                // blinding fields are present. Keep the original raw maps for
+                // serialization and use a signing-only decode view here.
+                let decode_bytes =
+                    liquid_pset_without_output_blinding_markers(&global, &raw_inputs, &raw_outputs);
+                encode::deserialize(&decode_bytes).map_err(|_| PsbtSignError::Invalid)?
+            }
+            Err(_) => return Err(PsbtSignError::Invalid),
+        };
+        let tx = pset.extract_tx().map_err(|err| match err {
+            elements::pset::Error::MissingOutputValue
+            | elements::pset::Error::MissingOutputAsset => PsbtSignError::Unsupported,
+            _ => PsbtSignError::Invalid,
+        })?;
         let prevouts = liquid_pset_prevouts(&pset)?;
         if prevouts.len() != tx.input.len() || pset.inputs().len() != tx.input.len() {
             return Err(PsbtSignError::Invalid);
@@ -1930,6 +1945,61 @@ pub mod pure_rust {
                 .find(|entry| entry.key.len() == 1 && entry.key[0] == key_type)
                 .map(|entry| entry.value)
         }
+    }
+
+    fn liquid_pset_without_output_blinding_markers(
+        global: &ParsedPsbtMap<'_>,
+        inputs: &[ParsedPsbtMap<'_>],
+        outputs: &[ParsedPsbtMap<'_>],
+    ) -> Vec<u8> {
+        let mut sanitized = Vec::new();
+        sanitized.extend_from_slice(b"pset\xff");
+        write_parsed_psbt_map(&mut sanitized, global, |_| true);
+        for input in inputs {
+            write_parsed_psbt_map(&mut sanitized, input, |_| true);
+        }
+        for output in outputs {
+            write_parsed_psbt_map(&mut sanitized, output, |entry| {
+                !is_liquid_pset_output_blinding_pubkey(entry.key)
+            });
+        }
+        sanitized
+    }
+
+    fn write_parsed_psbt_map<F>(output: &mut Vec<u8>, map: &ParsedPsbtMap<'_>, mut keep: F)
+    where
+        F: FnMut(&PsbtEntry<'_>) -> bool,
+    {
+        for entry in &map.entries {
+            if !keep(entry) {
+                continue;
+            }
+            push_compact_size(output, entry.key.len());
+            output.extend_from_slice(entry.key);
+            push_compact_size(output, entry.value.len());
+            output.extend_from_slice(entry.value);
+        }
+        output.push(0);
+    }
+
+    fn is_liquid_pset_output_blinding_pubkey(key: &[u8]) -> bool {
+        if key.first() != Some(&0xfc) {
+            return false;
+        }
+        let mut pos = 1;
+        let Some(prefix_len) = read_compact_size_sign(key, &mut pos).ok() else {
+            return false;
+        };
+        let Some(prefix) = read_exact_sign(key, &mut pos, prefix_len).ok() else {
+            return false;
+        };
+        if prefix != b"pset" {
+            return false;
+        }
+        read_exact_sign(key, &mut pos, 1)
+            .ok()
+            .and_then(|bytes| bytes.first())
+            == Some(&0x06)
     }
 
     struct BitcoinTxView<'a> {

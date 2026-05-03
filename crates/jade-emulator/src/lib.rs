@@ -2946,11 +2946,15 @@ impl Emulator {
                 liquid_network,
             ) {
                 Ok(Some(result)) => return V1Outcome::BytesResult { result },
-                Ok(None) => {
-                    return V1Outcome::DeferredToCore {
-                        method: "sign_psbt signing".to_string(),
-                    };
-                }
+                Ok(None) => match jade_crypto::psbt_needs_wallet_signature(&psbt, &fingerprint) {
+                    Ok(false) => return V1Outcome::BytesResult { result: psbt },
+                    Ok(true) => {
+                        return V1Outcome::DeferredToCore {
+                            method: "sign_psbt signing".to_string(),
+                        };
+                    }
+                    Err(_) => return bad_parameters("Failed to extract psbt from parameters"),
+                },
                 Err(jade_crypto::PsbtSignError::Invalid) => {
                     return bad_parameters("Failed to extract psbt from parameters");
                 }
@@ -9194,6 +9198,7 @@ mod tests {
             include_str!("../../../test_data/pset_ss_p2pkh.json"),
             include_str!("../../../test_data/pset_ss_p2wpkh.json"),
             include_str!("../../../test_data/pset_ss_p2sh_p2wpkh.json"),
+            include_str!("../../../test_data/pset_ss_p2sh_p2wpkh_maker_swap.json"),
             include_str!("../../../test_data/pset_ss_p2tr.json"),
         ] {
             let mut emulator = Emulator::new();
@@ -9226,6 +9231,40 @@ mod tests {
                 V1Outcome::BytesResult { result: expected }
             );
         }
+    }
+
+    #[test]
+    fn sign_psbt_returns_unchanged_liquid_pset_when_no_wallet_input_matches() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/psbt_tm_liquid_not_us.json");
+        let psbt = fixture_psbt_base64(fixture);
+        let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(fixture_network(fixture))
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("psbt"),
+            method: Cow::Borrowed("sign_psbt"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: expected }
+        );
     }
 
     #[test]
