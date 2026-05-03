@@ -5932,6 +5932,14 @@ fn descriptor_script(
         script.push(OP_CHECKSIG);
         return Some(script);
     }
+    if let Some(inner) = expression.strip_prefix("a:") {
+        let mut script = vec![OP_TOALTSTACK];
+        script.extend_from_slice(&descriptor_script(
+            inner, datavalues, branch, pointer, network,
+        )?);
+        script.push(OP_FROMALTSTACK);
+        return Some(script);
+    }
 
     let (name, args) = descriptor_function_call(expression)?;
     match name {
@@ -5951,6 +5959,21 @@ fn descriptor_script(
             }
             let mut script = descriptor_script(args[0], datavalues, branch, pointer, network)?;
             script.extend_from_slice(&[OP_IFDUP, OP_NOTIF]);
+            script.extend_from_slice(&descriptor_script(
+                args[1], datavalues, branch, pointer, network,
+            )?);
+            script.push(OP_ENDIF);
+            Some(script)
+        }
+        "or_i" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let mut script = vec![OP_IF];
+            script.extend_from_slice(&descriptor_script(
+                args[0], datavalues, branch, pointer, network,
+            )?);
+            script.push(OP_ELSE);
             script.extend_from_slice(&descriptor_script(
                 args[1], datavalues, branch, pointer, network,
             )?);
@@ -5998,6 +6021,26 @@ fn descriptor_script(
             script.push(OP_CSV);
             Some(script)
         }
+        "thresh" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let threshold = parse_decimal_u64(args[0])?;
+            if threshold == 0 || threshold > 16 || threshold as usize >= args.len() {
+                return None;
+            }
+
+            let mut script = descriptor_script(args[1], datavalues, branch, pointer, network)?;
+            for arg in &args[2..] {
+                script.extend_from_slice(&descriptor_script(
+                    arg, datavalues, branch, pointer, network,
+                )?);
+                script.push(OP_ADD);
+            }
+            descriptor_script_push_int(&mut script, threshold as i64)?;
+            script.push(OP_EQUAL);
+            Some(script)
+        }
         "multi" | "sortedmulti" => {
             if args.len() < 2 {
                 return None;
@@ -6036,6 +6079,10 @@ fn descriptor_script(
 const OP_0: u8 = 0x00;
 const OP_PUSHDATA1: u8 = 0x4c;
 const OP_1: u8 = 0x51;
+const OP_IF: u8 = 0x63;
+const OP_ELSE: u8 = 0x67;
+const OP_TOALTSTACK: u8 = 0x6b;
+const OP_FROMALTSTACK: u8 = 0x6c;
 const OP_DUP: u8 = 0x76;
 const OP_IFDUP: u8 = 0x73;
 const OP_NOTIF: u8 = 0x64;
@@ -6044,6 +6091,7 @@ const OP_VERIFY: u8 = 0x69;
 const OP_HASH160: u8 = 0xa9;
 const OP_EQUAL: u8 = 0x87;
 const OP_EQUALVERIFY: u8 = 0x88;
+const OP_ADD: u8 = 0x93;
 const OP_CHECKSIG: u8 = 0xac;
 const OP_CHECKSIGVERIFY: u8 = 0xad;
 const OP_CHECKMULTISIG: u8 = 0xae;
@@ -15588,9 +15636,11 @@ mod tests {
         for fixture in [
             include_str!("../../../test_data/descriptor_ss_anchorwatch.json"),
             include_str!("../../../test_data/descriptor_ss_liana.json"),
+            include_str!("../../../test_data/descriptor_ss_liana_long_script.json"),
             include_str!("../../../test_data/descriptor_ss_liana_reuse_placeholder.json"),
             include_str!("../../../test_data/descriptor_ss_multisig_wsh_sorted_match.json"),
             include_str!("../../../test_data/descriptor_ss_multisig_sh_wsh_unsorted_match.json"),
+            include_str!("../../../test_data/descriptor_ss_p2sh_example.json"),
             include_str!("../../../test_data/descriptor_tr.json"),
         ] {
             let mut emulator = Emulator::new();

@@ -160,9 +160,11 @@ The hard parts are hard for concrete compatibility reasons:
 - Wallet registration and enumeration: current/legacy multisig records,
   multisig setup-file import/export, descriptor registration for Bitcoin
   networks, and registered wallet listing/details. The Rust descriptor shell
-  now covers original miniscript address fixtures for `wsh(...)`,
-  `sh(wsh(...))`, Taproot `tr(...)`, and Jade's `/**` branch/pointer wildcard
-  form through the v1 `register_descriptor` and `get_receive_address` APIs.
+  now covers all original descriptor address fixtures for `wsh(...)`,
+  `sh(wsh(...))`, Taproot `tr(...)`, Jade's `/**` branch/pointer wildcard
+  form, and the Miniscript `or_i(...)`, `thresh(...)`, and `a:` wrappers used
+  by the long Liana/P2SH fixtures through the v1 `register_descriptor` and
+  `get_receive_address` APIs.
 - Receive addresses: default Green 2-of-2, Green 2-of-3 recovery-xpub, and
   Green CSV p2sh-p2wsh addresses for Bitcoin and Liquid, plus Bitcoin
   singlesig, Bitcoin multisig, Bitcoin descriptors, Liquid singlesig
@@ -279,7 +281,7 @@ The hard parts are hard for concrete compatibility reasons:
    where parity is implemented and tracks remaining signing and Liquid
    transaction flows as active implementation work.
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
-   Rust fixture gate now directly references 113 of 210 original `test_data`
+   Rust fixture gate now directly references 115 of 210 original `test_data`
    files; unreferenced fixtures remain active parity work rather than retired
    coverage.
 
