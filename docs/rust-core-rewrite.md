@@ -61,8 +61,13 @@ Both firmware crates also expose constructors for the full generic v1 runtime:
 `jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
 Those constructors instantiate `JadeRuntime<P, B>` with `jade-emulator`
 compiled as `no_std + alloc` and default features disabled, so board code can
-wire the full Rust v1 behavior engine to ESP platform hooks and NVS storage
-without pulling in host `std`.
+wire the full Rust v1 behavior engine to ESP platform hooks and storage
+without pulling in host `std`. Each target crate now also has an NVS-specific
+constructor, `nvs_runtime_for_v1` or `nvs_runtime_for_v2`, plus
+`Esp32V1BoardRuntime::new_with_nvs` and
+`Esp32s3V1BoardRuntime::new_with_nvs`, so a real ESP NVS driver only needs to
+implement `jade_storage::NvsKeyValueBackend` to become the runtime storage
+backend.
 
 Both firmware crates now also expose bootable full-v1 board runtimes:
 `Esp32V1BoardRuntime<P, B>` for Jade v1/v1.1 and
@@ -99,15 +104,13 @@ implementation, so production ESP32/ESP32-S3 platform structs can reuse the
 same transient wallet/PIN/attestation/debug state holder and only provide
 hardware-specific epoch, entropy, UI, camera, transport, OTA, attestation, and
 NVS behavior. A device-style storage backend test instantiates the generic
-runtime without `MemoryStorage`, which is the first step toward using
-NVS-backed storage on hardware. The firmware crate tests now instantiate
-full-v1 runtimes with platform types that implement both the real-device
-transport shims and `RuntimePlatformStateAccess`, proving that the same type
-boundary can serve board I/O and the Rust v1 behavior engine. The remaining
-extraction work is to implement production ESP32/ESP32-S3 hardware hook methods
-for entropy, clock, display driver rendering, camera decoding, confirmation
-input policy, OTA, and attestation, plus the concrete ESP NVS driver behind the
-storage shim.
+runtime without `MemoryStorage`, and both firmware crates now instantiate the
+bootable board runtime directly over `NvsStorage<B>`, proving the same type
+boundary can serve board I/O, NVS-backed records, and the Rust v1 behavior
+engine. The remaining extraction work is to implement production
+ESP32/ESP32-S3 hardware hook methods for entropy, clock, display driver
+rendering, camera decoding, confirmation input policy, OTA, and attestation,
+plus the concrete ESP NVS driver behind the storage shim.
 
 The storage crate now includes an `NvsKeyValueBackend` + `NvsStorage<B>`
 adapter. It maps Jade's typed `StorageNamespace` values to fixed NVS namespace

@@ -56,6 +56,7 @@ pub trait Esp32PlatformShim: DevicePlatform {
 
 pub type Esp32Runtime<P> = DeviceRuntime<P>;
 pub type Esp32V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
+pub type Esp32NvsStorage<B> = jade_storage::NvsStorage<B>;
 pub type Esp32OtaSession<W> = OtaWriteSession<W>;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +221,16 @@ where
     }
 }
 
+impl<P, B> Esp32V1BoardRuntime<P, Esp32NvsStorage<B>>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+{
+    pub fn new_with_nvs(platform: P, nvs_backend: B) -> Self {
+        Self::new(platform, jade_storage::NvsStorage::new(nvs_backend))
+    }
+}
+
 pub fn runtime_for_v1<P>(platform: P) -> Esp32Runtime<P>
 where
     P: Esp32PlatformShim,
@@ -237,6 +248,17 @@ where
         storage_backend,
         jade_storage::StorageLimits::ESP32_NVS_DEFAULT,
     )
+}
+
+pub fn nvs_runtime_for_v1<P, B>(
+    platform: P,
+    nvs_backend: B,
+) -> Esp32V1Runtime<P, Esp32NvsStorage<B>>
+where
+    P: jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+{
+    v1_runtime_for_v1(platform, jade_storage::NvsStorage::new(nvs_backend))
 }
 
 pub fn manifest_for_target(target: DeviceTarget) -> Option<DeviceManifest> {
@@ -451,7 +473,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{borrow::Cow, vec::Vec};
+    use alloc::{
+        borrow::Cow,
+        string::{String, ToString},
+        vec::Vec,
+    };
     use jade_core::{CoreResult, CoreState, Platform, VersionInfo};
     use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
     use jade_protocol_v2::{RequestBody, RequestKind, ResponseBody};
@@ -480,6 +506,27 @@ mod tests {
         begun: bool,
         finished: bool,
         aborted: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestNvs {
+        records: Vec<(String, String, Vec<u8>)>,
+    }
+
+    impl TestNvs {
+        fn new() -> Self {
+            Self {
+                records: Vec::new(),
+            }
+        }
+
+        fn index(&self, namespace: &str, key: &str) -> Option<usize> {
+            self.records
+                .iter()
+                .position(|(record_namespace, record_key, _)| {
+                    record_namespace == namespace && record_key == key
+                })
+        }
     }
 
     impl TestOtaWriter {
@@ -517,6 +564,56 @@ mod tests {
 
         fn abort(&mut self) {
             self.aborted = true;
+        }
+    }
+
+    impl jade_storage::NvsKeyValueBackend for TestNvs {
+        fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+            out: &mut Vec<u8>,
+        ) -> jade_storage::StorageResult<()> {
+            let Some(index) = self.index(namespace, key) else {
+                return Err(jade_storage::StorageError::NotFound);
+            };
+            out.clear();
+            out.extend_from_slice(&self.records[index].2);
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            namespace: &str,
+            key: &str,
+            value: &[u8],
+        ) -> jade_storage::StorageResult<()> {
+            match self.index(namespace, key) {
+                Some(index) => self.records[index].2 = value.to_vec(),
+                None => self
+                    .records
+                    .push((namespace.to_string(), key.to_string(), value.to_vec())),
+            }
+            Ok(())
+        }
+
+        fn erase(&mut self, namespace: &str, key: &str) -> jade_storage::StorageResult<()> {
+            let Some(index) = self.index(namespace, key) else {
+                return Err(jade_storage::StorageError::NotFound);
+            };
+            self.records.remove(index);
+            Ok(())
+        }
+
+        fn list(&self, namespace: &str, out: &mut Vec<String>) -> jade_storage::StorageResult<()> {
+            out.clear();
+            out.extend(
+                self.records
+                    .iter()
+                    .filter(|(record_namespace, _, _)| record_namespace == namespace)
+                    .map(|(_, key, _)| key.clone()),
+            );
+            Ok(())
         }
     }
 
@@ -709,6 +806,30 @@ mod tests {
         );
 
         assert_eq!(runtime.state().wallet, jade_core::WalletLifecycle::Uninit);
+    }
+
+    #[test]
+    fn esp32_board_runtime_can_use_nvs_storage_backend() {
+        let mut board =
+            Esp32V1BoardRuntime::new_with_nvs(TestPlatform::new(JADE_MANIFEST), TestNvs::new());
+        board.boot().unwrap();
+
+        board
+            .runtime_mut()
+            .runtime_storage_mut()
+            .set_record(
+                jade_storage::StorageRecord::BleFlags,
+                &[jade_storage::BLE_ENABLED],
+            )
+            .unwrap();
+
+        let mut stored = Vec::new();
+        board
+            .runtime()
+            .runtime_storage()
+            .get_record(jade_storage::StorageRecord::BleFlags, &mut stored)
+            .unwrap();
+        assert_eq!(stored, Vec::from([jade_storage::BLE_ENABLED]));
     }
 
     #[test]
