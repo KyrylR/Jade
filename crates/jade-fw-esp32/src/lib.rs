@@ -53,6 +53,18 @@ pub type Esp32Runtime<P> = DeviceRuntime<P>;
 pub type Esp32V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
 pub type Esp32OtaSession<W> = OtaWriteSession<W>;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Esp32V1PollReport {
+    pub serial: bool,
+    pub ble: bool,
+}
+
+impl Esp32V1PollReport {
+    pub const fn any(self) -> bool {
+        self.serial || self.ble
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Esp32OtaStartError<E> {
     Manifest(&'static str),
@@ -136,6 +148,20 @@ where
             return Err(FirmwareFrameError::BootRequired);
         }
         poll_ble_full_v1(&mut self.runtime, rx_buffer)
+    }
+
+    pub fn poll_v1_transports(
+        &mut self,
+        rx_buffer: &mut [u8],
+    ) -> Result<Esp32V1PollReport, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+
+        Ok(Esp32V1PollReport {
+            serial: poll_serial_full_v1(&mut self.runtime, rx_buffer)?,
+            ble: poll_ble_full_v1(&mut self.runtime, rx_buffer)?,
+        })
     }
 
     pub fn poll_camera_qr<'a>(
@@ -642,6 +668,38 @@ mod tests {
             Some(&b"ur:bytes/test"[..])
         );
         assert_eq!(board.poll_camera_qr(&mut qr), Ok(None));
+    }
+
+    #[test]
+    fn esp32_board_runtime_polls_all_v1_transports_once() {
+        let mut board = Esp32V1BoardRuntime::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+
+        let mut rx = [0u8; 128];
+        assert_eq!(
+            board.poll_v1_transports(&mut rx),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        board.boot().unwrap();
+        let report = board.poll_v1_transports(&mut rx).unwrap();
+        assert_eq!(
+            report,
+            Esp32V1PollReport {
+                serial: true,
+                ble: true
+            }
+        );
+        assert!(report.any());
+        assert_eq!(board.platform().serial_tx.len(), 1);
+        assert_eq!(board.platform().ble_tx.len(), 1);
+        assert_eq!(
+            board.poll_v1_transports(&mut rx).unwrap(),
+            Esp32V1PollReport::default()
+        );
     }
 
     #[test]

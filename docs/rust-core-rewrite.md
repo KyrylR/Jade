@@ -70,6 +70,8 @@ Both firmware crates now also expose bootable full-v1 board runtimes:
 Rust v1 runtime, call the platform boot report before accepting traffic, return
 `BootRequired` until the hardware readiness checks pass, and then dispatch
 serial/BLE/USB traffic through the full Rust v1 behavior engine. They also
+offer a single boot-gated `poll_v1_transports` helper per target, returning a
+small report of which links handled frames in that board-loop tick. They also
 expose boot-gated camera QR polling over caller-owned buffers, returning
 `Ok(None)` when no QR payload is ready and surfacing platform buffer/transport
 failures without panicking, and the ESP32-S3 board runtime exposes the same

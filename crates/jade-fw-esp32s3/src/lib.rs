@@ -83,6 +83,19 @@ pub type Esp32s3Runtime<P> = DeviceRuntime<P>;
 pub type Esp32s3V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
 pub type Esp32s3OtaSession<W> = OtaWriteSession<W>;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Esp32s3V1PollReport {
+    pub serial: bool,
+    pub usb: bool,
+    pub ble: bool,
+}
+
+impl Esp32s3V1PollReport {
+    pub const fn any(self) -> bool {
+        self.serial || self.usb || self.ble
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Esp32s3OtaStartError<E> {
     Manifest(&'static str),
@@ -173,6 +186,21 @@ where
             return Err(FirmwareFrameError::BootRequired);
         }
         poll_ble_full_v1(&mut self.runtime, rx_buffer)
+    }
+
+    pub fn poll_v1_transports(
+        &mut self,
+        rx_buffer: &mut [u8],
+    ) -> Result<Esp32s3V1PollReport, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+
+        Ok(Esp32s3V1PollReport {
+            serial: poll_serial_full_v1(&mut self.runtime, rx_buffer)?,
+            usb: poll_usb_full_v1(&mut self.runtime, rx_buffer)?,
+            ble: poll_ble_full_v1(&mut self.runtime, rx_buffer)?,
+        })
     }
 
     pub fn poll_camera_qr<'a>(
@@ -895,6 +923,41 @@ mod tests {
             Some(&b"ur:bytes/s3-test"[..])
         );
         assert_eq!(board.poll_camera_qr(&mut qr), Ok(None));
+    }
+
+    #[test]
+    fn s3_board_runtime_polls_all_v1_transports_once() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        board.platform_mut().usb_rx = Some(v1_request("u", "ping"));
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+
+        let mut rx = [0u8; 128];
+        assert_eq!(
+            board.poll_v1_transports(&mut rx),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        board.boot().unwrap();
+        let report = board.poll_v1_transports(&mut rx).unwrap();
+        assert_eq!(
+            report,
+            Esp32s3V1PollReport {
+                serial: true,
+                usb: true,
+                ble: true
+            }
+        );
+        assert!(report.any());
+        assert_eq!(board.platform().serial_tx.len(), 1);
+        assert_eq!(board.platform().usb_tx.len(), 1);
+        assert_eq!(board.platform().ble_tx.len(), 1);
+        assert_eq!(
+            board.poll_v1_transports(&mut rx).unwrap(),
+            Esp32s3V1PollReport::default()
+        );
     }
 
     #[test]
