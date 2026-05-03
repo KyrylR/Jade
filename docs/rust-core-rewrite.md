@@ -87,9 +87,15 @@ NVS-backed storage on hardware. The firmware crate tests now instantiate
 full-v1 runtimes with platform types that implement both the real-device
 transport shims and `RuntimePlatformStateAccess`, proving that the same type
 boundary can serve board I/O and the Rust v1 behavior engine. The remaining
-extraction work is to implement production ESP32/ESP32-S3 `StorageBackend`
-adapters and hardware hook methods for entropy, clock, display, camera,
-confirmation, OTA, attestation, and NVS.
+extraction work is to implement production ESP32/ESP32-S3 hardware hook methods
+for entropy, clock, display, camera, confirmation, OTA, and attestation, plus
+the concrete ESP NVS driver behind the storage shim.
+
+The storage crate now includes an `NvsKeyValueBackend` + `NvsStorage<B>`
+adapter. It maps Jade's typed `StorageNamespace` values to fixed NVS namespace
+names, validates Jade/NVS key constraints before platform I/O, and lets the
+existing `JadeStorage` record, PIN-counter, registration, OTP, and pinserver
+helpers run unchanged over an ESP NVS backend.
 
 ## State Domains
 

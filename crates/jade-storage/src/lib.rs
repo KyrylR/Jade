@@ -32,6 +32,18 @@ pub enum StorageNamespace {
     HotpCounters,
 }
 
+impl StorageNamespace {
+    pub const fn nvs_name(self) -> &'static str {
+        match self {
+            Self::Default => "storage",
+            Self::Multisig => "multisig",
+            Self::Descriptor => "descriptor",
+            Self::Otp => "otp",
+            Self::HotpCounters => "hotp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
     NotFound,
@@ -50,6 +62,57 @@ pub trait StorageBackend {
     fn set(&mut self, namespace: StorageNamespace, key: &str, value: &[u8]) -> StorageResult<()>;
     fn erase(&mut self, namespace: StorageNamespace, key: &str) -> StorageResult<()>;
     fn list(&self, namespace: StorageNamespace, out: &mut Vec<String>) -> StorageResult<()>;
+}
+
+pub trait NvsKeyValueBackend {
+    fn get(&self, namespace: &str, key: &str, out: &mut Vec<u8>) -> StorageResult<()>;
+    fn set(&mut self, namespace: &str, key: &str, value: &[u8]) -> StorageResult<()>;
+    fn erase(&mut self, namespace: &str, key: &str) -> StorageResult<()>;
+    fn list(&self, namespace: &str, out: &mut Vec<String>) -> StorageResult<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct NvsStorage<B> {
+    backend: B,
+}
+
+impl<B> NvsStorage<B> {
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    pub fn into_inner(self) -> B {
+        self.backend
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+}
+
+impl<B: NvsKeyValueBackend> StorageBackend for NvsStorage<B> {
+    fn get(&self, namespace: StorageNamespace, key: &str, out: &mut Vec<u8>) -> StorageResult<()> {
+        validate_nvs_key(key)?;
+        self.backend.get(namespace.nvs_name(), key, out)
+    }
+
+    fn set(&mut self, namespace: StorageNamespace, key: &str, value: &[u8]) -> StorageResult<()> {
+        validate_nvs_key(key)?;
+        self.backend.set(namespace.nvs_name(), key, value)
+    }
+
+    fn erase(&mut self, namespace: StorageNamespace, key: &str) -> StorageResult<()> {
+        validate_nvs_key(key)?;
+        self.backend.erase(namespace.nvs_name(), key)
+    }
+
+    fn list(&self, namespace: StorageNamespace, out: &mut Vec<String>) -> StorageResult<()> {
+        self.backend.list(namespace.nvs_name(), out)
+    }
 }
 
 pub trait RecordAuthenticator {
@@ -796,7 +859,11 @@ pub fn make_key_name_valid(name: &str) -> StorageResult<String> {
 }
 
 fn validate_record(record: StorageRecord<'_>) -> StorageResult<()> {
-    if key_name_valid(record.key()) {
+    validate_nvs_key(record.key())
+}
+
+fn validate_nvs_key(key: &str) -> StorageResult<()> {
+    if key_name_valid(key) {
         Ok(())
     } else {
         Err(StorageError::InvalidKey)
@@ -895,6 +962,72 @@ mod tests {
         fn verify_record(&self, _payload: &[u8], tag: &[u8; HMAC_SHA256_LEN]) -> bool {
             tag == &[0xa5; HMAC_SHA256_LEN]
         }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestNvs {
+        records: Vec<TestNvsRecord>,
+    }
+
+    impl TestNvs {
+        fn find_index(&self, namespace: &str, key: &str) -> Option<usize> {
+            self.records
+                .iter()
+                .position(|record| record.namespace == namespace && record.key == key)
+        }
+    }
+
+    impl NvsKeyValueBackend for TestNvs {
+        fn get(&self, namespace: &str, key: &str, out: &mut Vec<u8>) -> StorageResult<()> {
+            let index = self
+                .find_index(namespace, key)
+                .ok_or(StorageError::NotFound)?;
+            out.clear();
+            out.extend_from_slice(&self.records[index].value);
+            Ok(())
+        }
+
+        fn set(&mut self, namespace: &str, key: &str, value: &[u8]) -> StorageResult<()> {
+            match self.find_index(namespace, key) {
+                Some(index) => {
+                    self.records[index].value.clear();
+                    self.records[index].value.extend_from_slice(value);
+                }
+                None => self.records.push(TestNvsRecord {
+                    namespace: String::from(namespace),
+                    key: String::from(key),
+                    value: value.to_vec(),
+                }),
+            }
+            Ok(())
+        }
+
+        fn erase(&mut self, namespace: &str, key: &str) -> StorageResult<()> {
+            let index = self
+                .find_index(namespace, key)
+                .ok_or(StorageError::NotFound)?;
+            self.records.remove(index);
+            Ok(())
+        }
+
+        fn list(&self, namespace: &str, out: &mut Vec<String>) -> StorageResult<()> {
+            out.clear();
+            out.extend(
+                self.records
+                    .iter()
+                    .filter(|record| record.namespace == namespace)
+                    .map(|record| record.key.clone()),
+            );
+            out.sort();
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestNvsRecord {
+        namespace: String,
+        key: String,
+        value: Vec<u8>,
     }
 
     fn authenticated_record(mut payload: Vec<u8>) -> Vec<u8> {
@@ -1071,6 +1204,59 @@ mod tests {
             .erase_record(StorageRecord::MultisigRegistration { name: "wallet-a" })
             .unwrap();
         assert_eq!(storage.count(StorageNamespace::Multisig).unwrap(), 0);
+    }
+
+    #[test]
+    fn nvs_adapter_maps_storage_namespaces_to_platform_namespaces() {
+        let mut storage = JadeStorage::new(
+            NvsStorage::new(TestNvs::default()),
+            StorageLimits {
+                max_value_len: 32,
+                max_records_per_namespace: 4,
+            },
+        );
+
+        storage
+            .set_multisig_registration("wallet-a", b"record-a")
+            .unwrap();
+        storage.set_otp_data("otp-a", b"otpauth://totp/a").unwrap();
+
+        let mut names = Vec::new();
+        storage
+            .list_names(StorageNamespace::Multisig, &mut names)
+            .unwrap();
+        assert_eq!(names, vec![String::from("wallet-a")]);
+
+        let backend = storage.into_inner().into_inner();
+        assert!(backend.records.iter().any(|record| {
+            record.namespace == StorageNamespace::Multisig.nvs_name()
+                && record.key == "wallet-a"
+                && record.value == b"record-a"
+        }));
+        assert!(backend.records.iter().any(|record| {
+            record.namespace == StorageNamespace::Otp.nvs_name()
+                && record.key == "otp-a"
+                && record.value == b"otpauth://totp/a"
+        }));
+    }
+
+    #[test]
+    fn nvs_adapter_rejects_invalid_keys_before_platform_io() {
+        let mut storage = JadeStorage::new(
+            NvsStorage::new(TestNvs::default()),
+            StorageLimits::ESP32_NVS_DEFAULT,
+        );
+
+        assert_eq!(
+            storage.set_record(
+                StorageRecord::MultisigRegistration { name: "bad name\n" },
+                b"x"
+            ),
+            Err(StorageError::InvalidKey)
+        );
+
+        let backend = storage.into_inner().into_inner();
+        assert!(backend.records.is_empty());
     }
 
     #[test]
