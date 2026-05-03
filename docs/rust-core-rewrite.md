@@ -130,11 +130,16 @@ The hard parts are hard for concrete compatibility reasons:
   logout, OTA metadata flow, pinserver update/reset, attestation
   registration/signing request validation plus RustCrypto RSA PKCS#1 v1.5
   SHA-256 signing behind host platform state, and debug seed/mnemonic
-  injection. Adapter-only debug handshake, QR image capture, and QR scan calls
-  now route through Rust host platform byte hooks instead of the C debug
-  handlers. ESP32-S3 eFuse/DS burning and real camera/QR backends remain target
-  firmware platform shims, but the v1 core response shapes and request
-  validation no longer require Jade-owned C application code.
+  injection. The blind PIN oracle client now has Rust request assembly,
+  replay-counter handling, recoverable payload signing, AES-CBC/HMAC
+  ECDH-envelope compatibility, server-reply validation, final AES-key
+  derivation, and a host-first `auth_user` -> `pin` continuation path that
+  emits the existing `http_request`/`on-reply` shape. Adapter-only debug
+  handshake, QR image capture, and QR scan calls now route through Rust host
+  platform byte hooks instead of the C debug handlers. ESP32-S3 eFuse/DS
+  burning and real camera/QR backends remain target firmware platform shims,
+  but the v1 core response shapes and request validation no longer require
+  Jade-owned C application code.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
   BIP85 RSA public-key PEM export and RSA-PSS digest signing, P-256 identity
   pubkey/sign/ECDH, OTP storage,
@@ -155,6 +160,10 @@ The hard parts are hard for concrete compatibility reasons:
   nonce, deterministic blinding factors, and `get_commitments` asset-generator
   plus value-commitment construction. Host `get_commitments` now matches Jade
   Liquid commitment vectors through the permanent public `elements` backend.
+  The v1 method catalog now marks these Liquid helper RPCs and
+  `sign_liquid_tx` as must-parity Rust routes; unsupported subcases defer
+  inside the relevant transaction policy handlers rather than at method
+  dispatch.
 - PSBT/PSET signing front door: Rust now validates PSBT vs. PSET envelope
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
   no-op Bitcoin PSBT and Liquid PSET payloads unchanged when there is nothing

@@ -35,6 +35,7 @@ pub struct Emulator {
     ota: Option<HostOtaSession>,
     sign_tx: Option<BitcoinSignTxSession>,
     sign_message_ae: Option<BitcoinSignMessageAeSession>,
+    pin: Option<PinClientSession>,
     extended_data: Option<ExtendedDataSession>,
 }
 
@@ -52,6 +53,14 @@ const MAINNET_SERVICE_XPUB: &str = "xpub661MyMwAqRbcGsMS1UQfLrVW52iFHhKd1WbL4BVB
 const TESTNET_SERVICE_XPUB: &str = "tpubD6NzVbkrYhZ4Y9k7T65kw2Sx9z67CzZr2Hi7w2pkKutUvm25ryvL79PqQTtDvAaYacd4z5NQTMmdJ37t8VbMVZbDY1z2rqUKLRNpVW6rGC3";
 const LIQUID_SERVICE_XPUB: &str = "xpub661MyMwAqRbcEZr3uYPEEP4X2bRmYXmxrcLMH8YEwLAFxonVGqstpNywBvwkUDCEZA1cd6fsLgKvb6iZP5yUtLc3G3L8WynChNJznHLaVrA";
 const TESTNET_LIQUID_SERVICE_XPUB: &str = "tpubD6NzVbkrYhZ4YKB74cMgKEpwByD7UWLXt2MxRdwwaQtgrw6E3YPQgSRkaxMWnpDXKtX5LvRmY5mT8FkzCtJcEQ1YhN1o8CU2S5gy9TDFc24";
+const DEFAULT_PINSERVER_URL: &str = "https://j8d.io";
+const DEFAULT_PINSERVER_ONION: &str =
+    "http://mrrxtq6tjpbnbm7vh5jt6mpjctn7ggyfy5wegvbeff3x7jrznqawlmid.onion";
+const DEFAULT_PINSERVER_PUBLIC_KEY: [u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN] = [
+    0x03, 0x32, 0xb7, 0xb1, 0x34, 0x8b, 0xde, 0x8c, 0xa4, 0xb4, 0x6b, 0x9d, 0xcc, 0x30, 0x32, 0x0e,
+    0x14, 0x0c, 0xa2, 0x64, 0x28, 0x16, 0x0a, 0x27, 0xbd, 0xbf, 0xc3, 0x0b, 0x34, 0xec, 0x87, 0xc5,
+    0x47,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BitcoinSignTxSession {
@@ -69,6 +78,15 @@ struct BitcoinSignTxSession {
 struct BitcoinSignMessageAeSession {
     message: Vec<u8>,
     path: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinClientSession {
+    pin: Vec<u8>,
+    client_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
+    server_public_key: [u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN],
+    replay_counter: [u8; 4],
+    wallet_seed: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +126,7 @@ impl Default for Emulator {
             ota: None,
             sign_tx: None,
             sign_message_ae: None,
+            pin: None,
             extended_data: None,
         }
     }
@@ -220,6 +239,7 @@ impl Emulator {
                         self.ota = None;
                         self.sign_tx = None;
                         self.sign_message_ae = None;
+                        self.pin = None;
                         self.extended_data = None;
                         V1Outcome::BoolResult { result: true }
                     }
@@ -343,6 +363,7 @@ impl Emulator {
             Some(MethodClass::Continuation) if request.method == "ota_complete" => {
                 self.handle_ota_complete()
             }
+            Some(MethodClass::Continuation) if request.method == "pin" => self.pin_result(request),
             Some(MethodClass::Continuation) => V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string(),
@@ -3684,9 +3705,229 @@ impl Emulator {
                 self.state.wallet = WalletLifecycle::Ready;
             }
             V1Outcome::BoolResult { result: true }
+        } else if self.platform.pending_pin_wallet_seed.is_some() {
+            self.start_pinserver_set_session()
         } else {
             V1Outcome::BoolResult { result: false }
         }
+    }
+
+    fn start_pinserver_set_session(&mut self) -> V1Outcome {
+        let Some(wallet_seed) = self.platform.pending_pin_wallet_seed.clone() else {
+            return V1Outcome::BoolResult { result: false };
+        };
+        if self.platform.debug_pin.is_empty() {
+            return bad_parameters("Failed to extract valid PIN");
+        }
+
+        let unit_private_key = match self.pinserver_unit_private_key() {
+            Some(key) => key,
+            None => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to load pinserver unit key".to_string(),
+                };
+            }
+        };
+        let server_public_key = match self.pinserver_public_key() {
+            Some(key) => key,
+            None => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Invalid pinserver pubkey".to_string(),
+                };
+            }
+        };
+        let replay_counter = match self.storage.next_replay_counter() {
+            Ok(counter) => counter,
+            Err(_) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::InternalError,
+                    message: "Cannot initiate handshake - failed to deduce ephemeral server key"
+                        .to_string(),
+                };
+            }
+        };
+
+        let Some(request) = jade_crypto::pure_rust::pinserver_client_request(
+            &self.platform.debug_pin,
+            &unit_private_key,
+            &self.platform.pinserver_client_private_key,
+            &server_public_key,
+            replay_counter,
+            Some(&self.platform.pinserver_set_entropy),
+            &self.platform.pinserver_request_iv,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to create Oracle message content".to_string(),
+            };
+        };
+
+        self.pin = Some(PinClientSession {
+            pin: self.platform.debug_pin.clone(),
+            client_private_key: self.platform.pinserver_client_private_key,
+            server_public_key,
+            replay_counter: request.replay_counter,
+            wallet_seed,
+        });
+
+        V1Outcome::OwnedMapResult {
+            entries: vec![OwnedResultMapEntry {
+                key: "http_request".to_string(),
+                value: OwnedV1Value::Map(vec![
+                    OwnedResultMapEntry {
+                        key: "params".to_string(),
+                        value: self.pinserver_http_params("set_pin", request.data),
+                    },
+                    OwnedResultMapEntry {
+                        key: "on-reply".to_string(),
+                        value: OwnedV1Value::Text("pin".to_string()),
+                    },
+                ]),
+            }],
+        }
+    }
+
+    fn pinserver_unit_private_key(&mut self) -> Option<[u8; jade_crypto::EC_PRIVATE_KEY_LEN]> {
+        let mut stored = Vec::new();
+        if self
+            .storage
+            .get_record(StorageRecord::PinPrivateKey, &mut stored)
+            .is_ok()
+        {
+            return stored.as_slice().try_into().ok();
+        }
+
+        let key = self.platform.pinserver_unit_private_key;
+        self.storage
+            .set_record(StorageRecord::PinPrivateKey, &key)
+            .ok()?;
+        Some(key)
+    }
+
+    fn pinserver_public_key(&self) -> Option<[u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let mut stored = Vec::new();
+        if self
+            .storage
+            .get_record(StorageRecord::PinserverPubkey, &mut stored)
+            .is_ok()
+        {
+            return stored.as_slice().try_into().ok();
+        }
+        Some(self.platform.pinserver_public_key)
+    }
+
+    fn pinserver_http_params(&self, document: &str, data: String) -> OwnedV1Value {
+        let mut entries = Vec::new();
+        let urls = self.pinserver_urls(document);
+        if !urls.is_empty() {
+            entries.push(OwnedResultMapEntry {
+                key: "urls".to_string(),
+                value: OwnedV1Value::Array(urls.into_iter().map(OwnedV1Value::Text).collect()),
+            });
+        }
+        if let Some(certificate) = self.pinserver_certificate() {
+            entries.push(OwnedResultMapEntry {
+                key: "root_certificates".to_string(),
+                value: OwnedV1Value::Array(vec![OwnedV1Value::Text(certificate)]),
+            });
+        }
+        entries.push(OwnedResultMapEntry {
+            key: "method".to_string(),
+            value: OwnedV1Value::Text("POST".to_string()),
+        });
+        entries.push(OwnedResultMapEntry {
+            key: "accept".to_string(),
+            value: OwnedV1Value::Text("json".to_string()),
+        });
+        entries.push(OwnedResultMapEntry {
+            key: "data".to_string(),
+            value: OwnedV1Value::Map(vec![OwnedResultMapEntry {
+                key: "data".to_string(),
+                value: OwnedV1Value::Text(data),
+            }]),
+        });
+        OwnedV1Value::Map(entries)
+    }
+
+    fn pinserver_urls(&self, document: &str) -> Vec<String> {
+        let url_a = self
+            .storage_string(StorageRecord::PinserverUrlA)
+            .unwrap_or_else(|| DEFAULT_PINSERVER_URL.to_string());
+        let url_b = self
+            .storage_string(StorageRecord::PinserverUrlB)
+            .unwrap_or_else(|| DEFAULT_PINSERVER_ONION.to_string());
+
+        let mut urls = Vec::new();
+        if url_a.len() > 1 {
+            urls.push(format!("{url_a}/{document}"));
+        }
+        if url_b.len() > 1 {
+            urls.push(format!("{url_b}/{document}"));
+        }
+        urls
+    }
+
+    fn pinserver_certificate(&self) -> Option<String> {
+        self.storage_string(StorageRecord::PinserverCertificate)
+            .filter(|certificate| !certificate.is_empty())
+    }
+
+    fn storage_string(&self, record: StorageRecord<'_>) -> Option<String> {
+        let mut value = Vec::new();
+        self.storage.get_record(record, &mut value).ok()?;
+        String::from_utf8(value).ok()
+    }
+
+    fn pin_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(session) = self.pin.take() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        };
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to read parameters from Oracle".to_string(),
+            };
+        };
+        let data = match params.str("data") {
+            Ok(Some(data)) if !data.is_empty() => data,
+            Ok(_) | Err(_) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: "data field missing".to_string(),
+                };
+            }
+        };
+        let encrypted = match base64_decode(data) {
+            Ok(encrypted) => encrypted,
+            Err(()) => {
+                return V1Outcome::Reject {
+                    code: ErrorCode::BadParameters,
+                    message: "data field invalid".to_string(),
+                };
+            }
+        };
+        let Some(_final_aes) = jade_crypto::pure_rust::pinserver_final_aes_key(
+            &session.pin,
+            &session.client_private_key,
+            &session.server_public_key,
+            session.replay_counter,
+            &encrypted,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to decrypt payload".to_string(),
+            };
+        };
+
+        self.platform.set_debug_wallet_seed(session.wallet_seed);
+        self.platform.pending_pin_wallet_seed = None;
+        self.state.wallet = WalletLifecycle::Ready;
+        V1Outcome::BoolResult { result: true }
     }
 
     fn debug_handshake_result(&mut self) -> V1Outcome {
@@ -6290,6 +6531,13 @@ pub struct HostPlatform {
     debug_capture_image_contains_qr: bool,
     debug_scan_qr_image: Option<Vec<u8>>,
     debug_scan_qr_result: Option<Vec<u8>>,
+    debug_pin: Vec<u8>,
+    pending_pin_wallet_seed: Option<Vec<u8>>,
+    pinserver_unit_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
+    pinserver_client_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
+    pinserver_public_key: [u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN],
+    pinserver_set_entropy: [u8; jade_crypto::SHA256_LEN],
+    pinserver_request_iv: [u8; 16],
     bip85_ephemeral_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
     bip85_iv: [u8; 16],
     confirm_export_blinding_key: bool,
@@ -6309,6 +6557,21 @@ impl Default for HostPlatform {
             debug_capture_image_contains_qr: false,
             debug_scan_qr_image: None,
             debug_scan_qr_result: None,
+            debug_pin: vec![0, 1, 2, 3, 4, 5],
+            pending_pin_wallet_seed: None,
+            pinserver_unit_private_key: [
+                0x02, 0x44, 0x0a, 0x99, 0x76, 0xbe, 0xe4, 0x21, 0x5c, 0xe8, 0xa7, 0x4b, 0x29, 0x71,
+                0x4c, 0xd8, 0x7c, 0x51, 0x6f, 0xf4, 0x63, 0xaa, 0xb4, 0x94, 0x34, 0x7f, 0x20, 0xb5,
+                0x10, 0x7b, 0x75, 0x3d,
+            ],
+            pinserver_client_private_key: [
+                0x04, 0x32, 0x2f, 0xaf, 0xf8, 0x9e, 0x87, 0x9b, 0x27, 0x5f, 0x61, 0x3a, 0xe0, 0xb1,
+                0x69, 0xc1, 0x10, 0x41, 0x8b, 0x97, 0x5a, 0xf7, 0x48, 0xe0, 0x81, 0xce, 0xa7, 0x92,
+                0x89, 0x50, 0xd0, 0x59,
+            ],
+            pinserver_public_key: DEFAULT_PINSERVER_PUBLIC_KEY,
+            pinserver_set_entropy: [0x5a; jade_crypto::SHA256_LEN],
+            pinserver_request_iv: [0xa5; 16],
             bip85_ephemeral_private_key: [
                 0x0b, 0x6b, 0x3d, 0xc9, 0x0d, 0x20, 0x3d, 0x85, 0x41, 0x00, 0x11, 0x07, 0x88, 0xac,
                 0x87, 0xd4, 0x3a, 0xa0, 0x06, 0x20, 0xc9, 0xcd, 0xb3, 0x61, 0xb2, 0x81, 0xb0, 0x90,
@@ -6344,6 +6607,14 @@ impl HostPlatform {
         self.wallet_seed = Some(seed);
     }
 
+    pub fn set_pending_pin_wallet_seed(&mut self, seed: Vec<u8>) {
+        self.pending_pin_wallet_seed = Some(seed);
+    }
+
+    pub fn set_debug_pin(&mut self, pin: Vec<u8>) {
+        self.debug_pin = pin;
+    }
+
     pub fn clear_debug_wallet(&mut self) {
         self.wallet_seed = None;
         self.master_unblinding_key = [0; 64];
@@ -6354,6 +6625,7 @@ impl HostPlatform {
         self.debug_capture_image_contains_qr = false;
         self.debug_scan_qr_image = None;
         self.debug_scan_qr_result = None;
+        self.pending_pin_wallet_seed = None;
     }
 
     pub fn set_master_unblinding_key(&mut self, key: [u8; 64]) {
@@ -6894,6 +7166,30 @@ mod tests {
             rest = &value_rest[value_end + 1..];
         }
         values
+    }
+
+    fn base64_encode_test(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0];
+            let b = *chunk.get(1).unwrap_or(&0);
+            let c = *chunk.get(2).unwrap_or(&0);
+            output.push(TABLE[(a >> 2) as usize] as char);
+            output.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                output.push(TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
+            } else {
+                output.push('=');
+            }
+            if chunk.len() > 2 {
+                output.push(TABLE[(c & 0x3f) as usize] as char);
+            } else {
+                output.push('=');
+            }
+        }
+        output
     }
 
     fn fixture_input_objects(fixture: &str) -> Vec<&str> {
@@ -14920,6 +15216,76 @@ mod tests {
             V1Outcome::BoolResult { result: false }
         );
         assert_eq!(emulator.state.wallet, WalletLifecycle::Uninit);
+    }
+
+    #[test]
+    fn auth_user_and_pin_use_rust_pinserver_continuation() {
+        let mut emulator = Emulator::new();
+        let expected_seed = test_mnemonic_seed().to_vec();
+        emulator
+            .platform_mut()
+            .set_pending_pin_wallet_seed(expected_seed.clone());
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("testnet")
+            .unwrap();
+        let auth_request = Request {
+            id: Cow::Borrowed("auth"),
+            method: Cow::Borrowed("auth_user"),
+            params: Some(&params),
+        };
+
+        match emulator.handle_v1_request(&auth_request) {
+            V1Outcome::OwnedMapResult { entries } => {
+                let http_request = entries
+                    .iter()
+                    .find(|entry| entry.key == "http_request")
+                    .expect("http request result");
+                let OwnedV1Value::Map(http_entries) = &http_request.value else {
+                    panic!("expected http request map");
+                };
+                assert!(http_entries.iter().any(|entry| {
+                    entry.key == "on-reply" && entry.value == OwnedV1Value::Text("pin".to_string())
+                }));
+            }
+            other => panic!("expected pinserver http request, got {other:?}"),
+        }
+
+        let session = emulator.pin.as_ref().expect("pin session").clone();
+        let encrypted_reply = jade_crypto::pure_rust::pinserver_host_server_reply(
+            &session.client_private_key,
+            &session.server_public_key,
+            session.replay_counter,
+            &[0x33; 32],
+            &[0x44; 16],
+        )
+        .unwrap();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("data")
+            .unwrap()
+            .str(&base64_encode_test(&encrypted_reply))
+            .unwrap();
+        let pin_request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("pin"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&pin_request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.platform().wallet_seed(), Some(&expected_seed[..]));
+        assert_eq!(emulator.state.wallet, WalletLifecycle::Ready);
+        assert!(emulator.pin.is_none());
     }
 
     #[test]

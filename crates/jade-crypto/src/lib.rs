@@ -783,7 +783,7 @@ pub mod pure_rust {
         EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, LIQUID_COMMITMENT_LEN, SHA256_LEN,
         SHA512_LEN,
     };
-    use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
+    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
@@ -814,6 +814,20 @@ pub mod pure_rust {
 
     type HmacSha256 = Hmac<Sha256>;
     type HmacSha512 = Hmac<Sha512>;
+
+    const PIN_SECRET_LEN: usize = SHA256_LEN;
+    const PIN_CLIENT_ENTROPY_LEN: usize = SHA256_LEN;
+    const PIN_RECOVERABLE_SIGNATURE_LEN: usize = 65;
+    const PIN_SERVER_AES_KEY_LEN: usize = 32;
+    const PIN_ORACLE_REQUEST_LABEL: &[u8] = b"blind_oracle_request";
+    const PIN_ORACLE_RESPONSE_LABEL: &[u8] = b"blind_oracle_response";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PinserverClientRequest {
+        pub client_public_key: [u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        pub replay_counter: [u8; 4],
+        pub data: String,
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct BitcoinTxSignInput<'a> {
@@ -4335,6 +4349,178 @@ pub mod pure_rust {
         public_key.to_encoded_point(true).as_bytes().try_into().ok()
     }
 
+    pub fn pinserver_client_request(
+        pin: &[u8],
+        unit_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        client_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        server_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        replay_counter: u32,
+        client_entropy: Option<&[u8; PIN_CLIENT_ENTROPY_LEN]>,
+        request_iv: &[u8; 16],
+    ) -> Option<PinserverClientRequest> {
+        if pin.is_empty() {
+            return None;
+        }
+
+        let client_public_key = public_key_from_private_key(client_private_key)?;
+        let replay_counter = replay_counter.to_le_bytes();
+        let tweaked_server_key =
+            pinserver_tweaked_server_key(server_public_key, &client_public_key, &replay_counter)?;
+        let pin_secret = pinserver_pin_secret(pin, unit_private_key)?;
+        let entropy = client_entropy
+            .map(|entropy| entropy.as_slice())
+            .unwrap_or(&[]);
+        let signature = pinserver_payload_signature(
+            unit_private_key,
+            &client_public_key,
+            &replay_counter,
+            &pin_secret,
+            entropy,
+        )?;
+
+        let mut cleartext =
+            Vec::with_capacity(PIN_SECRET_LEN + entropy.len() + PIN_RECOVERABLE_SIGNATURE_LEN);
+        cleartext.extend_from_slice(&pin_secret);
+        cleartext.extend_from_slice(entropy);
+        cleartext.extend_from_slice(&signature);
+
+        let encrypted = wally_aes_cbc_with_ecdh_key_encrypt(
+            client_private_key,
+            request_iv,
+            &cleartext,
+            &tweaked_server_key,
+            PIN_ORACLE_REQUEST_LABEL,
+        )?;
+        let mut wire = Vec::with_capacity(
+            EC_PUBLIC_KEY_COMPRESSED_LEN + replay_counter.len() + encrypted.len(),
+        );
+        wire.extend_from_slice(&client_public_key);
+        wire.extend_from_slice(&replay_counter);
+        wire.extend_from_slice(&encrypted);
+
+        Some(PinserverClientRequest {
+            client_public_key,
+            replay_counter,
+            data: super::base64_encode(&wire),
+        })
+    }
+
+    pub fn pinserver_final_aes_key(
+        pin: &[u8],
+        client_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        server_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        replay_counter: [u8; 4],
+        encrypted_server_reply: &[u8],
+    ) -> Option<[u8; PIN_SERVER_AES_KEY_LEN]> {
+        if pin.is_empty() {
+            return None;
+        }
+
+        let client_public_key = public_key_from_private_key(client_private_key)?;
+        let tweaked_server_key =
+            pinserver_tweaked_server_key(server_public_key, &client_public_key, &replay_counter)?;
+        let server_key = wally_aes_cbc_with_ecdh_key_decrypt(
+            client_private_key,
+            encrypted_server_reply,
+            &tweaked_server_key,
+            PIN_ORACLE_RESPONSE_LABEL,
+        )?;
+        if server_key.len() != PIN_SERVER_AES_KEY_LEN {
+            return None;
+        }
+
+        let mut final_mac = HmacSha256::new_from_slice(&server_key).ok()?;
+        final_mac.update(pin);
+        final_mac.finalize().into_bytes().as_slice().try_into().ok()
+    }
+
+    pub fn pinserver_host_server_reply(
+        client_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        server_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        replay_counter: [u8; 4],
+        server_key: &[u8; PIN_SERVER_AES_KEY_LEN],
+        response_iv: &[u8; 16],
+    ) -> Option<Vec<u8>> {
+        let client_public_key = public_key_from_private_key(client_private_key)?;
+        let tweaked_server_key =
+            pinserver_tweaked_server_key(server_public_key, &client_public_key, &replay_counter)?;
+        wally_aes_cbc_with_ecdh_key_encrypt(
+            client_private_key,
+            response_iv,
+            server_key,
+            &tweaked_server_key,
+            PIN_ORACLE_RESPONSE_LABEL,
+        )
+    }
+
+    fn pinserver_tweaked_server_key(
+        server_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        client_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        replay_counter: &[u8; 4],
+    ) -> Option<[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]> {
+        let mut tweak_mac = HmacSha256::new_from_slice(client_public_key).ok()?;
+        tweak_mac.update(replay_counter);
+        let tweak_hash = Sha256::digest(tweak_mac.finalize().into_bytes());
+        let mut tweak_array = [0u8; SHA256_LEN];
+        tweak_array.copy_from_slice(&tweak_hash);
+        let tweak_bytes: FieldBytes = tweak_array.into();
+        let tweak = <Scalar as Reduce<U256>>::reduce_bytes(&tweak_bytes);
+
+        let server_key = PublicKey::from_sec1_bytes(server_public_key).ok()?;
+        let tweaked_point = (ProjectivePoint::from(*server_key.as_affine())
+            + ProjectivePoint::GENERATOR * tweak)
+            .to_affine();
+        if bool::from(
+            k256::elliptic_curve::group::prime::PrimeCurveAffine::is_identity(&tweaked_point),
+        ) {
+            return None;
+        }
+        tweaked_point
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .ok()
+    }
+
+    fn pinserver_pin_secret(
+        pin: &[u8],
+        unit_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+    ) -> Option<[u8; PIN_SECRET_LEN]> {
+        let mut key_mac = HmacSha256::new_from_slice(unit_private_key).ok()?;
+        key_mac.update(&[0]);
+        let hmac_key = key_mac.finalize().into_bytes();
+
+        let mut pin_mac = HmacSha256::new_from_slice(&hmac_key).ok()?;
+        pin_mac.update(pin);
+        pin_mac.finalize().into_bytes().as_slice().try_into().ok()
+    }
+
+    fn pinserver_payload_signature(
+        unit_private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        client_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        replay_counter: &[u8; 4],
+        pin_secret: &[u8; PIN_SECRET_LEN],
+        entropy: &[u8],
+    ) -> Option<[u8; PIN_RECOVERABLE_SIGNATURE_LEN]> {
+        if !entropy.is_empty() && entropy.len() != PIN_CLIENT_ENTROPY_LEN {
+            return None;
+        }
+
+        let digest = Sha256::new()
+            .chain_update(client_public_key)
+            .chain_update(replay_counter)
+            .chain_update(pin_secret)
+            .chain_update(entropy)
+            .finalize();
+        let signing_key = K256SigningKey::from_slice(unit_private_key).ok()?;
+        let (signature, recid) = signing_key.sign_prehash_recoverable(&digest).ok()?;
+
+        let mut recoverable = [0u8; PIN_RECOVERABLE_SIGNATURE_LEN];
+        recoverable[0] = 27 + recid.to_byte() + 4;
+        recoverable[1..].copy_from_slice(signature.to_bytes().as_ref());
+        Some(recoverable)
+    }
+
     pub fn ecdh_nonce_hash(
         private_key: &[u8; EC_PRIVATE_KEY_LEN],
         peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
@@ -4977,6 +5163,61 @@ pub mod pure_rust {
         Some(output)
     }
 
+    fn wally_aes_cbc_with_ecdh_key_decrypt(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        encrypted: &[u8],
+        peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        label: &[u8],
+    ) -> Option<Vec<u8>> {
+        if label.is_empty()
+            || encrypted.len() < 16 + 16 + SHA256_LEN
+            || (encrypted.len() - 16 - SHA256_LEN) % 16 != 0
+        {
+            return None;
+        }
+
+        let secret = secp256k1_ecdh_secret(private_key, peer_public_key)?;
+        let mut mac = HmacSha512::new_from_slice(&secret).ok()?;
+        mac.update(label);
+        let keys = mac.finalize().into_bytes();
+        let enc_key = &keys[..32];
+        let hmac_key = &keys[32..64];
+
+        let (authenticated, hmac) = encrypted.split_at(encrypted.len() - SHA256_LEN);
+        let mut expected_hmac = HmacSha256::new_from_slice(hmac_key).ok()?;
+        expected_hmac.update(authenticated);
+        expected_hmac.verify_slice(hmac).ok()?;
+
+        let cipher = Aes256::new_from_slice(enc_key).ok()?;
+        let (iv, ciphertext) = authenticated.split_at(16);
+        let mut previous: [u8; 16] = iv.try_into().ok()?;
+        let mut output = Vec::with_capacity(ciphertext.len());
+
+        for encrypted_block in ciphertext.chunks_exact(16) {
+            let mut block = Block::default();
+            block.copy_from_slice(encrypted_block);
+            cipher.decrypt_block(&mut block);
+            for (byte, previous_byte) in block.iter_mut().zip(previous) {
+                *byte ^= previous_byte;
+            }
+            output.extend_from_slice(&block);
+            previous.copy_from_slice(encrypted_block);
+        }
+
+        let padding = *output.last()? as usize;
+        if padding == 0 || padding > 16 || padding > output.len() {
+            return None;
+        }
+        if !output[output.len() - padding..]
+            .iter()
+            .all(|byte| *byte as usize == padding)
+        {
+            return None;
+        }
+        output.truncate(output.len() - padding);
+        Some(output)
+    }
+
     fn secp256k1_ecdh_secret(
         private_key: &[u8; EC_PRIVATE_KEY_LEN],
         peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
@@ -5132,6 +5373,79 @@ mod tests {
                 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
                 0x5b, 0x16, 0xf8, 0x17, 0x98,
             ]
+        );
+    }
+
+    #[test]
+    fn pinserver_request_and_reply_crypto_roundtrip_without_c_helpers() {
+        use hmac::{KeyInit, Mac};
+
+        let pin = [0, 1, 2, 3, 4, 5];
+        let mut unit_private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        unit_private_key[EC_PRIVATE_KEY_LEN - 1] = 2;
+        let mut client_private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        client_private_key[EC_PRIVATE_KEY_LEN - 1] = 3;
+        let mut server_private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        server_private_key[EC_PRIVATE_KEY_LEN - 1] = 4;
+        let server_public_key =
+            pure_rust::public_key_from_private_key(&server_private_key).unwrap();
+        let request_iv = [0x11; 16];
+        let entropy = [0x22; SHA256_LEN];
+
+        let request = pure_rust::pinserver_client_request(
+            &pin,
+            &unit_private_key,
+            &client_private_key,
+            &server_public_key,
+            7,
+            Some(&entropy),
+            &request_iv,
+        )
+        .unwrap();
+        assert_eq!(
+            request.client_public_key,
+            pure_rust::public_key_from_private_key(&client_private_key).unwrap()
+        );
+        assert_eq!(request.replay_counter, 7u32.to_le_bytes());
+        assert!(request.data.len() > EC_PUBLIC_KEY_COMPRESSED_LEN);
+
+        let server_key = [0x33; 32];
+        let encrypted_reply = pure_rust::pinserver_host_server_reply(
+            &client_private_key,
+            &server_public_key,
+            request.replay_counter,
+            &server_key,
+            &[0x44; 16],
+        )
+        .unwrap();
+
+        let final_key = pure_rust::pinserver_final_aes_key(
+            &pin,
+            &client_private_key,
+            &server_public_key,
+            request.replay_counter,
+            &encrypted_reply,
+        )
+        .unwrap();
+        let mut expected =
+            hmac::Hmac::<sha2::Sha256>::new_from_slice(&server_key).expect("HMAC key");
+        expected.update(&pin);
+        assert_eq!(
+            final_key.as_slice(),
+            expected.finalize().into_bytes().as_slice()
+        );
+
+        let mut tampered_reply = encrypted_reply;
+        *tampered_reply.last_mut().unwrap() ^= 0x01;
+        assert_eq!(
+            pure_rust::pinserver_final_aes_key(
+                &pin,
+                &client_private_key,
+                &server_public_key,
+                request.replay_counter,
+                &tampered_reply,
+            ),
+            None
         );
     }
 

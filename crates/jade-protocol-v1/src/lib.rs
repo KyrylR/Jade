@@ -189,17 +189,17 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     MethodSpec {
         name: "sign_liquid_tx",
         class: MethodClass::Authenticated,
-        parity: ParityStatus::Deferred,
+        parity: ParityStatus::MustParity,
     },
     MethodSpec {
         name: "get_commitments",
         class: MethodClass::Authenticated,
-        parity: ParityStatus::Deferred,
+        parity: ParityStatus::MustParity,
     },
     MethodSpec {
         name: "get_blinding_factor",
         class: MethodClass::Authenticated,
-        parity: ParityStatus::Deferred,
+        parity: ParityStatus::MustParity,
     },
     MethodSpec {
         name: "get_master_blinding_key",
@@ -209,12 +209,12 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     MethodSpec {
         name: "get_blinding_key",
         class: MethodClass::Authenticated,
-        parity: ParityStatus::Deferred,
+        parity: ParityStatus::MustParity,
     },
     MethodSpec {
         name: "get_shared_nonce",
         class: MethodClass::Authenticated,
-        parity: ParityStatus::Deferred,
+        parity: ParityStatus::MustParity,
     },
     MethodSpec {
         name: "get_bip85_pubkey",
@@ -843,7 +843,7 @@ mod tests {
         );
         assert_eq!(
             method_spec("sign_liquid_tx").unwrap().parity,
-            ParityStatus::Deferred
+            ParityStatus::MustParity
         );
     }
 
