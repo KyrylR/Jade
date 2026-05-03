@@ -155,6 +155,14 @@ The target crates also expose `run_board_stream_loop_from_storage` and
 Rust-side `app_main` contract: pass the concrete platform shim, concrete NVS
 backend, target stream storage, and loop hooks, then let the firmware crate
 construct and run the boot-gated stream loop.
+For production backends that use the reusable device platform adapters, the
+target crates also expose
+`run_board_stream_loop_with_hardware_and_nvs_storage`. That helper accepts raw
+`Esp32Hardware` or `Esp32s3Hardware`, wraps it in the Rust
+`Esp32DevicePlatform` or `Esp32s3DevicePlatform`, attaches the NVS adapter, and
+then runs the same boot-gated stream loop. A real `app_main` can therefore be
+reduced to board driver construction, static stream storage, NVS backend
+construction, hook construction, and one Rust entrypoint call.
 Those runners also have startup constructors over named buffer bundles,
 `Esp32BoardStreamBuffers` and `Esp32s3BoardStreamBuffers`, plus NVS-backed
 `new_with_nvs` constructors. This gives board startup code one typed object

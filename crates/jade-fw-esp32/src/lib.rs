@@ -449,6 +449,25 @@ where
     )
 }
 
+pub fn run_board_stream_loop_with_hardware_and_nvs_storage<Hw, B, H>(
+    hardware: Hw,
+    nvs_backend: B,
+    storage: &mut Esp32BoardStreamStorage,
+    hooks: &mut H,
+) -> Result<Esp32BoardLoopRun, Esp32BoardEntrypointError>
+where
+    Hw: Esp32Hardware,
+    B: jade_storage::NvsKeyValueBackend,
+    H: Esp32BoardLoopHooks,
+{
+    run_board_stream_loop_with_nvs_storage(
+        Esp32DevicePlatform::new(hardware),
+        nvs_backend,
+        storage,
+        hooks,
+    )
+}
+
 #[derive(Debug)]
 pub struct Esp32BoardApp<'a, P, B> {
     runtime: Esp32V1BoardRuntime<P, B>,
@@ -2831,6 +2850,40 @@ mod tests {
         );
         assert_eq!(hooks.boots, 1);
         assert_eq!(hooks.ticks, 2);
+    }
+
+    #[test]
+    fn esp32_board_entrypoint_wraps_raw_hardware_and_nvs() {
+        let mut storage = Esp32BoardStreamStorage::default();
+        let mut hooks = Esp32LoopTestHooks::new(1);
+        let mut hardware = TestPlatform::new(JADE_MANIFEST);
+        hardware.serial_rx = Some(v1_request("s", "ping"));
+
+        let run = run_board_stream_loop_with_hardware_and_nvs_storage(
+            hardware,
+            TestNvs::new(),
+            &mut storage,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run,
+            Esp32BoardLoopRun {
+                booted: true,
+                ticks: 1,
+                stop_reason: Esp32BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 1);
+        assert_eq!(
+            hooks.last_transports,
+            Esp32V1PollReport {
+                serial: true,
+                ble: false,
+            }
+        );
     }
 
     #[test]

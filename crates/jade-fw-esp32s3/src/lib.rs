@@ -553,6 +553,25 @@ where
     )
 }
 
+pub fn run_board_stream_loop_with_hardware_and_nvs_storage<Hw, B, H>(
+    hardware: Hw,
+    nvs_backend: B,
+    storage: &mut Esp32s3BoardStreamStorage,
+    hooks: &mut H,
+) -> Result<Esp32s3BoardLoopRun, Esp32s3BoardEntrypointError>
+where
+    Hw: Esp32s3Hardware,
+    B: jade_storage::NvsKeyValueBackend,
+    H: Esp32s3BoardLoopHooks,
+{
+    run_board_stream_loop_with_nvs_storage(
+        Esp32s3DevicePlatform::new(hardware),
+        nvs_backend,
+        storage,
+        hooks,
+    )
+}
+
 #[derive(Debug)]
 pub struct Esp32s3BoardApp<'a, P, B> {
     runtime: Esp32s3V1BoardRuntime<P, B>,
@@ -3358,6 +3377,45 @@ mod tests {
         );
         assert_eq!(hooks.boots, 1);
         assert_eq!(hooks.ticks, 2);
+    }
+
+    #[test]
+    fn s3_board_entrypoint_wraps_raw_hardware_and_nvs() {
+        static STORAGE: std::sync::Mutex<Esp32s3BoardStreamStorage> =
+            std::sync::Mutex::new(Esp32s3BoardStreamStorage::new());
+        let mut storage = STORAGE.lock().unwrap();
+        let mut hooks = S3LoopTestHooks::new(1);
+        let mut hardware = TestPlatform::new(JADE_V2_MANIFEST);
+        hardware.usb_rx = Some(v1_request("u", "ping"));
+        hardware.touch_rx = Some(TouchEvent::Release);
+
+        let run = run_board_stream_loop_with_hardware_and_nvs_storage(
+            hardware,
+            TestNvs::new(),
+            &mut storage,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run,
+            Esp32s3BoardLoopRun {
+                booted: true,
+                ticks: 1,
+                stop_reason: Esp32s3BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 1);
+        assert_eq!(
+            hooks.last_transports,
+            Esp32s3V1PollReport {
+                serial: false,
+                usb: true,
+                ble: false,
+            }
+        );
+        assert_eq!(hooks.last_touch, Some(TouchEvent::Release));
     }
 
     #[test]
