@@ -92,12 +92,16 @@ explicit value commitments, and reusing Jade's low-R and anti-exfil ECDSA
 signers. The v1 adapter now accepts the standard Elements ECDSA sighash set,
 including `SIGHASH_SINGLE|ANYONECANPAY`, and matches the Jade single-sig
 Liquid anti-exfil fixtures for P2PKH, P2WPKH, P2SH-P2WPKH, and the Liquidex
-partial-swap maker flow. It also covers staged Liquid Taproot key-path inputs
-by collecting the full prevout set from `tx_input`, using the Jade-compatible
-Liquid main/testnet/regtest genesis hashes for ELIP-0101 Taproot sighashes,
-verifying Elements Taproot tweaked output keys against the supplied script
-pubkeys, and producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now
-covers singlesig, the Liquidex partial-swap maker PSET, and the current Green
+partial-swap maker flow. Fixture coverage now also includes legacy low-R,
+large-amount, ledger-compare, no-signing, explicit-sighash, testnet,
+non-confidential-input, non-CSV, tx-commitment, random-blinder/proof-shape,
+asset-info, and swap maker/taker flows, including null no-sign input slots. It
+also covers staged Liquid Taproot key-path inputs by collecting the full
+prevout set from `tx_input`, using the Jade-compatible Liquid
+main/testnet/regtest genesis hashes for ELIP-0101 Taproot sighashes, verifying
+Elements Taproot tweaked output keys against the supplied script pubkeys, and
+producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now covers
+singlesig, the Liquidex partial-swap maker PSET, and the current Green
 witness-script fixtures, and returns Liquid PSET payloads unchanged when the
 wallet has no matching signing input. Remaining Liquid work is now narrower:
 script-path Taproot, generic PSET policy/finalization beyond the covered
@@ -197,15 +201,20 @@ The hard parts are hard for concrete compatibility reasons:
   immediate legacy signing and staged anti-exfil signing: `tx_input` returns
   the signer commitment and `get_signature` returns the final DER+sighash
   signature. This matches the P2PKH, P2WPKH, P2SH-P2WPKH, and Liquidex partial
-  swap anti-exfil fixtures, including `SIGHASH_SINGLE|ANYONECANPAY`. Staged
-  Liquid Taproot key-path inputs now collect all prevouts, compute
-  genesis-aware Elements Taproot sighashes, reject non-matching output keys,
-  and return DEFAULT/ALL Schnorr signatures matching the Jade fixture. Liquid
-  PSET signing now covers p2pkh, p2wpkh, p2sh-p2wpkh, the Liquidex
-  partial-swap maker PSET, Taproot key-path, Green CSV witness-script, Green
-  no-recovery P2WSH, and no-wallet-input Liquid PSET fixtures through
-  `sign_psbt`, with unsupported Liquid PSET policy/finalization cases returning
-  the explicit core-defer outcome. PSBT anti-exfil, Liquid script-path Taproot,
+  swap anti-exfil fixtures, including `SIGHASH_SINGLE|ANYONECANPAY`, and the
+  broader Liquid fixture corpus for low-R legacy signing, large amounts,
+  no-signing inputs, ledger comparison, testnet anti-exfil, explicit sighashes,
+  non-confidential inputs, non-CSV scripts, tx commitments, random blinder
+  proof-shape variants, asset metadata, and swap maker/taker flows with null
+  no-sign input slots. Staged Liquid Taproot key-path inputs now collect all
+  prevouts, compute genesis-aware Elements Taproot sighashes, reject
+  non-matching output keys, and return DEFAULT/ALL Schnorr signatures matching
+  the Jade fixture. Liquid PSET signing now covers p2pkh, p2wpkh,
+  p2sh-p2wpkh, the Liquidex partial-swap maker PSET, Taproot key-path, Green
+  CSV witness-script, Green no-recovery P2WSH, and no-wallet-input Liquid PSET
+  fixtures through `sign_psbt`, with unsupported Liquid PSET
+  policy/finalization cases returning the explicit core-defer outcome. PSBT
+  anti-exfil, Liquid script-path Taproot,
   registered/generic multisig policy validation, generic Liquid PSET
   policy/finalization, and full confidential transaction proof validation
   remain active implementation work.

@@ -6257,6 +6257,60 @@ mod tests {
         quoted_hex_strings(&expected_block[..end])
     }
 
+    fn fixture_expected_output_items(fixture: &str) -> Vec<&str> {
+        let marker = "\"expected_output\"";
+        let start = fixture.find(marker).unwrap();
+        let expected_block = &fixture[start..];
+        let outer_start = expected_block.find('[').unwrap();
+        let end = expected_block
+            .find("\"expected_legacy_output\"")
+            .unwrap_or(expected_block.len());
+        quoted_strings_including_empty(&expected_block[outer_start..end])
+    }
+
+    fn fixture_expected_output_pairs(fixture: &str) -> Vec<(&str, &str)> {
+        let marker = "\"expected_output\"";
+        let start = fixture.find(marker).unwrap();
+        let expected_block = &fixture[start..];
+        let outer_start = expected_block.find('[').unwrap() + 1;
+        let rest = &expected_block[outer_start..];
+        let bytes = rest.as_bytes();
+        let mut pairs = Vec::new();
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            while index < bytes.len()
+                && (bytes[index].is_ascii_whitespace() || bytes[index] == b',')
+            {
+                index += 1;
+            }
+            if index >= bytes.len() || bytes[index] == b']' {
+                break;
+            }
+            assert_eq!(bytes[index], b'[', "expected expected_output pair");
+            let pair_start = index + 1;
+            let pair_end = rest[pair_start..].find(']').unwrap() + pair_start;
+            let values = quoted_strings_including_empty(&rest[pair_start..pair_end]);
+            assert_eq!(values.len(), 2, "expected commitment/signature pair");
+            pairs.push((values[0], values[1]));
+            index = pair_end + 1;
+        }
+
+        pairs
+    }
+
+    fn quoted_strings_including_empty(block: &str) -> Vec<&str> {
+        let mut values = Vec::new();
+        let mut rest = block;
+        while let Some(start) = rest.find('"') {
+            let value_rest = &rest[start + 1..];
+            let value_end = value_rest.find('"').unwrap();
+            values.push(&value_rest[..value_end]);
+            rest = &value_rest[value_end + 1..];
+        }
+        values
+    }
+
     fn fixture_input_objects(fixture: &str) -> Vec<&str> {
         let marker = "\"inputs\": [";
         let start = fixture.find(marker).unwrap() + marker.len();
@@ -6286,6 +6340,99 @@ mod tests {
         }
 
         objects
+    }
+
+    fn fixture_input_entries(fixture: &str) -> Vec<Option<&str>> {
+        let marker = "\"inputs\": [";
+        let start = fixture.find(marker).unwrap() + marker.len();
+        let rest = &fixture[start..];
+        let bytes = rest.as_bytes();
+        let mut entries = Vec::new();
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            while index < bytes.len()
+                && (bytes[index].is_ascii_whitespace() || bytes[index] == b',')
+            {
+                index += 1;
+            }
+            if index >= bytes.len() || bytes[index] == b']' {
+                break;
+            }
+            if rest[index..].starts_with("null") {
+                entries.push(None);
+                index += 4;
+                continue;
+            }
+            assert_eq!(bytes[index], b'{', "expected input object or null");
+            let object_start = index;
+            let mut depth = 0usize;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth.checked_sub(1).unwrap();
+                        if depth == 0 {
+                            entries.push(Some(&rest[object_start..=index]));
+                            index += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+        }
+
+        entries
+    }
+
+    fn fixture_object_hex_value<'a>(object: &'a str, field: &str) -> Option<&'a str> {
+        let values = fixture_hex_values(object, field);
+        assert!(
+            values.len() <= 1,
+            "expected at most one {field} in fixture input"
+        );
+        values.first().copied()
+    }
+
+    fn fixture_object_required_hex_value<'a>(object: &'a str, field: &str) -> &'a str {
+        fixture_object_hex_value(object, field).expect("expected fixture input hex field")
+    }
+
+    fn fixture_object_path(object: &str) -> Vec<u32> {
+        let marker = "\"path\": [";
+        let start = object.find(marker).unwrap() + marker.len();
+        let rest = &object[start..];
+        let end = rest.find(']').unwrap();
+        rest[..end]
+            .split(',')
+            .map(|value| value.trim().parse().unwrap())
+            .collect()
+    }
+
+    fn fixture_object_bool_value(object: &str, field: &str) -> bool {
+        let marker = format!("\"{field}\": ");
+        let start = object.find(&marker).unwrap() + marker.len();
+        let rest = &object[start..];
+        if rest.starts_with("true") {
+            true
+        } else if rest.starts_with("false") {
+            false
+        } else {
+            panic!("expected boolean {field} in fixture input");
+        }
+    }
+
+    fn fixture_object_u64_value(object: &str, field: &str) -> Option<u64> {
+        let marker = format!("\"{field}\": ");
+        let start = object.find(&marker)?;
+        let value_start = start + marker.len();
+        let rest = &object[value_start..];
+        let end = rest
+            .find(|byte: char| !byte.is_ascii_digit())
+            .unwrap_or(rest.len());
+        Some(rest[..end].parse().unwrap())
     }
 
     fn fixture_input_hex_values<'a>(fixture: &'a str, field: &str) -> Vec<&'a str> {
@@ -6488,12 +6635,22 @@ mod tests {
         txn: &[u8],
         num_inputs: u64,
     ) -> Vec<u8> {
+        sign_liquid_tx_start_params_with_dummy_trusted(network, txn, num_inputs, true)
+    }
+
+    fn sign_liquid_tx_start_params_with_dummy_trusted(
+        network: &str,
+        txn: &[u8],
+        num_inputs: u64,
+        use_ae_signatures: bool,
+    ) -> Vec<u8> {
         let (_, output_confidentiality) =
             jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(txn).unwrap();
         let mut params = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut params);
+        let field_count = 4 + u64::from(use_ae_signatures);
         encoder
-            .map(5)
+            .map(field_count)
             .unwrap()
             .str("network")
             .unwrap()
@@ -6506,11 +6663,15 @@ mod tests {
             .str("num_inputs")
             .unwrap()
             .u64(num_inputs)
-            .unwrap()
-            .str("use_ae_signatures")
-            .unwrap()
-            .bool(true)
-            .unwrap()
+            .unwrap();
+        if use_ae_signatures {
+            encoder
+                .str("use_ae_signatures")
+                .unwrap()
+                .bool(true)
+                .unwrap();
+        }
+        encoder
             .str("trusted_commitments")
             .unwrap()
             .array(output_confidentiality.len() as u64)
@@ -6886,6 +7047,81 @@ mod tests {
             .unwrap()
             .bytes(ae_host_commitment)
             .unwrap();
+        params
+    }
+
+    fn sign_liquid_unsigned_input_params() -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params).map(0).unwrap();
+        params
+    }
+
+    fn sign_liquid_input_params_from_fixture(input: &str, use_ae_signatures: bool) -> Vec<u8> {
+        if !input.contains("\"path\"") {
+            return sign_liquid_unsigned_input_params();
+        }
+        let path = fixture_object_path(input);
+        let script = decode_hex_vec(fixture_object_required_hex_value(input, "script"));
+        let value_commitment = fixture_object_hex_value(input, "value_commitment")
+            .or_else(|| fixture_object_hex_value(input, "value commitment"))
+            .map(decode_hex_vec);
+        let asset_generator = fixture_object_hex_value(input, "asset_generator")
+            .or_else(|| fixture_object_hex_value(input, "asset"))
+            .map(decode_hex_vec);
+        let host_commitment = if use_ae_signatures {
+            Some(decode_hex::<{ jade_crypto::SHA256_LEN }>(
+                fixture_object_required_hex_value(input, "ae_host_commitment"),
+            ))
+        } else {
+            None
+        };
+        let sighash = fixture_object_u64_value(input, "sighash");
+        let field_count = 3
+            + u64::from(value_commitment.is_some())
+            + u64::from(asset_generator.is_some())
+            + u64::from(sighash.is_some())
+            + u64::from(host_commitment.is_some());
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(field_count)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(fixture_object_bool_value(input, "is_witness"))
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(path.len() as u64)
+            .unwrap();
+        for child in &path {
+            encoder.u32(*child).unwrap();
+        }
+        encoder.str("script").unwrap().bytes(&script).unwrap();
+        if let Some(sighash) = sighash {
+            encoder.str("sighash").unwrap().u64(sighash).unwrap();
+        }
+        if let Some(asset_generator) = asset_generator {
+            encoder
+                .str("asset_generator")
+                .unwrap()
+                .bytes(&asset_generator)
+                .unwrap();
+        }
+        if let Some(value_commitment) = value_commitment {
+            encoder
+                .str("value_commitment")
+                .unwrap()
+                .bytes(&value_commitment)
+                .unwrap();
+        }
+        if let Some(host_commitment) = host_commitment {
+            encoder
+                .str("ae_host_commitment")
+                .unwrap()
+                .bytes(&host_commitment)
+                .unwrap();
+        }
         params
     }
 
@@ -7859,6 +8095,168 @@ mod tests {
                     emulator.handle_v1_request(&signature_request),
                     V1Outcome::BytesResult {
                         result: decode_hex_vec(expected[index * 2 + 1])
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sign_liquid_tx_staged_flow_signs_swap_and_policy_fixture_inputs() {
+        let fixtures = [
+            include_str!("../../../test_data/liquid_txn_ae.json"),
+            include_str!("../../../test_data/liquid_txn_testnet.json"),
+            include_str!("../../../test_data/liquid_txn_sighashes.json"),
+            include_str!("../../../test_data/liquid_txn_nonconfidential_input.json"),
+            include_str!("../../../test_data/liquid_txn_noncsv.json"),
+            include_str!("../../../test_data/liquid_txn_tx_commits_ae.json"),
+            include_str!("../../../test_data/liquid_txn_asset_ae.json"),
+            include_str!("../../../test_data/liquid_txn_random_blinders.json"),
+            include_str!("../../../test_data/liquid_txn_random_blinders_asset_proof.json"),
+            include_str!("../../../test_data/liquid_txn_random_blinders_value_proof.json"),
+            include_str!("../../../test_data/liquid_txn_random_blinders_asset_value_proofs.json"),
+            include_str!("../../../test_data/liquid_txn_swap_maker_send_lbtc_ae.json"),
+            include_str!("../../../test_data/liquid_txn_swap_maker_recv_lbtc_ae.json"),
+            include_str!("../../../test_data/liquid_txn_swap_maker_assets_ae.json"),
+            include_str!("../../../test_data/liquid_txn_swap_taker_send_lbtc_ae.json"),
+            include_str!("../../../test_data/liquid_txn_swap_taker_recv_lbtc_ae.json"),
+            include_str!("../../../test_data/liquid_txn_swap_taker_assets_ae.json"),
+        ];
+
+        for fixture in fixtures {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let input_entries = fixture_input_entries(fixture);
+            let expected = fixture_expected_output_pairs(fixture);
+            assert_eq!(input_entries.len(), expected.len());
+            assert_eq!(
+                jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(&txn)
+                    .unwrap()
+                    .0,
+                input_entries.len()
+            );
+
+            let start_params = sign_liquid_tx_start_params_with_dummy_trusted_ae(
+                fixture_network(fixture),
+                &txn,
+                input_entries.len() as u64,
+            );
+            let start_request = Request {
+                id: Cow::Borrowed("liq"),
+                method: Cow::Borrowed("sign_liquid_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            for (index, input) in input_entries.iter().enumerate() {
+                let input_params = match input {
+                    Some(input) => sign_liquid_input_params_from_fixture(input, true),
+                    None => sign_liquid_unsigned_input_params(),
+                };
+                let input_request = Request {
+                    id: Cow::Borrowed("input"),
+                    method: Cow::Borrowed("tx_input"),
+                    params: Some(&input_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&input_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index].0)
+                    }
+                );
+            }
+
+            for (index, input) in input_entries.iter().enumerate() {
+                let signature_params = match input
+                    .and_then(|input| fixture_object_hex_value(input, "ae_host_entropy"))
+                {
+                    Some(entropy) => {
+                        let entropy: [u8; jade_crypto::SHA256_LEN] = decode_hex(entropy);
+                        get_signature_params_with_entropy(&entropy)
+                    }
+                    None => get_signature_params(),
+                };
+                let signature_request = Request {
+                    id: Cow::Borrowed("sig"),
+                    method: Cow::Borrowed("get_signature"),
+                    params: Some(&signature_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&signature_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index].1)
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sign_liquid_tx_legacy_flow_signs_policy_fixture_inputs() {
+        let fixtures = [
+            include_str!("../../../test_data/liquid_txn_legacy.json"),
+            include_str!("../../../test_data/liquid_txn_ledger_compare.json"),
+            include_str!("../../../test_data/liquid_txn_lowr.json"),
+            include_str!("../../../test_data/liquid_txn_lowr_nochange.json"),
+            include_str!("../../../test_data/liquid_txn_tx_commits_lowr.json"),
+            include_str!("../../../test_data/liquid_txn_asset_lowr.json"),
+            include_str!("../../../test_data/liquid_txn_large_amount.json"),
+            include_str!("../../../test_data/liquid_txn_large_amount2.json"),
+            include_str!("../../../test_data/liquid_txn_no_signing.json"),
+        ];
+
+        for fixture in fixtures {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let input_entries = fixture_input_entries(fixture);
+            let expected = fixture_expected_output_items(fixture);
+            assert_eq!(input_entries.len(), expected.len());
+            assert_eq!(
+                jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(&txn)
+                    .unwrap()
+                    .0,
+                input_entries.len()
+            );
+
+            let start_params = sign_liquid_tx_start_params_with_dummy_trusted(
+                fixture_network(fixture),
+                &txn,
+                input_entries.len() as u64,
+                false,
+            );
+            let start_request = Request {
+                id: Cow::Borrowed("liq"),
+                method: Cow::Borrowed("sign_liquid_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            for (index, input) in input_entries.iter().enumerate() {
+                let input_params = match input {
+                    Some(input) => sign_liquid_input_params_from_fixture(input, false),
+                    None => sign_liquid_unsigned_input_params(),
+                };
+                let input_request = Request {
+                    id: Cow::Borrowed("input"),
+                    method: Cow::Borrowed("tx_input"),
+                    params: Some(&input_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&input_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index])
                     }
                 );
             }
