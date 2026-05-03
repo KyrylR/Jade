@@ -2202,15 +2202,38 @@ impl Emulator {
         if liquid_network_for_name(network_name).is_none() {
             return bad_parameters("sign_liquid_tx call only appropriate for liquid network");
         }
-        match params.bytes("txn") {
-            Ok(Some(txn)) if !txn.is_empty() => {}
+        let txn = match params.bytes("txn") {
+            Ok(Some(txn)) if !txn.is_empty() => txn,
             Ok(_) | Err(_) => return bad_parameters("Failed to extract tx from parameters"),
-        }
-        match params.u64("num_inputs") {
-            Ok(Some(num_inputs)) if num_inputs > 0 && num_inputs <= usize::MAX as u64 => {}
+        };
+        let expected_inputs = match params.u64("num_inputs") {
+            Ok(Some(num_inputs)) if num_inputs > 0 && num_inputs <= usize::MAX as u64 => {
+                num_inputs as usize
+            }
             Ok(_) | Err(_) => {
                 return bad_parameters("Failed to extract valid number of inputs from parameters")
             }
+        };
+        let Some((actual_inputs, output_confidentiality)) =
+            jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(txn)
+        else {
+            return bad_parameters("Failed to extract tx from parameters");
+        };
+        if actual_inputs != expected_inputs {
+            return bad_parameters("Unexpected number of inputs for transaction");
+        }
+        if let Err(message) =
+            validate_liquid_trusted_commitments(params.raw(), &output_confidentiality)
+        {
+            return bad_parameters(message);
+        }
+        if let Err(message) =
+            validate_liquid_change_outputs(params.raw(), output_confidentiality.len())
+        {
+            return bad_parameters(message);
+        }
+        if let Err(message) = validate_liquid_asset_info(params.raw()) {
+            return bad_parameters(message);
         }
 
         V1Outcome::DeferredToCore {
@@ -3926,6 +3949,164 @@ fn cbor_map_bytes_or_null<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [
     }
 }
 
+fn validate_liquid_trusted_commitments(
+    raw_params: &[u8],
+    output_confidentiality: &[bool],
+) -> Result<(), &'static str> {
+    let raw = cbor_map_field(raw_params, "trusted_commitments")
+        .map_err(|_| "Failed to extract trusted commitments from parameters")?
+        .ok_or("Failed to extract trusted commitments from parameters")?;
+    let items = cbor_array_items(raw)
+        .map_err(|_| "Failed to extract trusted commitments from parameters")?;
+    if items.is_empty() || items.len() != output_confidentiality.len() {
+        return Err("Unexpected number of trusted commitments for transaction");
+    }
+
+    for (item, confidential) in items.iter().zip(output_confidentiality) {
+        if cbor_is_null(item) || cbor_is_empty_map(item) {
+            if *confidential {
+                return Err("Missing trusted commitment data for blinded output");
+            }
+            continue;
+        }
+        if !cbor_is_map(item) {
+            return Err("Invalid or missing trusted commitment data");
+        }
+        if *confidential {
+            validate_liquid_commitment_map(item)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_liquid_commitment_map(raw: &[u8]) -> Result<(), &'static str> {
+    for (field, len) in [
+        ("abf", jade_crypto::SHA256_LEN),
+        ("asset_generator", jade_crypto::LIQUID_COMMITMENT_LEN),
+        ("asset_id", jade_crypto::SHA256_LEN),
+        ("value_commitment", jade_crypto::LIQUID_COMMITMENT_LEN),
+        ("vbf", jade_crypto::SHA256_LEN),
+    ] {
+        let value = cbor_map_bytes(raw, field)
+            .map_err(|_| "Invalid or missing trusted commitment data")?
+            .ok_or("Invalid or missing trusted commitment data")?;
+        if value.len() != len {
+            return Err("Invalid or missing trusted commitment data");
+        }
+    }
+    cbor_map_u64(raw, "value")
+        .map_err(|_| "Invalid or missing trusted commitment data")?
+        .ok_or("Invalid or missing trusted commitment data")?;
+    if let Some(blinding_key) = cbor_map_bytes(raw, "blinding_key")
+        .map_err(|_| "Invalid or missing trusted commitment data")?
+    {
+        if blinding_key.len() != jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN {
+            return Err("Invalid or missing trusted commitment data");
+        }
+    }
+    Ok(())
+}
+
+fn validate_liquid_change_outputs(
+    raw_params: &[u8],
+    output_count: usize,
+) -> Result<(), &'static str> {
+    let Some(raw) = cbor_map_field(raw_params, "change")
+        .map_err(|_| "Unexpected number of output entries for transaction")?
+    else {
+        return Ok(());
+    };
+    if cbor_is_null(raw) {
+        return Ok(());
+    }
+
+    let items =
+        cbor_array_items(raw).map_err(|_| "Unexpected number of output entries for transaction")?;
+    if items.len() != output_count {
+        return Err("Unexpected number of output entries for transaction");
+    }
+    for item in items {
+        if cbor_is_null(item) {
+            continue;
+        }
+        if !cbor_is_map(item) {
+            return Err("Failed to extract valid receive path from parameters");
+        }
+        if cbor_map_field(item, "descriptor_name")
+            .map_err(|_| "Failed to extract valid receive path from parameters")?
+            .is_some()
+        {
+            return Err("Descriptor wallets not supported on liquid network");
+        }
+        let path = cbor_map_field(item, "path")
+            .map_err(|_| "Failed to extract valid receive path from parameters")?
+            .ok_or("Failed to extract valid receive path from parameters")?;
+        let path = cbor_u32_array(path, MAX_PATH_LEN)
+            .map_err(|_| "Failed to extract valid receive path from parameters")?;
+        if path.is_empty() {
+            return Err("Failed to extract valid receive path from parameters");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_liquid_asset_info(raw_params: &[u8]) -> Result<(), &'static str> {
+    let Some(raw) =
+        cbor_map_field(raw_params, "asset_info").map_err(|_| "Invalid asset info passed")?
+    else {
+        return Ok(());
+    };
+    if cbor_is_null(raw) {
+        return Ok(());
+    }
+    let items = cbor_array_items(raw).map_err(|_| "Invalid asset info passed")?;
+    for item in items {
+        if !cbor_is_map(item) {
+            return Err("Invalid asset info passed");
+        }
+        let asset_id = cbor_map_str(item, "asset_id")
+            .map_err(|_| "Invalid asset info passed")?
+            .ok_or("Invalid asset info passed")?;
+        if !is_hex_string_of_len(asset_id, 64) {
+            return Err("Invalid asset info passed");
+        }
+
+        let contract = cbor_map_field(item, "contract")
+            .map_err(|_| "Invalid asset info passed")?
+            .ok_or("Invalid asset info passed")?;
+        if !cbor_is_map(contract) {
+            return Err("Invalid asset info passed");
+        }
+        let entity = cbor_map_field(contract, "entity")
+            .map_err(|_| "Invalid asset info passed")?
+            .ok_or("Invalid asset info passed")?;
+        if !cbor_is_map(entity) || cbor_map_str(entity, "domain").ok().flatten().is_none() {
+            return Err("Invalid asset info passed");
+        }
+
+        let issuance_prevout = cbor_map_field(item, "issuance_prevout")
+            .map_err(|_| "Invalid asset info passed")?
+            .ok_or("Invalid asset info passed")?;
+        if !cbor_is_map(issuance_prevout) {
+            return Err("Invalid asset info passed");
+        }
+        let txid = cbor_map_str(issuance_prevout, "txid")
+            .map_err(|_| "Invalid asset info passed")?
+            .ok_or("Invalid asset info passed")?;
+        if !is_hex_string_of_len(txid, 64)
+            || cbor_map_u64(issuance_prevout, "vout")
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return Err("Invalid asset info passed");
+        }
+    }
+    Ok(())
+}
+
 fn cbor_bool(raw: &[u8]) -> Result<bool, ()> {
     let mut decoder = Decoder::new(raw);
     let value = decoder.bool().map_err(|_| ())?;
@@ -3981,6 +4162,43 @@ fn cbor_bytes_or_null(raw: &[u8]) -> Result<Option<&[u8]>, ()> {
     } else {
         Err(())
     }
+}
+
+fn cbor_array_items(raw: &[u8]) -> Result<Vec<&[u8]>, ()> {
+    let mut decoder = Decoder::new(raw);
+    let Some(len) = decoder.array().map_err(|_| ())? else {
+        return Err(());
+    };
+    let mut items = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let start = decoder.position();
+        decoder.skip().map_err(|_| ())?;
+        items.push(&raw[start..decoder.position()]);
+    }
+    if decoder.position() == raw.len() {
+        Ok(items)
+    } else {
+        Err(())
+    }
+}
+
+fn cbor_is_null(raw: &[u8]) -> bool {
+    let mut decoder = Decoder::new(raw);
+    decoder.null().is_ok() && decoder.position() == raw.len()
+}
+
+fn cbor_is_map(raw: &[u8]) -> bool {
+    let mut decoder = Decoder::new(raw);
+    decoder.map().is_ok()
+}
+
+fn cbor_is_empty_map(raw: &[u8]) -> bool {
+    let mut decoder = Decoder::new(raw);
+    matches!(decoder.map(), Ok(Some(0))) && decoder.position() == raw.len()
+}
+
+fn is_hex_string_of_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn cbor_u32_array(raw: &[u8], max_len: usize) -> Result<Vec<u32>, ()> {
@@ -5534,6 +5752,89 @@ mod tests {
         params
     }
 
+    fn good_liquid_tx() -> Vec<u8> {
+        decode_hex_vec(
+            "0200000000012413047d152348db4342763a0eece0d99e6e2983b3b46eda07ede58d28f201ad0100000000ffffffff020abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43033fc2cd1c4ce77e4339984f786dba6591bd862cf397e8cb6a99e457e162cad68617a9142e0ef2990318d8c9f7cee627650ba2a84fdda449870125b251070e29ca19043cf33ccd7324e2ddab03ecc4ae0b5e77c4fc0e5cf6c95a0100000000000f4240000000000000",
+        )
+    }
+
+    fn sign_liquid_tx_start_params_with_trusted(
+        network: &str,
+        txn: &[u8],
+        num_inputs: u64,
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(num_inputs)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_good_liquid_commitment(&mut encoder);
+        encoder.map(0).unwrap();
+        params
+    }
+
+    fn encode_good_liquid_commitment(encoder: &mut minicbor::Encoder<&mut Vec<u8>>) {
+        encoder
+            .map(7)
+            .unwrap()
+            .str("abf")
+            .unwrap()
+            .bytes(&decode_hex::<32>(
+                "a3510210bbab6ed67429af9beaf42f09382e12146a3db466971b58a45516bba0",
+            ))
+            .unwrap()
+            .str("asset_generator")
+            .unwrap()
+            .bytes(&decode_hex::<33>(
+                "0abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713",
+            ))
+            .unwrap()
+            .str("asset_id")
+            .unwrap()
+            .bytes(&decode_hex::<32>(
+                "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225",
+            ))
+            .unwrap()
+            .str("blinding_key")
+            .unwrap()
+            .bytes(&decode_hex::<33>(
+                "023454c233497be73ed98c07d5e9069e21519e94d0663375ca57c982037546e352",
+            ))
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u64(9_000_000)
+            .unwrap()
+            .str("value_commitment")
+            .unwrap()
+            .bytes(&decode_hex::<33>(
+                "094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43",
+            ))
+            .unwrap()
+            .str("vbf")
+            .unwrap()
+            .bytes(&decode_hex::<32>(
+                "6ec064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53",
+            ))
+            .unwrap();
+    }
+
     fn get_signature_params() -> Vec<u8> {
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
@@ -5871,6 +6172,7 @@ mod tests {
     #[test]
     fn sign_liquid_tx_validates_front_door_before_signing_defer() {
         let mut emulator = Emulator::new();
+        let good_tx = good_liquid_tx();
         let request = Request {
             id: Cow::Borrowed("liq"),
             method: Cow::Borrowed("sign_liquid_tx"),
@@ -5976,8 +6278,173 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract tx from parameters".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", Some(&good_tx), Some(2));
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Unexpected number of inputs for transaction".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", Some(&good_tx), Some(1));
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract trusted commitments from parameters".to_string()
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(&good_tx)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .map(0)
+            .unwrap()
+            .map(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Missing trusted commitment data for blinded output".to_string()
+            }
+        );
+
+        let mut params = sign_liquid_tx_start_params_with_trusted("localtest-liquid", &good_tx, 1);
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
             V1Outcome::DeferredToCore {
                 method: "sign_liquid_tx signing".to_string()
+            }
+        );
+
+        params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(&good_tx)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_good_liquid_commitment(&mut encoder);
+        encoder
+            .map(0)
+            .unwrap()
+            .str("change")
+            .unwrap()
+            .array(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Unexpected number of output entries for transaction".to_string()
+            }
+        );
+
+        params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(&good_tx)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_good_liquid_commitment(&mut encoder);
+        encoder
+            .map(0)
+            .unwrap()
+            .str("asset_info")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .map(0)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Invalid asset info passed".to_string()
             }
         );
     }

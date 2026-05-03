@@ -3240,7 +3240,6 @@ pub mod pure_rust {
         Some(output)
     }
 
-    #[cfg(feature = "liquid-elements-ffi")]
     pub fn liquid_commitments_from_factors(
         asset_id: &[u8; SHA256_LEN],
         value: u64,
@@ -3280,6 +3279,24 @@ pub mod pure_rust {
             asset_id: *asset_id,
             value,
         })
+    }
+
+    pub fn liquid_tx_input_count_and_output_confidentiality(
+        txn: &[u8],
+    ) -> Option<(usize, Vec<bool>)> {
+        use elements::confidential::{Asset, Value};
+        use elements::encode;
+
+        let tx: elements::Transaction = encode::deserialize(txn).ok()?;
+        let outputs = tx
+            .output
+            .iter()
+            .map(|output| {
+                matches!(output.asset, Asset::Confidential(_))
+                    || matches!(output.value, Value::Confidential(_))
+            })
+            .collect();
+        Some((tx.input.len(), outputs))
     }
 
     fn hash160(bytes: &[u8]) -> [u8; 20] {
