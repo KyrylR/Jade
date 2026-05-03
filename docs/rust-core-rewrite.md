@@ -191,15 +191,16 @@ The hard parts are hard for concrete compatibility reasons:
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
   no-op Bitcoin PSBT and Liquid PSET payloads unchanged when there is nothing
   to sign, no wallet-owned input matches, or wallet inputs are already signed,
-  and produces pure-Rust ECDSA signatures for the first Bitcoin signing paths:
-  single-sig legacy P2PKH, native P2WPKH,
-  P2SH-wrapped P2WPKH, Taproot key-path DEFAULT/ALL, and one-device multisig
-  partial signatures for P2SH, P2WSH, P2SH-P2WSH, Green 2-of-2 CSV, and
-  Green 2-of-3 fixtures, including multi-input Green PSBT byte-order golden
-  parity plus Green 2-of-3 recovery signing with both short parent-fingerprint
-  and full-path derivations. Raw v1 CBOR responses now chunk large signed PSBT
-  byte results with `seqnum`/`seqlen` and validate `get_extended_data`
-  continuation requests against the originating id and method. Liquid PSET
+  and produces pure-Rust ECDSA signatures for Bitcoin signing paths:
+  single-sig legacy P2PKH, native P2WPKH including the original coinbase-spend
+  fixture, P2SH-wrapped P2WPKH, Taproot key-path DEFAULT/ALL, and one-device
+  multisig partial signatures for P2SH, P2WSH, P2SH-P2WSH, Green 2-of-2 CSV,
+  and all original Green/native/wrapped/partial multisig PSBT fixtures,
+  including multi-input Green PSBT byte-order golden parity plus Green 2-of-3
+  recovery signing with both short parent-fingerprint and full-path
+  derivations. Raw v1 CBOR responses now chunk large signed PSBT byte results
+  with `seqnum`/`seqlen` and validate `get_extended_data` continuation
+  requests against the originating id and method. Liquid PSET
   signing now uses the permanent public `elements` PSET and sighash APIs to
   mutate singlesig P2PKH, P2WPKH, P2SH-P2WPKH, Liquidex partial-swap
   `SIGHASH_SINGLE|ANYONECANPAY`, Taproot key-path, and Green witness-script
@@ -289,7 +290,7 @@ The hard parts are hard for concrete compatibility reasons:
    where parity is implemented and tracks remaining signing and Liquid
    transaction flows as active implementation work.
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
-   Rust fixture gate now directly references 164 of 210 original `test_data`
+   Rust fixture gate now directly references 171 of 210 original `test_data`
    files; unreferenced fixtures remain active parity work rather than retired
    coverage.
 
