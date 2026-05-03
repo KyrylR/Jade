@@ -9,8 +9,8 @@ use jade_protocol_v2::{Request as V2Request, Response as V2Response, VersionInfo
 use minicbor::Decoder;
 
 use crate::{
-    CoreError, CoreState, DeviceBootFailure, DevicePlatform, DeviceRuntime, OperationState,
-    Platform,
+    AllocationFailure, CoreError, CoreState, DeviceBootFailure, DevicePlatform, DeviceRuntime,
+    OperationState, Platform,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,7 @@ pub enum FirmwareFrameError {
     BootRequired,
     Decode,
     Encode,
+    Allocation(AllocationFailure),
     Io(DeviceBootFailure),
 }
 
@@ -163,17 +164,31 @@ where
             return Err(FirmwareFrameError::BootRequired);
         }
 
-        let (state, platform) = self.state_and_platform_mut();
-        match protocol {
-            FirmwareProtocol::V1Cbor => Ok(handle_v1_cbor(state, platform, input)),
+        let allocation = self.manifest().memory.allocation;
+        allocation
+            .ensure_request(input.len())
+            .map_err(FirmwareFrameError::Allocation)?;
+
+        let reply = match protocol {
+            FirmwareProtocol::V1Cbor => {
+                let (state, platform) = self.state_and_platform_mut();
+                handle_v1_cbor(state, platform, input)
+            }
             FirmwareProtocol::V2Cbor => {
                 let request: V2Request<'_> =
                     minicbor::decode(input).map_err(|_| FirmwareFrameError::Decode)?;
+                let (state, platform) = self.state_and_platform_mut();
                 let response: V2Response<'_> = state.handle_v2(platform, request);
                 let bytes = minicbor::to_vec(response).map_err(|_| FirmwareFrameError::Encode)?;
-                Ok(Some(bytes))
+                Some(bytes)
             }
+        };
+        if let Some(bytes) = &reply {
+            allocation
+                .ensure_response(bytes.len())
+                .map_err(FirmwareFrameError::Allocation)?;
         }
+        Ok(reply)
     }
 }
 
@@ -517,6 +532,20 @@ mod tests {
         }
     }
 
+    fn test_device_with_allocation(allocation: AllocationBudget) -> TestDevice {
+        TestDevice {
+            manifest: DeviceManifest {
+                memory: DeviceMemoryBudget {
+                    allocation,
+                    ..TEST_MANIFEST.memory
+                },
+                ..TEST_MANIFEST
+            },
+            entropy_bytes: 0,
+            epoch: None,
+        }
+    }
+
     fn v1_request(id: &str, method: &str, params: Option<&[u8]>) -> Vec<u8> {
         let mut output = Vec::new();
         {
@@ -729,6 +758,61 @@ mod tests {
         assert_eq!(decoded.id, "e");
         assert_eq!(decoded.body, jade_protocol_v2::ResponseBody::Ok);
         assert_eq!(runtime.platform().entropy_bytes, 3);
+    }
+
+    #[test]
+    fn firmware_runtime_enforces_manifest_request_budget() {
+        let mut runtime = DeviceRuntime::new(test_device_with_allocation(AllocationBudget {
+            max_request_bytes: 4,
+            max_response_bytes: 4096,
+            max_scratch_bytes: 1024,
+        }));
+        runtime.boot().unwrap();
+        let request = v1_request("p", "ping", None);
+
+        assert_eq!(
+            runtime.handle_firmware_frame(FirmwareProtocol::V1Cbor, &request),
+            Err(FirmwareFrameError::Allocation(
+                AllocationFailure::RequestTooLarge {
+                    requested: request.len(),
+                    limit: 4
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn firmware_runtime_enforces_manifest_response_budget() {
+        let mut runtime = DeviceRuntime::new(test_device_with_allocation(AllocationBudget {
+            max_request_bytes: 1024,
+            max_response_bytes: 4,
+            max_scratch_bytes: 1024,
+        }));
+        runtime.boot().unwrap();
+
+        assert!(matches!(
+            runtime.handle_firmware_frame(FirmwareProtocol::V1Cbor, &v1_request("p", "ping", None)),
+            Err(FirmwareFrameError::Allocation(
+                AllocationFailure::ResponseTooLarge { limit: 4, .. }
+            ))
+        ));
+        assert!(matches!(
+            runtime.handle_firmware_frame(
+                FirmwareProtocol::V2Cbor,
+                &minicbor::to_vec(jade_protocol_v2::Request {
+                    id: Cow::Borrowed("e"),
+                    kind: RequestKind::AddEntropy,
+                    session: None,
+                    body: RequestBody::AddEntropy {
+                        entropy: ByteVec::from(vec![1]),
+                    },
+                })
+                .unwrap(),
+            ),
+            Err(FirmwareFrameError::Allocation(
+                AllocationFailure::ResponseTooLarge { limit: 4, .. }
+            ))
+        ));
     }
 
     #[test]

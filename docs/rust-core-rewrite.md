@@ -120,6 +120,11 @@ back-to-back frames. The stream board-app owners now keep those persistent
 `CborFrameBuffer`s inside the app object, so firmware glue can allocate the
 storage once at startup while still running display, user confirmation, QR,
 touch, clock, and rollback checks through the same event-loop tick.
+The firmware boundary now also enforces each target manifest's allocation
+budget before dispatching a request or sending a response. Oversized request
+frames and oversized handler replies return explicit allocation errors instead
+of being forwarded to serial, BLE, or USB, which is a required step before the
+Rust transport path can run against fixed real-device buffers.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or

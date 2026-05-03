@@ -927,14 +927,20 @@ where
     if len == 0 {
         return Ok(false);
     }
+    runtime
+        .runtime_platform()
+        .manifest()
+        .memory
+        .allocation
+        .ensure_request(len)
+        .map_err(FirmwareFrameError::Allocation)?;
 
     let reply = runtime.handle_v1_cbor(&rx_buffer[..len]);
-    if !reply.is_empty() {
-        runtime
-            .runtime_platform_mut()
-            .serial_send(&reply)
-            .map_err(FirmwareFrameError::Io)?;
-    }
+    send_budgeted_reply(
+        runtime.runtime_platform_mut(),
+        &reply,
+        Esp32s3PlatformShim::serial_send,
+    )?;
     Ok(true)
 }
 
@@ -969,14 +975,20 @@ where
     if len == 0 {
         return Ok(false);
     }
+    runtime
+        .runtime_platform()
+        .manifest()
+        .memory
+        .allocation
+        .ensure_request(len)
+        .map_err(FirmwareFrameError::Allocation)?;
 
     let reply = runtime.handle_v1_cbor(&rx_buffer[..len]);
-    if !reply.is_empty() {
-        runtime
-            .runtime_platform_mut()
-            .usb_send(&reply)
-            .map_err(FirmwareFrameError::Io)?;
-    }
+    send_budgeted_reply(
+        runtime.runtime_platform_mut(),
+        &reply,
+        Esp32s3PlatformShim::usb_send,
+    )?;
     Ok(true)
 }
 
@@ -1011,14 +1023,20 @@ where
     if len == 0 {
         return Ok(false);
     }
+    runtime
+        .runtime_platform()
+        .manifest()
+        .memory
+        .allocation
+        .ensure_request(len)
+        .map_err(FirmwareFrameError::Allocation)?;
 
     let reply = runtime.handle_v1_cbor(&rx_buffer[..len]);
-    if !reply.is_empty() {
-        runtime
-            .runtime_platform_mut()
-            .ble_send(&reply)
-            .map_err(FirmwareFrameError::Io)?;
-    }
+    send_budgeted_reply(
+        runtime.runtime_platform_mut(),
+        &reply,
+        Esp32s3PlatformShim::ble_send,
+    )?;
     Ok(true)
 }
 
@@ -1058,6 +1076,20 @@ where
 
     let mut handled = false;
     loop {
+        let Some(frame_len) = frame_buffer
+            .next_frame_len()
+            .map_err(|_| FirmwareFrameError::Decode)?
+        else {
+            break;
+        };
+        runtime
+            .runtime_platform()
+            .manifest()
+            .memory
+            .allocation
+            .ensure_request(frame_len)
+            .map_err(FirmwareFrameError::Allocation)?;
+
         let Some(reply) = frame_buffer
             .handle_next_frame(|frame| runtime.handle_v1_cbor(frame))
             .map_err(|_| FirmwareFrameError::Decode)?
@@ -1065,12 +1097,32 @@ where
             break;
         };
         handled = true;
-        if !reply.is_empty() {
-            send(runtime.runtime_platform_mut(), &reply).map_err(FirmwareFrameError::Io)?;
-        }
+        send_budgeted_reply(runtime.runtime_platform_mut(), &reply, |platform, bytes| {
+            send(platform, bytes)
+        })?;
     }
 
     Ok(handled)
+}
+
+fn send_budgeted_reply<P>(
+    platform: &mut P,
+    reply: &[u8],
+    mut send: impl FnMut(&mut P, &[u8]) -> Result<(), DeviceBootFailure>,
+) -> Result<(), FirmwareFrameError>
+where
+    P: DevicePlatform,
+{
+    if reply.is_empty() {
+        return Ok(());
+    }
+    platform
+        .manifest()
+        .memory
+        .allocation
+        .ensure_response(reply.len())
+        .map_err(FirmwareFrameError::Allocation)?;
+    send(platform, reply).map_err(FirmwareFrameError::Io)
 }
 
 fn poll_serial<P>(
@@ -1372,6 +1424,19 @@ mod tests {
         fn set_epoch(&mut self, epoch: u64) -> CoreResult<()> {
             self.epoch = Some(epoch);
             Ok(())
+        }
+    }
+
+    fn manifest_with_allocation(
+        manifest: DeviceManifest,
+        allocation: AllocationBudget,
+    ) -> DeviceManifest {
+        DeviceManifest {
+            memory: DeviceMemoryBudget {
+                allocation,
+                ..manifest.memory
+            },
+            ..manifest
         }
     }
 
@@ -2328,6 +2393,58 @@ mod tests {
         assert_eq!(decoder.str().unwrap(), "p");
         assert_eq!(decoder.str().unwrap(), "result");
         assert_eq!(decoder.u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn s3_full_v1_transport_enforces_manifest_allocation_budget() {
+        let request = v1_request("p", "ping");
+        let mut request_runtime = v1_runtime_for_v2(
+            TestPlatform::new(manifest_with_allocation(
+                JADE_V2_MANIFEST,
+                AllocationBudget {
+                    max_request_bytes: 4,
+                    max_response_bytes: 4096,
+                    max_scratch_bytes: 1024,
+                },
+            )),
+            jade_storage::MemoryStorage::new(),
+        );
+        request_runtime.runtime_platform_mut().usb_rx = Some(request.clone());
+
+        let mut rx = [0u8; 128];
+        assert_eq!(
+            poll_usb_full_v1(&mut request_runtime, &mut rx),
+            Err(FirmwareFrameError::Allocation(
+                jade_core::AllocationFailure::RequestTooLarge {
+                    requested: request.len(),
+                    limit: 4
+                }
+            ))
+        );
+        assert!(request_runtime.runtime_platform().usb_tx.is_empty());
+
+        let mut response_runtime = v1_runtime_for_v2(
+            TestPlatform::new(manifest_with_allocation(
+                JADE_V2_MANIFEST,
+                AllocationBudget {
+                    max_request_bytes: 1024,
+                    max_response_bytes: 4,
+                    max_scratch_bytes: 1024,
+                },
+            )),
+            jade_storage::MemoryStorage::new(),
+        );
+        response_runtime.runtime_platform_mut().usb_rx = Some(request);
+        let mut frame_storage = [0u8; 256];
+        let mut frames = CborFrameBuffer::new(&mut frame_storage);
+
+        assert!(matches!(
+            poll_usb_full_v1_stream(&mut response_runtime, &mut frames),
+            Err(FirmwareFrameError::Allocation(
+                jade_core::AllocationFailure::ResponseTooLarge { limit: 4, .. }
+            ))
+        ));
+        assert!(response_runtime.runtime_platform().usb_tx.is_empty());
     }
 
     #[test]
