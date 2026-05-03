@@ -5854,8 +5854,17 @@ fn descriptor_receive_address(
     pointer: u32,
     network: jade_crypto::BitcoinNetwork,
 ) -> Option<String> {
-    let script = descriptor_receive_script(details, branch, pointer, network)?;
-    jade_crypto::pure_rust::bitcoin_wsh_address_from_script(&script, network)
+    match descriptor_receive_output(details, branch, pointer, network)? {
+        DescriptorReceiveOutput::Wsh(script) => {
+            jade_crypto::pure_rust::bitcoin_wsh_address_from_script(&script, network)
+        }
+        DescriptorReceiveOutput::ShWsh(script) => {
+            jade_crypto::pure_rust::bitcoin_p2sh_p2wsh_address_from_script(&script, network)
+        }
+        DescriptorReceiveOutput::Tr(public_key) => {
+            jade_crypto::pure_rust::bitcoin_taproot_address_from_public_key(&public_key, network)
+        }
+    }
 }
 
 fn descriptor_receive_script_pubkey(
@@ -5864,18 +5873,45 @@ fn descriptor_receive_script_pubkey(
     pointer: u32,
     network: jade_crypto::BitcoinNetwork,
 ) -> Option<Vec<u8>> {
-    let script = descriptor_receive_script(details, branch, pointer, network)?;
-    Some(jade_crypto::pure_rust::bitcoin_wsh_script_pubkey_from_script(&script))
+    match descriptor_receive_output(details, branch, pointer, network)? {
+        DescriptorReceiveOutput::Wsh(script) => {
+            Some(jade_crypto::pure_rust::bitcoin_wsh_script_pubkey_from_script(&script))
+        }
+        DescriptorReceiveOutput::ShWsh(script) => {
+            Some(jade_crypto::pure_rust::bitcoin_p2sh_p2wsh_script_pubkey_from_script(&script))
+        }
+        DescriptorReceiveOutput::Tr(public_key) => {
+            jade_crypto::pure_rust::bitcoin_taproot_script_pubkey_from_public_key(&public_key)
+        }
+    }
 }
 
-fn descriptor_receive_script(
+enum DescriptorReceiveOutput {
+    Wsh(Vec<u8>),
+    ShWsh(Vec<u8>),
+    Tr([u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN]),
+}
+
+fn descriptor_receive_output(
     details: &DescriptorDetails,
     branch: u32,
     pointer: u32,
     network: jade_crypto::BitcoinNetwork,
-) -> Option<Vec<u8>> {
-    let inner = descriptor_function_body(&details.descriptor, "wsh")?;
-    descriptor_script(inner, &details.datavalues, branch, pointer, network)
+) -> Option<DescriptorReceiveOutput> {
+    if let Some(inner) = descriptor_function_body(&details.descriptor, "wsh") {
+        return descriptor_script(inner, &details.datavalues, branch, pointer, network)
+            .map(DescriptorReceiveOutput::Wsh);
+    }
+    if let Some(inner) = descriptor_function_body(&details.descriptor, "sh") {
+        let inner = descriptor_function_body(inner, "wsh")?;
+        return descriptor_script(inner, &details.datavalues, branch, pointer, network)
+            .map(DescriptorReceiveOutput::ShWsh);
+    }
+    if let Some(inner) = descriptor_function_body(&details.descriptor, "tr") {
+        return descriptor_public_key(inner, &details.datavalues, branch, pointer, network)
+            .map(DescriptorReceiveOutput::Tr);
+    }
+    None
 }
 
 fn descriptor_script(
@@ -6195,6 +6231,13 @@ fn descriptor_key_suffix_path(suffix: &str, branch: u32, pointer: u32) -> Option
             continue;
         }
         if let Some(after_wildcard) = rest.strip_prefix('*') {
+            if let Some(after_double_wildcard) = after_wildcard.strip_prefix('*') {
+                path.push(branch);
+                path.push(pointer);
+                saw_multipath = true;
+                rest = after_double_wildcard;
+                continue;
+            }
             path.push(pointer);
             rest = after_wildcard;
             continue;
@@ -7473,6 +7516,44 @@ mod tests {
             .find(|byte: char| !byte.is_ascii_digit())
             .unwrap_or(rest.len());
         Some(rest[..end].parse().unwrap())
+    }
+
+    fn fixture_descriptor_datavalues(fixture: &str) -> Vec<DescriptorDataValue> {
+        let Some(start) = fixture.find("\"datavalues\": {") else {
+            return Vec::new();
+        };
+        let rest = &fixture[start + "\"datavalues\": {".len()..];
+        let bytes = rest.as_bytes();
+        let mut values = Vec::new();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            while index < bytes.len()
+                && (bytes[index].is_ascii_whitespace() || bytes[index] == b',')
+            {
+                index += 1;
+            }
+            if index >= bytes.len() || bytes[index] == b'}' {
+                break;
+            }
+            assert_eq!(bytes[index], b'"', "expected descriptor datavalue key");
+            let key_start = index + 1;
+            let key_end = rest[key_start..].find('"').unwrap() + key_start;
+            index = key_end + 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_whitespace() || bytes[index] == b':')
+            {
+                index += 1;
+            }
+            assert_eq!(bytes[index], b'"', "expected descriptor datavalue string");
+            let value_start = index + 1;
+            let value_end = rest[value_start..].find('"').unwrap() + value_start;
+            values.push(DescriptorDataValue {
+                key: rest[key_start..key_end].to_string(),
+                value: rest[value_start..value_end].to_string(),
+            });
+            index = value_end + 1;
+        }
+        values
     }
 
     fn fixture_input_hex_values<'a>(fixture: &'a str, field: &str) -> Vec<&'a str> {
@@ -15500,6 +15581,102 @@ mod tests {
                     .to_string(),
             }
         );
+    }
+
+    #[test]
+    fn register_descriptor_matches_original_miniscript_address_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/descriptor_ss_anchorwatch.json"),
+            include_str!("../../../test_data/descriptor_ss_liana.json"),
+            include_str!("../../../test_data/descriptor_ss_liana_reuse_placeholder.json"),
+            include_str!("../../../test_data/descriptor_ss_multisig_wsh_sorted_match.json"),
+            include_str!("../../../test_data/descriptor_ss_multisig_sh_wsh_unsorted_match.json"),
+            include_str!("../../../test_data/descriptor_tr.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let network = fixture_object_string_value(fixture, "network").unwrap();
+            let descriptor_name = fixture_object_string_value(fixture, "descriptor_name").unwrap();
+            let descriptor = fixture_object_string_value(fixture, "descriptor").unwrap();
+            let datavalues = fixture_descriptor_datavalues(fixture);
+
+            let mut params = Vec::new();
+            let mut encoder = minicbor::Encoder::new(&mut params);
+            encoder
+                .map(4)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(network)
+                .unwrap()
+                .str("descriptor_name")
+                .unwrap()
+                .str(descriptor_name)
+                .unwrap()
+                .str("descriptor")
+                .unwrap()
+                .str(descriptor)
+                .unwrap()
+                .str("datavalues")
+                .unwrap()
+                .map(datavalues.len() as u64)
+                .unwrap();
+            for value in &datavalues {
+                encoder.str(&value.key).unwrap().str(&value.value).unwrap();
+            }
+            let request = Request {
+                id: Cow::Borrowed("r"),
+                method: Cow::Borrowed("register_descriptor"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BoolResult { result: true },
+                "{descriptor_name}"
+            );
+
+            for address_test in fixture_array_entries(fixture, "address_tests")
+                .into_iter()
+                .flatten()
+            {
+                let mut params = Vec::new();
+                minicbor::Encoder::new(&mut params)
+                    .map(4)
+                    .unwrap()
+                    .str("network")
+                    .unwrap()
+                    .str(network)
+                    .unwrap()
+                    .str("descriptor_name")
+                    .unwrap()
+                    .str(descriptor_name)
+                    .unwrap()
+                    .str("branch")
+                    .unwrap()
+                    .u64(fixture_object_u64_value(address_test, "branch").unwrap())
+                    .unwrap()
+                    .str("pointer")
+                    .unwrap()
+                    .u64(fixture_object_u64_value(address_test, "pointer").unwrap())
+                    .unwrap();
+                let request = Request {
+                    id: Cow::Borrowed("a"),
+                    method: Cow::Borrowed("get_receive_address"),
+                    params: Some(&params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&request),
+                    V1Outcome::TextResult {
+                        result: fixture_object_string_value(address_test, "expected_address")
+                            .unwrap()
+                            .to_string(),
+                    },
+                    "{descriptor_name} {address_test}"
+                );
+            }
+        }
     }
 
     #[test]

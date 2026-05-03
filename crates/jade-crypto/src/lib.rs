@@ -3582,6 +3582,12 @@ pub mod pure_rust {
         p2sh_address(network, &script_hash)
     }
 
+    pub fn bitcoin_p2sh_p2wsh_script_pubkey_from_script(script: &[u8]) -> Vec<u8> {
+        let witness_script_hash = Sha256::digest(script);
+        let script_hash = hash160(&witness_v0_script_pubkey(witness_script_hash.as_ref()));
+        p2sh_script_pubkey(&script_hash)
+    }
+
     pub fn liquid_unconfidential_p2sh_p2wsh_address_from_script(
         script: &[u8],
         network: LiquidNetwork,
@@ -3749,6 +3755,21 @@ pub mod pure_rust {
     pub fn bitcoin_wsh_script_pubkey_from_script(script: &[u8]) -> Vec<u8> {
         let script_hash = Sha256::digest(script);
         witness_v0_script_pubkey(script_hash.as_ref())
+    }
+
+    pub fn bitcoin_taproot_address_from_public_key(
+        public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        network: BitcoinNetwork,
+    ) -> Option<String> {
+        let output_key = taproot_keyspend_output_key(public_key)?;
+        bech32::segwit::encode_v1(segwit_hrp(network), &output_key).ok()
+    }
+
+    pub fn bitcoin_taproot_script_pubkey_from_public_key(
+        public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<Vec<u8>> {
+        let output_key = taproot_keyspend_output_key(public_key)?;
+        Some(p2tr_script_pubkey(&output_key))
     }
 
     pub fn hash160_digest(bytes: &[u8]) -> [u8; 20] {
