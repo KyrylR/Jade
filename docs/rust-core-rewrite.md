@@ -105,6 +105,12 @@ names, validates Jade/NVS key constraints before platform I/O, and lets the
 existing `JadeStorage` record, PIN-counter, registration, OTP, and pinserver
 helpers run unchanged over an ESP NVS backend.
 
+The device manifest now validates OTA requests against the target partition
+layout. `DeviceManifest::validate_ota_request` rejects full firmware images,
+compressed uploads, and delta patches that do not fit the configured OTA slot,
+making partition fit a shared core release gate instead of a late board-script
+check.
+
 ## State Domains
 
 The Rust core models state as orthogonal domains:

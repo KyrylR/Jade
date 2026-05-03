@@ -20,8 +20,8 @@ pub use allocation::{AllocationBudget, AllocationFailure};
 pub use bip32_path::{JadeDerivationPath, PathError};
 pub use device::{
     static_version_info, DeviceBootFailure, DeviceBootReport, DeviceFeatureSet, DeviceManifest,
-    DeviceMemoryBudget, DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError,
-    DeviceSoc, DeviceTarget,
+    DeviceMemoryBudget, DeviceOtaError, DevicePartitionLayout, DevicePlatform, DeviceRuntime,
+    DeviceRuntimeError, DeviceSoc, DeviceTarget,
 };
 pub use firmware::{handle_v1_cbor, FirmwareFrameError, FirmwareProtocol};
 pub use jade_protocol_v2::{NetworkRestriction, VersionDebugInfo, VersionInfo, VersionInfoState};

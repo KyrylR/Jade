@@ -1,6 +1,6 @@
 use alloc::borrow::Cow;
 
-use crate::{AllocationBudget, CoreState, Platform};
+use crate::{AllocationBudget, CoreState, OtaRequest, Platform};
 use jade_protocol_v2::{Request, Response, VersionInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +110,36 @@ impl DeviceManifest {
     pub const fn supports_real_attestation(self) -> bool {
         self.features.hardware_attestation && matches!(self.soc(), DeviceSoc::Esp32S3)
     }
+
+    pub fn validate_ota_request(self, request: &OtaRequest) -> Result<(), DeviceOtaError> {
+        if self.partitions.ota_slots == 0 || self.partitions.ota_app_bytes == 0 {
+            return Err(DeviceOtaError::NoOtaSlot);
+        }
+
+        let slot_bytes = self.partitions.ota_app_bytes as u64;
+        if request.firmware_size > slot_bytes {
+            return Err(DeviceOtaError::FirmwareTooLarge);
+        }
+        if request.compressed_size > slot_bytes {
+            return Err(DeviceOtaError::CompressedUploadTooLarge);
+        }
+        if request
+            .patch_size
+            .is_some_and(|patch_size| patch_size > slot_bytes)
+        {
+            return Err(DeviceOtaError::DeltaPatchTooLarge);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceOtaError {
+    NoOtaSlot,
+    FirmwareTooLarge,
+    CompressedUploadTooLarge,
+    DeltaPatchTooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,5 +460,45 @@ mod tests {
         assert_eq!(info.jade_state, VersionInfoState::Uninit);
         assert!(info.attestation_initialised);
         assert!(info.jade_has_pin);
+    }
+
+    #[test]
+    fn ota_request_must_fit_target_slot() {
+        let request = OtaRequest::full(
+            TEST_MANIFEST.partitions.ota_app_bytes as u64,
+            512 * 1024,
+            Some([0x11; crate::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(TEST_MANIFEST.validate_ota_request(&request), Ok(()));
+
+        let too_large = OtaRequest::full(
+            TEST_MANIFEST.partitions.ota_app_bytes as u64 + 1,
+            512 * 1024,
+            Some([0x11; crate::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            TEST_MANIFEST.validate_ota_request(&too_large),
+            Err(DeviceOtaError::FirmwareTooLarge)
+        );
+
+        let patch_too_large = OtaRequest::delta(
+            1_000,
+            TEST_MANIFEST.partitions.ota_app_bytes as u64 + 1,
+            600,
+            Some([0x11; crate::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            TEST_MANIFEST.validate_ota_request(&patch_too_large),
+            Err(DeviceOtaError::DeltaPatchTooLarge)
+        );
     }
 }
