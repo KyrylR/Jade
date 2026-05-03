@@ -4294,10 +4294,10 @@ fn bad_parameters(message: &'static str) -> V1Outcome {
 fn current_unix_epoch() -> u64 {
     #[cfg(feature = "std")]
     {
-        return SystemTime::now()
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
-            .unwrap_or(0);
+            .unwrap_or(0)
     }
 
     #[cfg(not(feature = "std"))]

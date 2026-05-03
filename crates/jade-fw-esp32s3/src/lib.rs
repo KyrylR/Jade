@@ -204,8 +204,8 @@ where
             qr_buffer,
         } = self;
         runtime.tick(Esp32s3BoardTick {
-            rx_buffer: &mut **rx_buffer,
-            qr_buffer: Some(&mut **qr_buffer),
+            rx_buffer,
+            qr_buffer: Some(qr_buffer),
             display_status,
             confirmation,
         })
@@ -996,6 +996,7 @@ mod tests {
     use alloc::{
         borrow::Cow,
         string::{String, ToString},
+        vec,
         vec::Vec,
     };
     use jade_core::{CoreResult, CoreState, Platform, VersionInfo};
@@ -1405,7 +1406,7 @@ mod tests {
         );
 
         assert!(matches!(
-            board.begin_ota_update(TestOtaWriter::new(), request.clone()),
+            board.begin_ota_update(TestOtaWriter::new(), request),
             Err(Esp32s3OtaStartError::BootRequired)
         ));
         board.boot().unwrap();
@@ -1735,10 +1736,8 @@ mod tests {
 
     #[test]
     fn s3_board_app_validates_static_buffer_sizes() {
-        let mut short_rx = Vec::new();
-        short_rx.resize(RX_BUFFER_BYTES - 1, 0);
-        let mut qr = Vec::new();
-        qr.resize(QR_BUFFER_BYTES, 0);
+        let short_rx = vec![0; RX_BUFFER_BYTES - 1];
+        let qr = vec![0; QR_BUFFER_BYTES];
         assert_eq!(
             validate_board_buffers(&short_rx, &qr),
             Err(Esp32s3BoardAppError::RxBufferTooSmall {
@@ -1747,10 +1746,8 @@ mod tests {
             })
         );
 
-        let mut rx = Vec::new();
-        rx.resize(RX_BUFFER_BYTES, 0);
-        let mut short_qr = Vec::new();
-        short_qr.resize(QR_BUFFER_BYTES - 1, 0);
+        let rx = vec![0; RX_BUFFER_BYTES];
+        let short_qr = vec![0; QR_BUFFER_BYTES - 1];
         assert_eq!(
             validate_board_buffers(&rx, &short_qr),
             Err(Esp32s3BoardAppError::QrBufferTooSmall {
@@ -1764,10 +1761,8 @@ mod tests {
 
     #[test]
     fn s3_board_app_ticks_runtime_with_fixed_buffers() {
-        let mut rx = Vec::new();
-        rx.resize(RX_BUFFER_BYTES, 0);
-        let mut qr = Vec::new();
-        qr.resize(QR_BUFFER_BYTES, 0);
+        let mut rx = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
         let mut app = Esp32s3BoardApp::new(
             TestPlatform::new(JADE_V2_MANIFEST),
             jade_storage::MemoryStorage::new(),

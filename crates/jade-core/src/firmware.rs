@@ -519,20 +519,23 @@ mod tests {
 
     fn v1_request(id: &str, method: &str, params: Option<&[u8]>) -> Vec<u8> {
         let mut output = Vec::new();
-        let mut encoder = Encoder::new(&mut output);
-        let fields = if params.is_some() { 3 } else { 2 };
-        encoder
-            .map(fields)
-            .and_then(|e| e.str("id"))
-            .and_then(|e| e.str(id))
-            .and_then(|e| e.str("method"))
-            .and_then(|e| e.str(method))
-            .expect("Vec-backed CBOR encoding is infallible");
-        if let Some(params) = params {
+        {
+            let mut encoder = Encoder::new(&mut output);
+            let fields = if params.is_some() { 3 } else { 2 };
             encoder
-                .str("params")
+                .map(fields)
+                .and_then(|e| e.str("id"))
+                .and_then(|e| e.str(id))
+                .and_then(|e| e.str("method"))
+                .and_then(|e| e.str(method))
                 .expect("Vec-backed CBOR encoding is infallible");
-            drop(encoder);
+            if params.is_some() {
+                encoder
+                    .str("params")
+                    .expect("Vec-backed CBOR encoding is infallible");
+            }
+        }
+        if let Some(params) = params {
             output.extend_from_slice(params);
         }
         output
@@ -757,6 +760,6 @@ mod tests {
                 _ => decoder.skip().unwrap(),
             }
         }
-        assert_eq!(state.as_deref(), Some(VersionInfoState::Ready.as_v1_str()));
+        assert_eq!(state, Some(VersionInfoState::Ready.as_v1_str()));
     }
 }

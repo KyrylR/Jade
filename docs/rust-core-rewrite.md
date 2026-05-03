@@ -461,7 +461,11 @@ remain target firmware platform shims, but
 
 ## First Parity Gates
 
-1. `cargo check --workspace --all-targets` passes.
+1. Rust CI gates pass locally: `cargo fmt --all --check`,
+   `./tools/check_rust_core_no_c.sh`, `cargo check --workspace --all-targets`,
+   `cargo test --workspace`, `cargo clippy --workspace --all-targets
+   --all-features -- -D warnings`, and `cargo check -p jade-emulator
+   --no-default-features --lib`.
 2. v1 method catalog matches current dispatch and continuation methods.
 3. `jade-emulator` routes immediate/pre-auth/authenticated calls through Rust
    where parity is implemented and tracks remaining signing and Liquid
