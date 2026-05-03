@@ -6,8 +6,8 @@ extern crate alloc;
 use jade_core::{
     AllocationBudget, CborFrameBuffer, CoreResult, CoreState, DeviceBootFailure,
     DeviceBootReadiness, DeviceBootReport, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
-    DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
-    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
+    DevicePartitionLayout, DevicePlatform, DeviceRunningImage, DeviceRuntime, DeviceRuntimeError,
+    DeviceTarget, DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
     OtaUploadVerifier, OtaWriteError, OtaWriteSession, Platform, UserConfirmation,
     UserConfirmationDecision, VersionInfo,
 };
@@ -66,6 +66,12 @@ pub trait Esp32Hardware {
     }
     fn boot_report(&mut self) -> DeviceBootReport {
         DeviceBootReport::from_readiness(self.manifest().target, self.boot_readiness())
+    }
+    fn running_image(&mut self) -> Result<Option<DeviceRunningImage>, DeviceBootFailure> {
+        Ok(None)
+    }
+    fn mark_running_image_valid_cancel_rollback(&mut self) -> Result<(), DeviceBootFailure> {
+        Ok(())
     }
     fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure>;
     fn monotonic_millis(&self) -> u64;
@@ -172,6 +178,14 @@ impl<H: Esp32Hardware> DevicePlatform for Esp32DevicePlatform<H> {
 
     fn boot_report(&mut self) -> DeviceBootReport {
         self.hardware.boot_report()
+    }
+
+    fn running_image(&mut self) -> Result<Option<DeviceRunningImage>, DeviceBootFailure> {
+        self.hardware.running_image()
+    }
+
+    fn mark_running_image_valid_cancel_rollback(&mut self) -> Result<(), DeviceBootFailure> {
+        self.hardware.mark_running_image_valid_cancel_rollback()
     }
 
     fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
@@ -1602,6 +1616,8 @@ mod tests {
         confirmation_decision: UserConfirmationDecision,
         monotonic_millis: u64,
         rollback_secure_version: u32,
+        running_image: Option<DeviceRunningImage>,
+        mark_valid_count: usize,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1782,6 +1798,8 @@ mod tests {
                 confirmation_decision: UserConfirmationDecision::Approved,
                 monotonic_millis: 1,
                 rollback_secure_version: 1,
+                running_image: None,
+                mark_valid_count: 0,
             }
         }
 
@@ -1857,6 +1875,15 @@ mod tests {
             self.boot_report
         }
 
+        fn running_image(&mut self) -> Result<Option<DeviceRunningImage>, DeviceBootFailure> {
+            Ok(self.running_image)
+        }
+
+        fn mark_running_image_valid_cancel_rollback(&mut self) -> Result<(), DeviceBootFailure> {
+            self.mark_valid_count += 1;
+            Ok(())
+        }
+
         fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
             out.fill(0x5a);
             Ok(())
@@ -1915,6 +1942,15 @@ mod tests {
 
         fn boot_report(&mut self) -> jade_core::DeviceBootReport {
             self.boot_report
+        }
+
+        fn running_image(&mut self) -> Result<Option<DeviceRunningImage>, DeviceBootFailure> {
+            Ok(self.running_image)
+        }
+
+        fn mark_running_image_valid_cancel_rollback(&mut self) -> Result<(), DeviceBootFailure> {
+            self.mark_valid_count += 1;
+            Ok(())
         }
 
         fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
@@ -2159,6 +2195,28 @@ mod tests {
         let (hardware, runtime_state) = platform.into_inner();
         assert_eq!(hardware.epoch, Some(42));
         assert!(runtime_state.jade_has_pin());
+    }
+
+    #[test]
+    fn esp32_device_platform_marks_pending_ota_image_valid_at_boot() {
+        let mut hardware = TestPlatform::new(JADE_MANIFEST);
+        let image = DeviceRunningImage {
+            state: jade_core::DeviceOtaImageState::PendingVerify,
+            secure_version: 5,
+        };
+        hardware.running_image = Some(image);
+        let mut runtime = runtime_for_v1(Esp32DevicePlatform::new(hardware));
+
+        runtime.boot().unwrap();
+
+        assert_eq!(
+            runtime.ota_boot_report(),
+            Some(jade_core::DeviceOtaBootReport {
+                image: Some(image),
+                action: jade_core::DeviceOtaBootAction::MarkedValidCancelRollback,
+            })
+        );
+        assert_eq!(runtime.platform().hardware().mark_valid_count, 1);
     }
 
     #[test]

@@ -143,6 +143,43 @@ pub enum DeviceOtaError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceOtaImageState {
+    Unknown,
+    New,
+    PendingVerify,
+    Valid,
+    Invalid,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRunningImage {
+    pub state: DeviceOtaImageState,
+    pub secure_version: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceOtaBootAction {
+    None,
+    MarkedValidCancelRollback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceOtaBootReport {
+    pub image: Option<DeviceRunningImage>,
+    pub action: DeviceOtaBootAction,
+}
+
+impl DeviceOtaBootReport {
+    pub const fn unavailable() -> Self {
+        Self {
+            image: None,
+            action: DeviceOtaBootAction::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceBootFailure {
     EntropyUnavailable,
     StorageUnavailable,
@@ -262,6 +299,12 @@ impl DeviceBootReport {
 pub trait DevicePlatform: Platform {
     fn manifest(&self) -> DeviceManifest;
     fn boot_report(&mut self) -> DeviceBootReport;
+    fn running_image(&mut self) -> Result<Option<DeviceRunningImage>, DeviceBootFailure> {
+        Ok(None)
+    }
+    fn mark_running_image_valid_cancel_rollback(&mut self) -> Result<(), DeviceBootFailure> {
+        Ok(())
+    }
     fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure>;
     fn monotonic_millis(&self) -> u64;
     fn rollback_secure_version(&self) -> u32;
@@ -277,6 +320,7 @@ pub struct DeviceRuntime<P> {
     state: CoreState,
     platform: P,
     booted: bool,
+    ota_boot_report: Option<DeviceOtaBootReport>,
 }
 
 impl<P> DeviceRuntime<P>
@@ -288,6 +332,7 @@ where
             state: CoreState::default(),
             platform,
             booted: false,
+            ota_boot_report: None,
         }
     }
 
@@ -297,13 +342,49 @@ where
             self.booted = false;
             Err(DeviceRuntimeError::Boot(failure))
         } else {
+            self.ota_boot_report = Some(self.validate_running_image()?);
             self.booted = true;
             Ok(report)
         }
     }
 
+    fn validate_running_image(&mut self) -> Result<DeviceOtaBootReport, DeviceRuntimeError> {
+        let Some(image) = self
+            .platform
+            .running_image()
+            .map_err(DeviceRuntimeError::Boot)?
+        else {
+            return Ok(DeviceOtaBootReport::unavailable());
+        };
+
+        let action = match image.state {
+            DeviceOtaImageState::PendingVerify => {
+                self.platform
+                    .mark_running_image_valid_cancel_rollback()
+                    .map_err(DeviceRuntimeError::Boot)?;
+                DeviceOtaBootAction::MarkedValidCancelRollback
+            }
+            DeviceOtaImageState::Invalid | DeviceOtaImageState::Aborted => {
+                self.booted = false;
+                return Err(DeviceRuntimeError::Boot(DeviceBootFailure::OtaStateInvalid));
+            }
+            DeviceOtaImageState::Unknown
+            | DeviceOtaImageState::New
+            | DeviceOtaImageState::Valid => DeviceOtaBootAction::None,
+        };
+
+        Ok(DeviceOtaBootReport {
+            image: Some(image),
+            action,
+        })
+    }
+
     pub fn is_booted(&self) -> bool {
         self.booted
+    }
+
+    pub fn ota_boot_report(&self) -> Option<DeviceOtaBootReport> {
+        self.ota_boot_report
     }
 
     pub fn state(&self) -> &CoreState {
@@ -464,6 +545,71 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct OtaBootDevice {
+        manifest: DeviceManifest,
+        report: DeviceBootReport,
+        image: Option<DeviceRunningImage>,
+        mark_valid_count: usize,
+    }
+
+    impl OtaBootDevice {
+        fn new(image: Option<DeviceRunningImage>) -> Self {
+            Self {
+                manifest: TEST_MANIFEST,
+                report: DeviceBootReport::ok(TEST_MANIFEST.target),
+                image,
+                mark_valid_count: 0,
+            }
+        }
+    }
+
+    impl Platform for OtaBootDevice {
+        fn version_info<'a>(&'a self, state: &CoreState) -> VersionInfo<'a> {
+            static_version_info(self.manifest, state, "host", "000000000000", false)
+        }
+
+        fn add_entropy(&mut self, _entropy: &[u8]) -> crate::CoreResult<()> {
+            Ok(())
+        }
+
+        fn set_epoch(&mut self, _epoch: u64) -> crate::CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl DevicePlatform for OtaBootDevice {
+        fn manifest(&self) -> DeviceManifest {
+            self.manifest
+        }
+
+        fn boot_report(&mut self) -> DeviceBootReport {
+            self.report
+        }
+
+        fn running_image(&mut self) -> Result<Option<DeviceRunningImage>, DeviceBootFailure> {
+            Ok(self.image)
+        }
+
+        fn mark_running_image_valid_cancel_rollback(&mut self) -> Result<(), DeviceBootFailure> {
+            self.mark_valid_count += 1;
+            Ok(())
+        }
+
+        fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
+            out.fill(0xa5);
+            Ok(())
+        }
+
+        fn monotonic_millis(&self) -> u64 {
+            42
+        }
+
+        fn rollback_secure_version(&self) -> u32 {
+            1
+        }
+    }
+
     const TEST_MANIFEST: DeviceManifest = DeviceManifest {
         target: DeviceTarget::JadeV2,
         features: DeviceFeatureSet::ESP32S3_BASE,
@@ -512,6 +658,44 @@ mod tests {
             ))
         );
         assert!(!runtime.is_booted());
+    }
+
+    #[test]
+    fn runtime_marks_pending_ota_image_valid_before_accepting_traffic() {
+        let image = DeviceRunningImage {
+            state: DeviceOtaImageState::PendingVerify,
+            secure_version: 7,
+        };
+        let mut runtime = DeviceRuntime::new(OtaBootDevice::new(Some(image)));
+
+        assert_eq!(runtime.boot().unwrap().target, DeviceTarget::JadeV2);
+        assert!(runtime.is_booted());
+        assert_eq!(runtime.platform().mark_valid_count, 1);
+        assert_eq!(
+            runtime.ota_boot_report(),
+            Some(DeviceOtaBootReport {
+                image: Some(image),
+                action: DeviceOtaBootAction::MarkedValidCancelRollback,
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_invalid_or_aborted_running_ota_image() {
+        for state in [DeviceOtaImageState::Invalid, DeviceOtaImageState::Aborted] {
+            let image = DeviceRunningImage {
+                state,
+                secure_version: 3,
+            };
+            let mut runtime = DeviceRuntime::new(OtaBootDevice::new(Some(image)));
+
+            assert_eq!(
+                runtime.boot(),
+                Err(DeviceRuntimeError::Boot(DeviceBootFailure::OtaStateInvalid))
+            );
+            assert!(!runtime.is_booted());
+            assert_eq!(runtime.platform().mark_valid_count, 0);
+        }
     }
 
     #[test]

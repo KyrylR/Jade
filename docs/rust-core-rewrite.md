@@ -79,6 +79,14 @@ Secure boot and flash-encryption readiness are also part of that boot gate,
 not only manifest metadata. A production backend must report the actual eFuse
 state, and the Rust runtime now fails closed with explicit boot errors before
 accepting traffic if secure boot or flash encryption is not enabled.
+The boot gate also models the ESP OTA running-image validation path that the C
+firmware currently performs during startup. `DevicePlatform` can now report the
+running OTA image state and secure version; when the state is pending verify,
+`DeviceRuntime::boot` calls the platform hook that maps to
+`esp_ota_mark_app_valid_cancel_rollback` before accepting client traffic, and
+invalid or aborted running images fail closed as `OtaStateInvalid`. The ESP32
+and ESP32-S3 reusable hardware adapters forward those hooks, so a production
+backend only needs to bind them to the concrete ESP OTA APIs.
 
 Both firmware crates also expose constructors for the full generic v1 runtime:
 `jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
