@@ -348,8 +348,8 @@ fn scan_psbt_input_map(
             }
             // PSBT_IN_TAP_BIP32_DERIVATION. Jade's current signer supports
             // single-key key-path Taproot only; script-path leaves, merkle roots,
-            // and multiple tap derivations are intentionally not treated as C-core
-            // defers because the legacy signer does not sign them either.
+            // and multiple tap derivations are intentionally not treated as
+            // missing Rust work because the legacy signer does not sign them either.
             0x16 => {
                 if let Some(leaf_hashes) = tap_derivation_leaf_hashes(value) {
                     tap_derivations = tap_derivations.saturating_add(1);

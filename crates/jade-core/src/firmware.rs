@@ -275,7 +275,7 @@ fn handle_v1_request(
         Some(_) => Some(v1_error(
             &request.id,
             V1ErrorCode::InternalError,
-            "method not yet ported to Rust core",
+            "unsupported by Rust core",
         )),
         None => Some(v1_error(
             &request.id,
@@ -408,9 +408,7 @@ fn v1_core_error(id: &str, err: CoreError) -> Vec<u8> {
         CoreError::InternalError => (V1ErrorCode::InternalError, "internal error"),
         CoreError::HardwareLocked => (V1ErrorCode::HardwareLocked, "hardware locked"),
         CoreError::OutOfMemory => (V1ErrorCode::InternalError, "out of memory"),
-        CoreError::Deferred(_) | CoreError::Unsupported(_) => {
-            (V1ErrorCode::InternalError, "unsupported")
-        }
+        CoreError::Unsupported(_) => (V1ErrorCode::InternalError, "unsupported"),
     };
     v1_error(id, code, message)
 }

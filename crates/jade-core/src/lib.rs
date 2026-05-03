@@ -44,7 +44,6 @@ pub enum CoreError {
     InternalError,
     HardwareLocked,
     OutOfMemory,
-    Deferred(&'static str),
     Unsupported(&'static str),
 }
 
@@ -155,7 +154,6 @@ fn v2_error_body(err: CoreError) -> ResponseBody<'static> {
             "hardware locked",
         ),
         CoreError::OutOfMemory => (jade_protocol_v2::ErrorCode::OutOfMemory, "out of memory"),
-        CoreError::Deferred(method) => (jade_protocol_v2::ErrorCode::Unsupported, method),
         CoreError::Unsupported(feature) => (jade_protocol_v2::ErrorCode::Unsupported, feature),
     };
     ResponseBody::Error {

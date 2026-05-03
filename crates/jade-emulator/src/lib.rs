@@ -432,7 +432,7 @@ where
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string(),
             },
-            Some(_) => V1Outcome::DeferredToCore {
+            Some(_) => V1Outcome::UnsupportedByRust {
                 method: request.method.to_string(),
             },
             None => V1Outcome::Reject {
@@ -473,10 +473,10 @@ where
                     code: code as i32,
                     message: Cow::Owned(message),
                 }),
-                V1Outcome::DeferredToCore { method } => encode_error_response(&ErrorResponse {
+                V1Outcome::UnsupportedByRust { method } => encode_error_response(&ErrorResponse {
                     id: request.id,
                     code: ErrorCode::InternalError as i32,
-                    message: Cow::Owned(format!("method not yet ported to Rust core: {method}")),
+                    message: Cow::Owned(format!("unsupported by Rust core: {method}")),
                 }),
             },
             Err(err) => encode_error_response(&ErrorResponse {
@@ -1197,7 +1197,7 @@ where
                 return bad_parameters("Descriptor wallets not supported on liquid network");
             }
             let Some(network) = bitcoin_network_for_name(network_name) else {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "get_receive_address".to_string(),
                 };
             };
@@ -1207,7 +1207,7 @@ where
         if params.contains("multisig_name").unwrap_or(false) {
             if is_liquid {
                 let Some(network) = liquid_network_for_name(network_name) else {
-                    return V1Outcome::DeferredToCore {
+                    return V1Outcome::UnsupportedByRust {
                         method: "get_receive_address".to_string(),
                     };
                 };
@@ -1231,7 +1231,7 @@ where
                 );
             }
             let Some(network) = bitcoin_network_for_name(network_name) else {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "get_receive_address".to_string(),
                 };
             };
@@ -1274,7 +1274,7 @@ where
 
         let address = if is_liquid {
             let Some(network) = liquid_network_for_name(network_name) else {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "get_receive_address".to_string(),
                 };
             };
@@ -1293,7 +1293,7 @@ where
             }
         } else {
             let Some(network) = bitcoin_network_for_name(network_name) else {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "get_receive_address".to_string(),
                 };
             };
@@ -1378,7 +1378,7 @@ where
 
         let address = if is_liquid {
             let Some(network) = liquid_network_for_name(network_name) else {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "get_receive_address".to_string(),
                 };
             };
@@ -1404,7 +1404,7 @@ where
             }
         } else {
             let Some(network) = bitcoin_network_for_name(network_name) else {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "get_receive_address".to_string(),
                 };
             };
@@ -2465,7 +2465,7 @@ where
                 return bad_parameters("Failed to extract tx input from parameters")
             }
             Err(jade_crypto::TxSignError::Unsupported) => {
-                return V1Outcome::DeferredToCore {
+                return V1Outcome::UnsupportedByRust {
                     method: "sign_tx signing".to_string(),
                 }
             }
@@ -2500,7 +2500,7 @@ where
                     return bad_parameters("Failed to extract tx input from parameters");
                 }
                 Err(jade_crypto::TxSignError::Unsupported) => {
-                    return V1Outcome::DeferredToCore {
+                    return V1Outcome::UnsupportedByRust {
                         method: "sign_tx signing".to_string(),
                     };
                 }
@@ -2517,7 +2517,7 @@ where
                         jade_crypto::TxSignError::Invalid => {
                             bad_parameters("Failed to extract tx input from parameters")
                         }
-                        jade_crypto::TxSignError::Unsupported => V1Outcome::DeferredToCore {
+                        jade_crypto::TxSignError::Unsupported => V1Outcome::UnsupportedByRust {
                             method: "sign_tx signing".to_string(),
                         },
                     });
@@ -2612,7 +2612,7 @@ where
                     jade_crypto::TxSignError::Invalid => {
                         bad_parameters("Failed to extract tx input from parameters")
                     }
-                    jade_crypto::TxSignError::Unsupported => V1Outcome::DeferredToCore {
+                    jade_crypto::TxSignError::Unsupported => V1Outcome::UnsupportedByRust {
                         method: "sign_liquid_tx signing".to_string(),
                     },
                 });
@@ -2646,7 +2646,7 @@ where
                             return bad_parameters("Failed to extract tx input from parameters");
                         }
                         Err(jade_crypto::TxSignError::Unsupported) => {
-                            return V1Outcome::DeferredToCore {
+                            return V1Outcome::UnsupportedByRust {
                                 method: "sign_liquid_tx anti-exfil signing".to_string(),
                             };
                         }
@@ -2757,7 +2757,7 @@ where
                         return bad_parameters("Failed to extract tx input from parameters");
                     }
                     Err(jade_crypto::TxSignError::Unsupported) => {
-                        return V1Outcome::DeferredToCore {
+                        return V1Outcome::UnsupportedByRust {
                             method: "sign_liquid_tx anti-exfil signing".to_string(),
                         };
                     }
@@ -2796,7 +2796,7 @@ where
                         return bad_parameters("Failed to extract tx input from parameters");
                     }
                     Err(jade_crypto::TxSignError::Unsupported) => {
-                        return V1Outcome::DeferredToCore {
+                        return V1Outcome::UnsupportedByRust {
                             method: "sign_liquid_tx signing".to_string(),
                         };
                     }
@@ -2856,7 +2856,7 @@ where
                     return bad_parameters("Failed to extract tx input from parameters");
                 }
                 Err(jade_crypto::TxSignError::Unsupported) => {
-                    return V1Outcome::DeferredToCore {
+                    return V1Outcome::UnsupportedByRust {
                         method: "sign_tx signing".to_string(),
                     };
                 }
@@ -2875,7 +2875,7 @@ where
                     return bad_parameters("Failed to extract tx input from parameters");
                 }
                 Err(jade_crypto::TxSignError::Unsupported) => {
-                    return V1Outcome::DeferredToCore {
+                    return V1Outcome::UnsupportedByRust {
                         method: "sign_tx signing".to_string(),
                     };
                 }
@@ -3086,7 +3086,7 @@ where
                 Ok(None) => match jade_crypto::psbt_needs_wallet_signature(&psbt, &fingerprint) {
                     Ok(false) => return V1Outcome::BytesResult { result: psbt },
                     Ok(true) => {
-                        return V1Outcome::DeferredToCore {
+                        return V1Outcome::UnsupportedByRust {
                             method: "sign_psbt signing".to_string(),
                         };
                     }
@@ -3096,7 +3096,7 @@ where
                     return bad_parameters("Failed to extract psbt from parameters");
                 }
                 Err(jade_crypto::PsbtSignError::Unsupported) => {
-                    return V1Outcome::DeferredToCore {
+                    return V1Outcome::UnsupportedByRust {
                         method: "sign_psbt signing".to_string(),
                     };
                 }
@@ -3104,7 +3104,7 @@ where
         }
         match jade_crypto::psbt_needs_wallet_signature(&psbt, &fingerprint) {
             Ok(false) => V1Outcome::BytesResult { result: psbt },
-            Ok(true) => V1Outcome::DeferredToCore {
+            Ok(true) => V1Outcome::UnsupportedByRust {
                 method: "sign_psbt signing".to_string(),
             },
             Err(_) => bad_parameters("Failed to extract psbt from parameters"),
@@ -7392,7 +7392,6 @@ fn reject_core_error(err: CoreError) -> V1Outcome {
         CoreError::InternalError => (ErrorCode::InternalError, "internal error"),
         CoreError::HardwareLocked => (ErrorCode::HardwareLocked, "hardware locked"),
         CoreError::OutOfMemory => (ErrorCode::InternalError, "out of memory"),
-        CoreError::Deferred(method) => (ErrorCode::InternalError, method),
         CoreError::Unsupported(feature) => (ErrorCode::InternalError, feature),
     };
     V1Outcome::Reject {
@@ -7585,7 +7584,7 @@ pub enum V1Outcome {
         entries: Vec<OwnedResultMapEntry>,
     },
     NoReply,
-    DeferredToCore {
+    UnsupportedByRust {
         method: String,
     },
     Reject {
