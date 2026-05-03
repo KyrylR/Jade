@@ -136,13 +136,16 @@ The hard parts are hard for concrete compatibility reasons:
   derivation, AES-CBC/HMAC wallet seed blob encryption/decryption, retry
   counter restore/decrement semantics, and host-first `auth_user` -> `pin`
   continuation paths for both `set_pin` wallet persistence and `get_pin`
-  wallet unlock. These routes emit the existing `http_request`/`on-reply`
-  shape while keeping HTTP transport and PIN entry as platform boundaries.
-  Adapter-only debug handshake, QR image capture, and QR scan calls now route
-  through Rust host platform byte hooks instead of the C debug handlers.
-  ESP32-S3 eFuse/DS burning and real camera/QR backends remain target firmware
-  platform shims, but the v1 core response shapes and request validation no
-  longer require Jade-owned C application code.
+  wallet unlock. `get_version_info` now derives `jade_has_pin` and `LOCKED`
+  state from the Rust encrypted wallet blob when no seed is loaded, matching
+  the public keychain state without the C keychain globals. These routes emit
+  the existing `http_request`/`on-reply` shape while keeping HTTP transport and
+  PIN entry as platform boundaries. Adapter-only debug handshake, QR image
+  capture, and QR scan calls now route through Rust host platform byte hooks
+  instead of the C debug handlers. ESP32-S3 eFuse/DS burning and real camera/QR
+  backends remain target firmware platform shims, but the v1 core response
+  shapes and request validation no longer require Jade-owned C application
+  code.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
   BIP85 RSA public-key PEM export and RSA-PSS digest signing, P-256 identity
   pubkey/sign/ECDH, OTP storage,

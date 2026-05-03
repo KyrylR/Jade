@@ -168,6 +168,7 @@ impl Emulator {
                 activity: self.state.operation,
             },
             Some(MethodClass::PreAuth) if request.method == "get_version_info" => {
+                self.sync_wallet_storage_state();
                 V1Outcome::VersionInfo {
                     info: Box::new(self.state.version_info(&self.platform).into_static()),
                 }
@@ -3820,6 +3821,20 @@ impl Emulator {
         self.storage.get_encrypted_blob(&mut encrypted).is_ok() && !encrypted.is_empty()
     }
 
+    fn sync_wallet_storage_state(&mut self) {
+        let has_pin = self.has_encrypted_wallet_blob();
+        self.platform.jade_has_pin = has_pin;
+        if self.platform.wallet_seed().is_none() {
+            self.state.wallet = if has_pin {
+                WalletLifecycle::Locked
+            } else if self.state.wallet == WalletLifecycle::Locked {
+                WalletLifecycle::Uninit
+            } else {
+                self.state.wallet
+            };
+        }
+    }
+
     fn pinserver_unit_private_key(&mut self) -> Option<[u8; jade_crypto::EC_PRIVATE_KEY_LEN]> {
         let mut stored = Vec::new();
         if self
@@ -3983,6 +3998,7 @@ impl Emulator {
             };
         }
 
+        self.platform.jade_has_pin = true;
         self.platform.set_debug_wallet_seed(seed);
         self.platform.pending_pin_wallet_seed = None;
         self.state.wallet = WalletLifecycle::Ready;
@@ -3997,23 +4013,27 @@ impl Emulator {
         let mut encrypted = Vec::new();
         if self.storage.get_encrypted_blob(&mut encrypted).is_err() {
             let _ = self.storage.erase_encrypted_blob();
+            self.platform.jade_has_pin = false;
             return V1Outcome::BoolResult { result: false };
         }
 
         let Some(seed) = jade_crypto::pure_rust::wallet_blob_decrypt(final_aes, &encrypted) else {
             if self.storage.pin_counter() == 0 {
                 let _ = self.storage.erase_encrypted_blob();
+                self.platform.jade_has_pin = false;
             }
             return V1Outcome::BoolResult { result: false };
         };
         if !matches!(seed.len(), 32 | 64) {
             if self.storage.pin_counter() == 0 {
                 let _ = self.storage.erase_encrypted_blob();
+                self.platform.jade_has_pin = false;
             }
             return V1Outcome::BoolResult { result: false };
         }
 
         let _ = self.storage.restore_pin_counter();
+        self.platform.jade_has_pin = true;
         self.platform.set_debug_wallet_seed(seed);
         self.state.wallet = WalletLifecycle::Ready;
         V1Outcome::BoolResult { result: true }
@@ -6615,6 +6635,7 @@ pub struct HostPlatform {
     wallet_seed: Option<Vec<u8>>,
     master_unblinding_key: [u8; 64],
     attestation: Option<HostAttestationData>,
+    jade_has_pin: bool,
     debug_handshake_count: u64,
     debug_capture_image_data: Option<Vec<u8>>,
     debug_capture_image_contains_qr: bool,
@@ -6642,6 +6663,7 @@ impl Default for HostPlatform {
             wallet_seed: None,
             master_unblinding_key: [0; 64],
             attestation: None,
+            jade_has_pin: false,
             debug_handshake_count: 0,
             debug_capture_image_data: None,
             debug_capture_image_contains_qr: false,
@@ -6714,6 +6736,7 @@ impl HostPlatform {
         self.master_unblinding_key = [0; 64];
         self.confirm_export_blinding_key = false;
         self.attestation = None;
+        self.jade_has_pin = false;
         self.debug_handshake_count = 0;
         self.debug_capture_image_data = None;
         self.debug_capture_image_contains_qr = false;
@@ -6783,7 +6806,7 @@ impl Platform for HostPlatform {
             battery_charging: false,
             jade_state: state.wallet.into(),
             jade_networks: NetworkRestriction::All,
-            jade_has_pin: false,
+            jade_has_pin: self.jade_has_pin,
             debug: Some(VersionDebugInfo {
                 nvs_entries_used: 0,
                 nvs_entries_free: 0,
@@ -15390,6 +15413,17 @@ mod tests {
 
         emulator.platform_mut().clear_debug_wallet();
         emulator.state.wallet = WalletLifecycle::Locked;
+        let version_request = Request {
+            id: Cow::Borrowed("version"),
+            method: Cow::Borrowed("get_version_info"),
+            params: None,
+        };
+        let V1Outcome::VersionInfo { info } = emulator.handle_v1_request(&version_request) else {
+            panic!("expected version info");
+        };
+        assert!(info.jade_has_pin);
+        assert_eq!(info.jade_state, jade_protocol_v2::VersionInfoState::Locked);
+
         match emulator.handle_v1_request(&auth_request) {
             V1Outcome::OwnedMapResult { entries } => {
                 let http_request = entries
