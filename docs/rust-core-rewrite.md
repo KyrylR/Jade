@@ -55,6 +55,13 @@ split. They also expose transport pollers for the real links:
 the platform shim, dispatches it through `DeviceRuntime`, and writes the reply
 back through the same link.
 
+Both firmware crates also expose constructors for the full generic v1 runtime:
+`jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
+Those constructors instantiate `JadeRuntime<P, B>` with `jade-emulator`
+compiled as `no_std + alloc` and default features disabled, so board code can
+wire the full Rust v1 behavior engine to ESP platform hooks and NVS storage
+without pulling in host `std`.
+
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
 conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, and call

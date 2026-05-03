@@ -42,6 +42,7 @@ zeroize = { version = "1.8", default-features = false, features = ["alloc", "der
 
 jade-core = { path = "crates/jade-core" }
 jade-crypto = { path = "crates/jade-crypto" }
+jade-emulator = { path = "crates/jade-emulator", default-features = false }
 jade-protocol-v1 = { path = "crates/jade-protocol-v1" }
 jade-protocol-v2 = { path = "crates/jade-protocol-v2" }
 jade-storage = { path = "crates/jade-storage" }

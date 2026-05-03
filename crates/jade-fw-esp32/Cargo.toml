@@ -8,6 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 jade-core.workspace = true
+jade-emulator.workspace = true
+jade-storage.workspace = true
 
 [dev-dependencies]
 jade-protocol-v2.workspace = true

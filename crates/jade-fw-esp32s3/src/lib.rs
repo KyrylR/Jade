@@ -59,12 +59,25 @@ pub enum TouchEvent {
 }
 
 pub type Esp32s3Runtime<P> = DeviceRuntime<P>;
+pub type Esp32s3V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
 
 pub fn runtime_for_v2<P>(platform: P) -> Esp32s3Runtime<P>
 where
     P: Esp32s3PlatformShim,
 {
     DeviceRuntime::new(platform)
+}
+
+pub fn v1_runtime_for_v2<P, B>(platform: P, storage_backend: B) -> Esp32s3V1Runtime<P, B>
+where
+    P: jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    jade_emulator::JadeRuntime::from_parts(
+        platform,
+        storage_backend,
+        jade_storage::StorageLimits::ESP32_NVS_DEFAULT,
+    )
 }
 
 pub fn manifest_for_target(target: DeviceTarget) -> Option<DeviceManifest> {
@@ -387,6 +400,16 @@ mod tests {
         assert_eq!(runtime.boot().unwrap().target, DeviceTarget::JadeV2);
         assert!(runtime.is_booted());
         assert_eq!(runtime.version_info().board_type, Cow::Borrowed("jade_v2"));
+    }
+
+    #[test]
+    fn s3_exposes_full_v1_runtime_constructor() {
+        let runtime = v1_runtime_for_v2(
+            jade_emulator::HostPlatform::default(),
+            jade_storage::MemoryStorage::new(),
+        );
+
+        assert_eq!(runtime.state().wallet, jade_core::WalletLifecycle::Uninit);
     }
 
     #[test]

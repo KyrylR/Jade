@@ -49,12 +49,25 @@ pub trait Esp32PlatformShim: DevicePlatform {
 }
 
 pub type Esp32Runtime<P> = DeviceRuntime<P>;
+pub type Esp32V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
 
 pub fn runtime_for_v1<P>(platform: P) -> Esp32Runtime<P>
 where
     P: Esp32PlatformShim,
 {
     DeviceRuntime::new(platform)
+}
+
+pub fn v1_runtime_for_v1<P, B>(platform: P, storage_backend: B) -> Esp32V1Runtime<P, B>
+where
+    P: jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    jade_emulator::JadeRuntime::from_parts(
+        platform,
+        storage_backend,
+        jade_storage::StorageLimits::ESP32_NVS_DEFAULT,
+    )
 }
 
 pub fn manifest_for_target(target: DeviceTarget) -> Option<DeviceManifest> {
@@ -306,6 +319,16 @@ mod tests {
         assert_eq!(runtime.boot().unwrap().target, DeviceTarget::Jade);
         assert!(runtime.is_booted());
         assert_eq!(runtime.version_info().board_type, Cow::Borrowed("jade"));
+    }
+
+    #[test]
+    fn esp32_exposes_full_v1_runtime_constructor() {
+        let runtime = v1_runtime_for_v1(
+            jade_emulator::HostPlatform::default(),
+            jade_storage::MemoryStorage::new(),
+        );
+
+        assert_eq!(runtime.state().wallet, jade_core::WalletLifecycle::Uninit);
     }
 
     #[test]
