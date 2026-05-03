@@ -61,6 +61,7 @@ struct BitcoinSignTxSession {
     next_signature: usize,
     flow: BitcoinSignTxFlow,
     inputs: Vec<BitcoinTxInputParams>,
+    liquid_inputs: Vec<LiquidTxInputParams>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2228,6 +2229,7 @@ impl Emulator {
             next_signature: 0,
             flow,
             inputs: Vec::with_capacity(expected_inputs),
+            liquid_inputs: Vec::new(),
         });
         V1Outcome::BoolResult { result: true }
     }
@@ -2294,7 +2296,8 @@ impl Emulator {
             received_inputs: 0,
             next_signature: 0,
             flow,
-            inputs: Vec::with_capacity(expected_inputs),
+            inputs: Vec::new(),
+            liquid_inputs: Vec::with_capacity(expected_inputs),
         });
         V1Outcome::BoolResult { result: true }
     }
@@ -2418,6 +2421,7 @@ impl Emulator {
                 Ok(input) => input,
                 Err(message) => return bad_parameters(message),
             };
+        let seed = self.platform.wallet_seed();
         let session = self
             .sign_tx
             .as_mut()
@@ -2428,27 +2432,86 @@ impl Emulator {
                 message: "Too many tx_input messages".to_string(),
             };
         }
-        session.received_inputs += 1;
-        let done = session.received_inputs == session.expected_inputs;
+        let tx_input_index = session.received_inputs;
 
-        if !input.signs_input {
-            if done {
-                self.sign_tx = None;
+        match flow {
+            BitcoinSignTxFlow::LiquidLegacy => {
+                session.received_inputs += 1;
+                let done = session.received_inputs == session.expected_inputs;
+
+                if !input.signs_input {
+                    if done {
+                        self.sign_tx = None;
+                    }
+                    return V1Outcome::BytesResult { result: Vec::new() };
+                }
+
+                let Some(seed) = seed else {
+                    if done {
+                        self.sign_tx = None;
+                    }
+                    return V1Outcome::Reject {
+                        code: ErrorCode::InternalError,
+                        message: "Wallet seed is not available".to_string(),
+                    };
+                };
+                let signature = sign_liquid_tx_input(&session.txn, seed, tx_input_index, &input)
+                    .map_err(|err| match err {
+                        jade_crypto::TxSignError::Invalid => {
+                            bad_parameters("Failed to extract tx input from parameters")
+                        }
+                        jade_crypto::TxSignError::Unsupported => V1Outcome::DeferredToCore {
+                            method: "sign_liquid_tx signing".to_string(),
+                        },
+                    });
+                if done {
+                    self.sign_tx = None;
+                }
+                match signature {
+                    Ok(signature) => V1Outcome::BytesResult { result: signature },
+                    Err(outcome) => outcome,
+                }
             }
-            return V1Outcome::BytesResult { result: Vec::new() };
-        }
-
-        if done {
-            self.sign_tx = None;
-        }
-        if input.uses_ae_signature {
-            return V1Outcome::DeferredToCore {
-                method: "sign_liquid_tx anti-exfil signing".to_string(),
-            };
-        }
-
-        V1Outcome::DeferredToCore {
-            method: "sign_liquid_tx signing".to_string(),
+            BitcoinSignTxFlow::LiquidStaged => {
+                let ae_signer_commitment = if let Some(host_commitment) =
+                    input.ae_host_commitment.as_ref()
+                {
+                    let Some(seed) = seed else {
+                        return V1Outcome::Reject {
+                            code: ErrorCode::InternalError,
+                            message: "Wallet seed is not available".to_string(),
+                        };
+                    };
+                    match liquid_tx_signer_commitment(
+                        &session.txn,
+                        seed,
+                        tx_input_index,
+                        &input,
+                        host_commitment,
+                    ) {
+                        Ok(commitment) => commitment,
+                        Err(jade_crypto::TxSignError::Invalid) => {
+                            return bad_parameters("Failed to extract tx input from parameters");
+                        }
+                        Err(jade_crypto::TxSignError::Unsupported) => {
+                            return V1Outcome::DeferredToCore {
+                                method: "sign_liquid_tx anti-exfil signing".to_string(),
+                            };
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                session.received_inputs += 1;
+                session.liquid_inputs.push(input);
+                V1Outcome::BytesResult {
+                    result: ae_signer_commitment,
+                }
+            }
+            BitcoinSignTxFlow::Legacy | BitcoinSignTxFlow::Staged => V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            },
         }
     }
 
@@ -2467,11 +2530,6 @@ impl Emulator {
             return V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string(),
-            };
-        }
-        if session.flow == BitcoinSignTxFlow::LiquidStaged {
-            return V1Outcome::DeferredToCore {
-                method: "sign_liquid_tx anti-exfil signing".to_string(),
             };
         }
         let Some(params) = request.params() else {
@@ -2500,6 +2558,87 @@ impl Emulator {
             .as_mut()
             .expect("checked active sign_tx session");
         let signature_index = session.next_signature;
+        if session.flow == BitcoinSignTxFlow::LiquidStaged {
+            let Some(input) = session.liquid_inputs.get(signature_index).cloned() else {
+                return V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Unexpected method".to_string(),
+                };
+            };
+            if input.path.is_some()
+                && ae_host_entropy.is_some_and(|entropy| {
+                    !entropy.is_empty() && entropy.len() != jade_crypto::SHA256_LEN
+                })
+            {
+                return V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Failed to extract valid host entropy from parameters".to_string(),
+                };
+            }
+            let signature = if input.path.is_none() {
+                Vec::new()
+            } else if input.ae_host_commitment.is_some() {
+                let host_entropy = match ae_host_entropy {
+                    Some(entropy) if entropy.len() == jade_crypto::SHA256_LEN => {
+                        let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                        bytes.copy_from_slice(entropy);
+                        bytes
+                    }
+                    _ => {
+                        return V1Outcome::Reject {
+                            code: ErrorCode::ProtocolError,
+                            message:
+                                "Failed to extract valid host commitment and entropy from parameters"
+                                    .to_string(),
+                        };
+                    }
+                };
+                match sign_liquid_tx_input_anti_exfil(
+                    &session.txn,
+                    seed,
+                    signature_index,
+                    &input,
+                    &host_entropy,
+                ) {
+                    Ok(signature) => signature,
+                    Err(jade_crypto::TxSignError::Invalid) => {
+                        return bad_parameters("Failed to extract tx input from parameters");
+                    }
+                    Err(jade_crypto::TxSignError::Unsupported) => {
+                        return V1Outcome::DeferredToCore {
+                            method: "sign_liquid_tx anti-exfil signing".to_string(),
+                        };
+                    }
+                }
+            } else {
+                if ae_host_entropy.is_some_and(|entropy| !entropy.is_empty()) {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::ProtocolError,
+                        message:
+                            "Failed to extract valid host commitment and entropy from parameters"
+                                .to_string(),
+                    };
+                }
+                match sign_liquid_tx_input(&session.txn, seed, signature_index, &input) {
+                    Ok(signature) => signature,
+                    Err(jade_crypto::TxSignError::Invalid) => {
+                        return bad_parameters("Failed to extract tx input from parameters");
+                    }
+                    Err(jade_crypto::TxSignError::Unsupported) => {
+                        return V1Outcome::DeferredToCore {
+                            method: "sign_liquid_tx signing".to_string(),
+                        };
+                    }
+                }
+            };
+            session.next_signature += 1;
+            if session.next_signature == session.expected_inputs {
+                self.sign_tx = None;
+            }
+
+            return V1Outcome::BytesResult { result: signature };
+        }
+
         let Some(input) = session.inputs.get(signature_index).cloned() else {
             return V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
@@ -3912,10 +4051,15 @@ fn parse_bitcoin_tx_input_params(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LiquidTxInputParams {
     signs_input: bool,
-    uses_ae_signature: bool,
+    path: Option<Vec<u32>>,
+    script: Option<Vec<u8>>,
+    sighash: u32,
+    is_witness: bool,
+    value_commitment: Option<Vec<u8>>,
+    ae_host_commitment: Option<[u8; jade_crypto::SHA256_LEN]>,
 }
 
 fn parse_liquid_tx_input_params(
@@ -3930,7 +4074,12 @@ fn parse_liquid_tx_input_params(
     if path.is_none() {
         return Ok(LiquidTxInputParams {
             signs_input: false,
-            uses_ae_signature: false,
+            path: None,
+            script: None,
+            sighash: 1,
+            is_witness: false,
+            value_commitment: None,
+            ae_host_commitment: None,
         });
     }
 
@@ -3951,33 +4100,50 @@ fn parse_liquid_tx_input_params(
     if !liquid_sighash_is_supported(script, sighash) {
         return Err("Unsupported sighash value");
     }
-    if is_witness {
+    let value_commitment =
         match cbor_map_bytes_or_null_alias(params.raw(), &["value_commitment", "value commitment"])
         {
             Ok(Some(commitment))
                 if commitment.len() == jade_crypto::LIQUID_COMMITMENT_LEN
-                    || commitment.len() == LIQUID_EXPLICIT_VALUE_LEN => {}
-            Ok(_) | Err(()) => return Err("Failed to extract value commitment from parameters"),
-        }
-    }
-    let uses_ae_signature = if use_ae_signatures {
+                    || commitment.len() == LIQUID_EXPLICIT_VALUE_LEN =>
+            {
+                Some(commitment)
+            }
+            Ok(Some(_)) | Err(()) => {
+                return Err("Failed to extract value commitment from parameters")
+            }
+            Ok(None) if is_witness => {
+                return Err("Failed to extract value commitment from parameters")
+            }
+            Ok(None) => None,
+        };
+    let ae_host_commitment = if use_ae_signatures {
         match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
-            Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
-            Ok(Some([])) | Ok(None) => false,
+            Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => {
+                let mut bytes = [0u8; jade_crypto::SHA256_LEN];
+                bytes.copy_from_slice(commitment);
+                Some(bytes)
+            }
+            Ok(Some([])) | Ok(None) => None,
             Ok(Some(_)) | Err(()) => {
                 return Err("Failed to extract valid host commitment from parameters")
             }
         }
     } else {
-        false
+        None
     };
-    if uses_ae_signature && is_taproot_script_pubkey(script) {
+    if ae_host_commitment.is_some() && is_taproot_script_pubkey(script) {
         return Err("Invalid non-empty taproot host commitment");
     }
 
     Ok(LiquidTxInputParams {
         signs_input: true,
-        uses_ae_signature,
+        path,
+        script: Some(script.to_vec()),
+        sighash,
+        is_witness,
+        value_commitment: value_commitment.map(Vec::from),
+        ae_host_commitment,
     })
 }
 
@@ -4015,6 +4181,77 @@ fn sign_bitcoin_tx_input(
     let mut signatures =
         jade_crypto::pure_rust::sign_bitcoin_tx_from_seed(txn, seed, &[signing_input])?;
     Ok(signatures.remove(0))
+}
+
+fn sign_liquid_tx_input(
+    txn: &[u8],
+    seed: &[u8],
+    tx_input_index: usize,
+    input: &LiquidTxInputParams,
+) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let Some(signing_input) = liquid_tx_sign_input(tx_input_index, input)? else {
+        return Ok(Vec::new());
+    };
+    let mut signatures =
+        jade_crypto::pure_rust::sign_liquid_tx_from_seed(txn, seed, &[signing_input])?;
+    Ok(signatures.remove(0))
+}
+
+fn liquid_tx_signer_commitment(
+    txn: &[u8],
+    seed: &[u8],
+    tx_input_index: usize,
+    input: &LiquidTxInputParams,
+    host_commitment: &[u8; jade_crypto::SHA256_LEN],
+) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let Some(signing_input) = liquid_tx_sign_input(tx_input_index, input)? else {
+        return Ok(Vec::new());
+    };
+    jade_crypto::pure_rust::liquid_tx_anti_exfil_signer_commitment_from_seed(
+        txn,
+        seed,
+        &signing_input,
+        host_commitment,
+    )
+}
+
+fn sign_liquid_tx_input_anti_exfil(
+    txn: &[u8],
+    seed: &[u8],
+    tx_input_index: usize,
+    input: &LiquidTxInputParams,
+    host_entropy: &[u8; jade_crypto::SHA256_LEN],
+) -> Result<Vec<u8>, jade_crypto::TxSignError> {
+    let Some(signing_input) = liquid_tx_sign_input(tx_input_index, input)? else {
+        return Ok(Vec::new());
+    };
+    jade_crypto::pure_rust::sign_liquid_tx_anti_exfil_from_seed(
+        txn,
+        seed,
+        &signing_input,
+        host_entropy,
+    )
+}
+
+fn liquid_tx_sign_input<'a>(
+    tx_input_index: usize,
+    input: &'a LiquidTxInputParams,
+) -> Result<Option<jade_crypto::pure_rust::LiquidTxSignInput<'a>>, jade_crypto::TxSignError> {
+    let Some(path) = input.path.as_deref() else {
+        return Ok(None);
+    };
+    let script = input
+        .script
+        .as_deref()
+        .ok_or(jade_crypto::TxSignError::Invalid)?;
+    Ok(Some(jade_crypto::pure_rust::LiquidTxSignInput {
+        tx_input_index,
+        path,
+        script_code: script,
+        sighash: input.sighash,
+        is_witness: input.is_witness,
+        value_commitment: input.value_commitment.as_deref(),
+    }))
 }
 
 fn bitcoin_tx_signer_commitment(
@@ -6009,6 +6246,41 @@ mod tests {
         params
     }
 
+    fn sign_liquid_tx_start_params_with_trusted_ae(
+        network: &str,
+        txn: &[u8],
+        num_inputs: u64,
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(num_inputs)
+            .unwrap()
+            .str("use_ae_signatures")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_good_liquid_commitment(&mut encoder);
+        encoder.map(0).unwrap();
+        params
+    }
+
     fn encode_good_liquid_commitment(encoder: &mut minicbor::Encoder<&mut Vec<u8>>) {
         encoder
             .map(7)
@@ -6844,6 +7116,139 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sign_liquid_tx_legacy_flow_signs_p2pkh_wallet_input() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/liquid_txn_legacy.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let start_params = sign_liquid_tx_start_params_with_trusted("localtest-liquid", &txn, 1);
+        let start_request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let script = decode_hex_vec("76a9145f4fcd4a757c2abf6a0691f59dffae18852bbd7388ac");
+        let mut input_params = Vec::new();
+        minicbor::Encoder::new(&mut input_params)
+            .map(4)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(false)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(&script)
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(1)
+            .unwrap();
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(fixture_expected_output_signatures(fixture)[0])
+            }
+        );
+    }
+
+    #[test]
+    fn sign_liquid_tx_staged_flow_signs_anti_exfil_p2pkh_wallet_input() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/liquid_txn_legacy_ae.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let expected = fixture_expected_output_signatures(fixture);
+        assert_eq!(expected.len(), 2);
+        let start_params = sign_liquid_tx_start_params_with_trusted_ae("localtest-liquid", &txn, 1);
+        let start_request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let script = decode_hex_vec("76a9145f4fcd4a757c2abf6a0691f59dffae18852bbd7388ac");
+        let host_commitment: [u8; jade_crypto::SHA256_LEN] =
+            decode_hex("925333af2732ac1663375c2ad543efe0f0586ec9cc99f988e40a29ab51ef3b67");
+        let mut input_params = Vec::new();
+        minicbor::Encoder::new(&mut input_params)
+            .map(5)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(false)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(&script)
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("ae_host_commitment")
+            .unwrap()
+            .bytes(&host_commitment)
+            .unwrap();
+        let input_request = Request {
+            id: Cow::Borrowed("input"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&input_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[0])
+            }
+        );
+
+        let host_entropy: [u8; jade_crypto::SHA256_LEN] =
+            decode_hex("516c3e24719ea7f257ea117329cbb9b36625db3f26c7bc2a60eba628a430410b");
+        let signature_params = get_signature_params_with_entropy(&host_entropy);
+        let signature_request = Request {
+            id: Cow::Borrowed("sig"),
+            method: Cow::Borrowed("get_signature"),
+            params: Some(&signature_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&signature_request),
+            V1Outcome::BytesResult {
+                result: decode_hex_vec(expected[1])
             }
         );
     }

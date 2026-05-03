@@ -792,6 +792,16 @@ pub mod pure_rust {
         pub satoshi: Option<u64>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LiquidTxSignInput<'a> {
+        pub tx_input_index: usize,
+        pub path: &'a [u32],
+        pub script_code: &'a [u8],
+        pub sighash: u32,
+        pub is_witness: bool,
+        pub value_commitment: Option<&'a [u8]>,
+    }
+
     #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     enum Blech32 {}
 
@@ -1264,6 +1274,109 @@ pub mod pure_rust {
         let mut output = signature.to_der().as_bytes().to_vec();
         output.push(signing_input.sighash as u8);
         Ok(output)
+    }
+
+    pub fn sign_liquid_tx_from_seed(
+        txn: &[u8],
+        seed: &[u8],
+        signing_inputs: &[LiquidTxSignInput<'_>],
+    ) -> Result<Vec<Vec<u8>>, TxSignError> {
+        let mut signatures = Vec::with_capacity(signing_inputs.len());
+        for signing_input in signing_inputs {
+            let digest = liquid_tx_ecdsa_sighash(txn, signing_input)?;
+            let sighash = elements::EcdsaSighashType::from_standard(signing_input.sighash)
+                .map_err(|_| TxSignError::Unsupported)?;
+            let signature = sign_digest_der_from_seed(
+                seed,
+                signing_input.path,
+                &digest,
+                sighash.as_u32() as u8,
+            )
+            .ok_or(TxSignError::Unsupported)?;
+            signatures.push(signature);
+        }
+
+        Ok(signatures)
+    }
+
+    pub fn liquid_tx_anti_exfil_signer_commitment_from_seed(
+        txn: &[u8],
+        seed: &[u8],
+        signing_input: &LiquidTxSignInput<'_>,
+        host_commitment: &[u8; SHA256_LEN],
+    ) -> Result<Vec<u8>, TxSignError> {
+        let digest = liquid_tx_ecdsa_sighash(txn, signing_input)?;
+        anti_exfil_signer_commitment_from_seed(seed, signing_input.path, &digest, host_commitment)
+            .map(|commitment| commitment.to_vec())
+            .ok_or(TxSignError::Unsupported)
+    }
+
+    pub fn sign_liquid_tx_anti_exfil_from_seed(
+        txn: &[u8],
+        seed: &[u8],
+        signing_input: &LiquidTxSignInput<'_>,
+        host_entropy: &[u8; SHA256_LEN],
+    ) -> Result<Vec<u8>, TxSignError> {
+        let digest = liquid_tx_ecdsa_sighash(txn, signing_input)?;
+        let signature = sign_digest_anti_exfil_compact_from_seed(
+            seed,
+            signing_input.path,
+            &digest,
+            host_entropy,
+        )
+        .ok_or(TxSignError::Unsupported)?;
+        let signature = k256::ecdsa::Signature::try_from(signature.as_slice())
+            .map_err(|_| TxSignError::Unsupported)?;
+        let mut output = signature.to_der().as_bytes().to_vec();
+        output.push(signing_input.sighash as u8);
+        Ok(output)
+    }
+
+    fn liquid_tx_ecdsa_sighash(
+        txn: &[u8],
+        signing_input: &LiquidTxSignInput<'_>,
+    ) -> Result<[u8; SHA256_LEN], TxSignError> {
+        use elements::encode;
+        use elements::hashes::Hash as _;
+        use elements::sighash::SighashCache;
+        use elements::{EcdsaSighashType, Script};
+
+        let tx: elements::Transaction =
+            encode::deserialize(txn).map_err(|_| TxSignError::Invalid)?;
+        if signing_input.path.is_empty()
+            || signing_input.script_code.is_empty()
+            || signing_input.tx_input_index >= tx.input.len()
+        {
+            return Err(TxSignError::Invalid);
+        }
+        if is_p2tr_script_pubkey(signing_input.script_code) {
+            return Err(TxSignError::Unsupported);
+        }
+        let sighash = EcdsaSighashType::from_standard(signing_input.sighash)
+            .map_err(|_| TxSignError::Unsupported)?;
+        let mut sighash_cache = SighashCache::new(&tx);
+        let script = Script::from(signing_input.script_code.to_vec());
+        let digest = if signing_input.is_witness {
+            let value = liquid_value_commitment(
+                signing_input.value_commitment.ok_or(TxSignError::Invalid)?,
+            )
+            .ok_or(TxSignError::Invalid)?;
+            sighash_cache.segwitv0_sighash(signing_input.tx_input_index, &script, value, sighash)
+        } else {
+            sighash_cache.legacy_sighash(signing_input.tx_input_index, &script, sighash)
+        };
+        Ok(*digest.as_byte_array())
+    }
+
+    fn liquid_value_commitment(value: &[u8]) -> Option<elements::confidential::Value> {
+        match value.len() {
+            LIQUID_COMMITMENT_LEN => elements::confidential::Value::from_commitment(value).ok(),
+            9 if value[0] == 1 => {
+                let amount = u64::from_be_bytes(value[1..].try_into().ok()?);
+                Some(elements::confidential::Value::Explicit(amount))
+            }
+            _ => None,
+        }
     }
 
     fn bitcoin_tx_ecdsa_sighash(

@@ -41,7 +41,7 @@ the continuation methods used by multi-message flows.
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
 | Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
-| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session and validates Liquid `tx_input` continuations, with signature production still active implementation work |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session, validates Liquid `tx_input` continuations, and signs non-Taproot legacy/segwit ECDSA inputs, including anti-exfil continuations, through the public `elements` sighash API |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -67,7 +67,7 @@ the continuation methods used by multi-message flows.
   `jade-crypto`. This is better than depending directly on `secp256k1-zkp`
   because `elements` re-exports the ZKP types and also provides Elements-native
   asset, value, PSET, sighash, transaction, and address structures needed by
-  later Liquid work. Its
+  Liquid signing and PSET work. Its
   `secp256k1-zkp-sys` and `secp256k1-sys` dependencies are accepted as the
   permanent upstream Liquid cryptography backend, while Jade-owned C/C++ core
   code remains out of scope for the Rust crates.
@@ -83,13 +83,17 @@ and validation code. Copying that into this project would move a large C++/Core
 architecture into `jade-core`, violate the no-C-application/core target, and
 make bounded-allocation/no-panic review harder.
 
-Liquid transaction completion should therefore use the public Elements
-implementation as the production dependency and the C firmware/libjade behavior
-as the differential reference: PSET/transaction parsing, issuance/reissuance
-commitments, confidential value/asset handling, rangeproof/surjection-proof
-boundaries, Elements sighash, anti-exfil signing, and golden vector
-compatibility. Direct `secp256k1-zkp` usage should still stay behind narrow
-Liquid helper APIs unless there is a reason to expose the lower-level backend.
+Liquid transaction completion uses the public Elements implementation as the
+production dependency and the C firmware/libjade behavior as the differential
+reference. The first Rust `sign_liquid_tx` signer covers non-Taproot
+legacy/segwit ECDSA inputs by parsing Elements transactions with `elements`,
+constructing Elements legacy/BIP143 sighashes with `SighashCache`, parsing
+confidential or explicit value commitments, and reusing Jade's low-R and
+anti-exfil ECDSA signers. Remaining Liquid work is now narrower: Taproot
+key/script-path signing with genesis-aware sighashes, PSET mutation, and full
+confidential transaction proof validation. Direct `secp256k1-zkp` usage should
+still stay behind narrow Liquid helper APIs unless there is a reason to expose
+the lower-level backend.
 
 The hard parts are hard for concrete compatibility reasons:
 
@@ -140,8 +144,9 @@ The hard parts are hard for concrete compatibility reasons:
   and full-path derivations. Raw v1 CBOR responses now chunk large signed PSBT
   byte results with `seqnum`/`seqlen` and validate `get_extended_data`
   continuation requests against the originating id and method. PSBT
-  anti-exfil, script-path Taproot, full multisig finalization, and complete
-  Liquid/PSET signing remain active transaction-signing implementation work.
+  anti-exfil, script-path Taproot, full multisig finalization, Liquid Taproot
+  signing, and PSET mutation remain active transaction-signing implementation
+  work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -168,10 +173,14 @@ The hard parts are hard for concrete compatibility reasons:
   stateful Liquid legacy or anti-exfil signing session. Liquid `tx_input`
   continuations now use Jade-compatible validation for signing paths, scripts,
   witness value commitments, sighash values, and anti-exfil host commitments,
-  including empty byte replies for pathless no-sign inputs. PSBT anti-exfil,
-  Taproot anti-exfil signing, registered/generic multisig policy validation,
-  and complete Liquid confidential transaction signature production remain
-  active implementation work.
+  including empty byte replies for pathless no-sign inputs. Non-Taproot
+  legacy/segwit ECDSA Liquid inputs now produce DER+sighash signatures through
+  the `elements` sighash backend in both immediate legacy signing and staged
+  anti-exfil signing: `tx_input` returns the signer commitment and
+  `get_signature` returns the final DER+sighash signature. PSBT anti-exfil,
+  Liquid Taproot, registered/generic multisig policy validation, PSET mutation,
+  and full confidential transaction proof validation remain active
+  implementation work.
 
 ## First Parity Gates
 
