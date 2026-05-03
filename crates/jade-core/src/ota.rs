@@ -44,10 +44,10 @@ pub enum OtaWriteError<E> {
 }
 
 #[derive(Debug)]
-pub struct OtaWriteSession<W> {
+pub struct OtaWriteSession<W: OtaImageWriter> {
     request: OtaRequest,
     received_compressed: u64,
-    writer: W,
+    writer: Option<W>,
     finalized: bool,
 }
 
@@ -60,7 +60,7 @@ where
         Ok(Self {
             request,
             received_compressed: 0,
-            writer,
+            writer: Some(writer),
             finalized: false,
         })
     }
@@ -78,12 +78,12 @@ where
             .upload_progress_percent(self.received_compressed)
     }
 
-    pub fn writer(&self) -> &W {
-        &self.writer
+    pub fn writer(&self) -> Option<&W> {
+        self.writer.as_ref()
     }
 
-    pub fn writer_mut(&mut self) -> &mut W {
-        &mut self.writer
+    pub fn writer_mut(&mut self) -> Option<&mut W> {
+        self.writer.as_mut()
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<u64, OtaWriteError<W::Error>> {
@@ -99,7 +99,8 @@ where
             return Err(OtaWriteError::TooMuchData);
         }
 
-        self.writer
+        let writer = self.writer.as_mut().ok_or(OtaWriteError::Finalized)?;
+        writer
             .write(self.received_compressed, data)
             .map_err(OtaWriteError::Writer)?;
         self.received_compressed = next;
@@ -114,19 +115,38 @@ where
             return Err(OtaWriteError::IncompleteUpload);
         }
 
-        self.writer
-            .finish(&self.request, self.received_compressed)
-            .map_err(OtaWriteError::Writer)?;
+        let mut writer = self.writer.take().ok_or(OtaWriteError::Finalized)?;
+        if let Err(err) = writer.finish(&self.request, self.received_compressed) {
+            writer.abort();
+            self.finalized = true;
+            return Err(OtaWriteError::Writer(err));
+        }
         self.finalized = true;
-        Ok(self.writer)
+        Ok(writer)
     }
 
-    pub fn abort(mut self) -> W {
+    pub fn abort(mut self) -> Option<W> {
+        self.writer.take().map(|mut writer| {
+            if !self.finalized {
+                writer.abort();
+                self.finalized = true;
+            }
+            writer
+        })
+    }
+}
+
+impl<W> Drop for OtaWriteSession<W>
+where
+    W: OtaImageWriter,
+{
+    fn drop(&mut self) {
         if !self.finalized {
-            self.writer.abort();
+            if let Some(writer) = self.writer.as_mut() {
+                writer.abort();
+            }
             self.finalized = true;
         }
-        self.writer
     }
 }
 
@@ -213,6 +233,8 @@ fn select_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
+    use core::cell::Cell;
 
     #[test]
     fn full_ota_validates_sizes_and_prefers_final_firmware_hash() {
@@ -320,17 +342,46 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct SharedAbortWriter {
+        aborted: Rc<Cell<bool>>,
+    }
+
+    impl OtaImageWriter for SharedAbortWriter {
+        type Error = ();
+
+        fn begin(&mut self, _request: &OtaRequest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn write(&mut self, _offset: u64, _data: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _request: &OtaRequest,
+            _received_compressed: u64,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self) {
+            self.aborted.set(true);
+        }
+    }
+
     #[test]
     fn ota_write_session_streams_chunks_with_offsets_and_progress() {
         let request =
             OtaRequest::full(1_000, 600, None, Some([0x22; OTA_HASH_LEN]), false).unwrap();
         let mut session = OtaWriteSession::begin(TestWriter::new(), request).unwrap();
 
-        assert!(session.writer().begun);
+        assert!(session.writer().unwrap().begun);
         assert_eq!(session.write(&[1; 150]).unwrap(), 25);
         assert_eq!(session.write(&[2; 450]).unwrap(), 100);
         assert_eq!(
-            session.writer().writes,
+            session.writer().unwrap().writes,
             alloc::vec![(0, alloc::vec![1; 150]), (150, alloc::vec![2; 450])]
         );
 
@@ -357,8 +408,42 @@ mod tests {
         let mut session = OtaWriteSession::begin(TestWriter::new(), request).unwrap();
         session.write(&[0; 300]).unwrap();
 
-        let writer = session.abort();
+        let writer = session.abort().unwrap();
         assert!(writer.aborted);
         assert!(!writer.finished);
+    }
+
+    #[test]
+    fn ota_write_session_aborts_when_dropped_or_failed_finish() {
+        let request =
+            OtaRequest::full(1_000, 600, None, Some([0x22; OTA_HASH_LEN]), false).unwrap();
+
+        let dropped_abort = Rc::new(Cell::new(false));
+        {
+            let mut session = OtaWriteSession::begin(
+                SharedAbortWriter {
+                    aborted: dropped_abort.clone(),
+                },
+                request,
+            )
+            .unwrap();
+            session.write(&[0; 300]).unwrap();
+        }
+        assert!(dropped_abort.get());
+
+        let failed_finish_abort = Rc::new(Cell::new(false));
+        let mut session = OtaWriteSession::begin(
+            SharedAbortWriter {
+                aborted: failed_finish_abort.clone(),
+            },
+            request,
+        )
+        .unwrap();
+        session.write(&[0; 300]).unwrap();
+        assert!(matches!(
+            session.finish(),
+            Err(OtaWriteError::IncompleteUpload)
+        ));
+        assert!(failed_finish_abort.get());
     }
 }

@@ -1203,7 +1203,7 @@ mod tests {
         .unwrap();
         let mut session =
             begin_ota_update(JADE_V2_MANIFEST, TestOtaWriter::new(), request).unwrap();
-        assert!(session.writer().begun);
+        assert!(session.writer().unwrap().begun);
         assert_eq!(session.write(&[0; 600]).unwrap(), 100);
         let writer = session.finish().unwrap();
         assert!(writer.finished);
@@ -1247,7 +1247,7 @@ mod tests {
         let session = board
             .begin_ota_update(TestOtaWriter::new(), request)
             .unwrap();
-        assert!(session.writer().begun);
+        assert!(session.writer().unwrap().begun);
     }
 
     #[test]
