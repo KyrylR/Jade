@@ -64,20 +64,14 @@ impl<'a> CborFrameBuffer<'a> {
         self.capacity() - self.len
     }
 
-    pub fn clear(&mut self) {
-        self.len = 0;
+    pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.len..]
     }
 
-    pub fn reject_pending(&mut self) -> usize {
-        let rejected = self.len;
-        self.clear();
-        rejected
-    }
-
-    pub fn push(&mut self, input: &[u8]) -> Result<(), CborFrameBufferError> {
+    pub fn advance(&mut self, additional: usize) -> Result<(), CborFrameBufferError> {
         let next = self
             .len
-            .checked_add(input.len())
+            .checked_add(additional)
             .ok_or(CborFrameBufferError::Overflow {
                 capacity: self.capacity(),
                 attempted: usize::MAX,
@@ -89,8 +83,24 @@ impl<'a> CborFrameBuffer<'a> {
             });
         }
 
-        self.bytes[self.len..next].copy_from_slice(input);
         self.len = next;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn reject_pending(&mut self) -> usize {
+        let rejected = self.len;
+        self.clear();
+        rejected
+    }
+
+    pub fn push(&mut self, input: &[u8]) -> Result<(), CborFrameBufferError> {
+        let offset = self.len;
+        self.advance(input.len())?;
+        self.bytes[offset..self.len].copy_from_slice(input);
         Ok(())
     }
 
@@ -564,7 +574,9 @@ mod tests {
         let split = first.len() / 2;
         buffer.push(&first[..split]).unwrap();
         assert_eq!(buffer.next_frame_len().unwrap(), None);
-        buffer.push(&first[split..]).unwrap();
+        let spare = buffer.spare_capacity_mut();
+        spare[..first.len() - split].copy_from_slice(&first[split..]);
+        buffer.advance(first.len() - split).unwrap();
         buffer.push(&second).unwrap();
 
         let frame = buffer

@@ -4,10 +4,10 @@
 extern crate alloc;
 
 use jade_core::{
-    AllocationBudget, DeviceBootFailure, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
-    DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
-    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
-    OtaWriteSession, UserConfirmation, UserConfirmationDecision,
+    AllocationBudget, CborFrameBuffer, DeviceBootFailure, DeviceFeatureSet, DeviceManifest,
+    DeviceMemoryBudget, DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError,
+    DeviceTarget, DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
+    OtaWriteError, OtaWriteSession, UserConfirmation, UserConfirmationDecision,
 };
 
 pub const TARGET_SOC: &str = "esp32s3";
@@ -311,6 +311,16 @@ where
         poll_serial_full_v1(&mut self.runtime, rx_buffer)
     }
 
+    pub fn poll_serial_v1_stream(
+        &mut self,
+        frame_buffer: &mut CborFrameBuffer<'_>,
+    ) -> Result<bool, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_serial_full_v1_stream(&mut self.runtime, frame_buffer)
+    }
+
     pub fn poll_usb_v1(&mut self, rx_buffer: &mut [u8]) -> Result<bool, FirmwareFrameError> {
         if !self.booted {
             return Err(FirmwareFrameError::BootRequired);
@@ -318,11 +328,31 @@ where
         poll_usb_full_v1(&mut self.runtime, rx_buffer)
     }
 
+    pub fn poll_usb_v1_stream(
+        &mut self,
+        frame_buffer: &mut CborFrameBuffer<'_>,
+    ) -> Result<bool, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_usb_full_v1_stream(&mut self.runtime, frame_buffer)
+    }
+
     pub fn poll_ble_v1(&mut self, rx_buffer: &mut [u8]) -> Result<bool, FirmwareFrameError> {
         if !self.booted {
             return Err(FirmwareFrameError::BootRequired);
         }
         poll_ble_full_v1(&mut self.runtime, rx_buffer)
+    }
+
+    pub fn poll_ble_v1_stream(
+        &mut self,
+        frame_buffer: &mut CborFrameBuffer<'_>,
+    ) -> Result<bool, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_ble_full_v1_stream(&mut self.runtime, frame_buffer)
     }
 
     pub fn poll_v1_transports(
@@ -701,6 +731,22 @@ where
     Ok(true)
 }
 
+pub fn poll_serial_full_v1_stream<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    frame_buffer: &mut CborFrameBuffer<'_>,
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    poll_full_v1_stream(
+        runtime,
+        frame_buffer,
+        Esp32s3PlatformShim::serial_recv,
+        Esp32s3PlatformShim::serial_send,
+    )
+}
+
 pub fn poll_usb_full_v1<P, B>(
     runtime: &mut Esp32s3V1Runtime<P, B>,
     rx_buffer: &mut [u8],
@@ -727,6 +773,22 @@ where
     Ok(true)
 }
 
+pub fn poll_usb_full_v1_stream<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    frame_buffer: &mut CborFrameBuffer<'_>,
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    poll_full_v1_stream(
+        runtime,
+        frame_buffer,
+        Esp32s3PlatformShim::usb_recv,
+        Esp32s3PlatformShim::usb_send,
+    )
+}
+
 pub fn poll_ble_full_v1<P, B>(
     runtime: &mut Esp32s3V1Runtime<P, B>,
     rx_buffer: &mut [u8],
@@ -751,6 +813,57 @@ where
             .map_err(FirmwareFrameError::Io)?;
     }
     Ok(true)
+}
+
+pub fn poll_ble_full_v1_stream<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    frame_buffer: &mut CborFrameBuffer<'_>,
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    poll_full_v1_stream(
+        runtime,
+        frame_buffer,
+        Esp32s3PlatformShim::ble_recv,
+        Esp32s3PlatformShim::ble_send,
+    )
+}
+
+fn poll_full_v1_stream<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    frame_buffer: &mut CborFrameBuffer<'_>,
+    recv: impl FnOnce(&mut P, &mut [u8]) -> Result<usize, DeviceBootFailure>,
+    mut send: impl FnMut(&mut P, &[u8]) -> Result<(), DeviceBootFailure>,
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    let spare = frame_buffer.spare_capacity_mut();
+    if !spare.is_empty() {
+        let len = recv(runtime.runtime_platform_mut(), spare).map_err(FirmwareFrameError::Io)?;
+        frame_buffer
+            .advance(len)
+            .map_err(|_| FirmwareFrameError::Decode)?;
+    }
+
+    let mut handled = false;
+    loop {
+        let Some(reply) = frame_buffer
+            .handle_next_frame(|frame| runtime.handle_v1_cbor(frame))
+            .map_err(|_| FirmwareFrameError::Decode)?
+        else {
+            break;
+        };
+        handled = true;
+        if !reply.is_empty() {
+            send(runtime.runtime_platform_mut(), &reply).map_err(FirmwareFrameError::Io)?;
+        }
+    }
+
+    Ok(handled)
 }
 
 fn poll_serial<P>(
@@ -1704,6 +1817,53 @@ mod tests {
         assert_eq!(decoder.str().unwrap(), "p");
         assert_eq!(decoder.str().unwrap(), "result");
         assert_eq!(decoder.u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn s3_usb_stream_polls_split_and_trailing_full_v1_frames() {
+        let mut runtime = v1_runtime_for_v2(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        let first = v1_request("a", "ping");
+        let second = v1_request("b", "ping");
+        let split = first.len() / 2;
+        let mut frame_storage = [0u8; 256];
+        let mut frames = CborFrameBuffer::new(&mut frame_storage);
+
+        runtime.runtime_platform_mut().usb_rx = Some(first[..split].to_vec());
+        assert_eq!(
+            poll_usb_full_v1_stream(&mut runtime, &mut frames),
+            Ok(false)
+        );
+        assert_eq!(runtime.runtime_platform().usb_tx.len(), 0);
+        assert_eq!(frames.len(), split);
+
+        let mut next = first[split..].to_vec();
+        next.extend_from_slice(&second);
+        runtime.runtime_platform_mut().usb_rx = Some(next);
+        assert_eq!(poll_usb_full_v1_stream(&mut runtime, &mut frames), Ok(true));
+        assert!(frames.is_empty());
+        assert_eq!(runtime.runtime_platform().usb_tx.len(), 2);
+    }
+
+    #[test]
+    fn s3_board_runtime_stream_polling_is_boot_gated() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        let mut frame_storage = [0u8; 256];
+        let mut frames = CborFrameBuffer::new(&mut frame_storage);
+        board.platform_mut().usb_rx = Some(v1_request("u", "ping"));
+
+        assert_eq!(
+            board.poll_usb_v1_stream(&mut frames),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        board.boot().unwrap();
+        assert_eq!(board.poll_usb_v1_stream(&mut frames), Ok(true));
+        assert_eq!(board.platform().usb_tx.len(), 1);
     }
 
     #[test]

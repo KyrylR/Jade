@@ -104,7 +104,11 @@ to know whether the buffers came from static memory, heap, or a HAL allocator.
 behavior in pure Rust: append transport bytes, detect the first complete CBOR
 object without allocation, leave trailing bytes pending for the next frame, and
 surface full-buffer invalid/incomplete data so the board loop can reject stale
-or oversized input explicitly.
+or oversized input explicitly. The ESP32 and ESP32-S3 firmware wrappers expose
+boot-gated stream pollers over those buffers for serial/BLE and serial/USB/BLE
+respectively, so the real board transport adapters can hand over arbitrary byte
+chunks and drain every complete v1 CBOR-RPC request without losing partial or
+back-to-back frames.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
