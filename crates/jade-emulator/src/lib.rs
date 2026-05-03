@@ -7506,14 +7506,65 @@ mod tests {
     }
 
     fn fixture_object_path(object: &str) -> Vec<u32> {
-        let marker = "\"path\": [";
-        let start = object.find(marker).unwrap() + marker.len();
+        fixture_object_u32_array(object, "path")
+    }
+
+    fn fixture_object_u32_array(object: &str, field: &str) -> Vec<u32> {
+        let marker = format!("\"{field}\": [");
+        let start = object.find(&marker).unwrap() + marker.len();
         let rest = &object[start..];
         let end = rest.find(']').unwrap();
         rest[..end]
             .split(',')
+            .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().parse().unwrap())
             .collect()
+    }
+
+    fn fixture_object_u32_array_arrays(object: &str, field: &str) -> Vec<Vec<u32>> {
+        let marker = format!("\"{field}\": [");
+        let start = object.find(&marker).unwrap() + marker.len();
+        let rest = &object[start..];
+        let bytes = rest.as_bytes();
+        let mut arrays = Vec::new();
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            while index < bytes.len()
+                && (bytes[index].is_ascii_whitespace() || bytes[index] == b',')
+            {
+                index += 1;
+            }
+            if index >= bytes.len() || bytes[index] == b']' {
+                break;
+            }
+            assert_eq!(bytes[index], b'[', "expected nested integer array");
+            let array_start = index + 1;
+            let mut depth = 1usize;
+            index += 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth = depth.checked_sub(1).unwrap();
+                        if depth == 0 {
+                            arrays.push(
+                                rest[array_start..index]
+                                    .split(',')
+                                    .filter(|value| !value.trim().is_empty())
+                                    .map(|value| value.trim().parse().unwrap())
+                                    .collect(),
+                            );
+                            index += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+        }
+        arrays
     }
 
     fn fixture_object_bool_value(object: &str, field: &str) -> bool {
@@ -8720,6 +8771,301 @@ mod tests {
         emulator.handle_v1_request(&request)
     }
 
+    fn encode_fixture_u32_array(encoder: &mut minicbor::Encoder<&mut Vec<u8>>, values: &[u32]) {
+        encoder.array(values.len() as u64).unwrap();
+        for value in values {
+            encoder.u32(*value).unwrap();
+        }
+    }
+
+    fn register_multisig_fixture(emulator: &mut Emulator, fixture: &str) -> V1Outcome {
+        let network = fixture_object_string_value(fixture, "network").unwrap();
+        let multisig_name = fixture_object_string_value(fixture, "multisig_name").unwrap();
+        let variant = fixture_object_string_value(fixture, "variant").unwrap();
+        let sorted = fixture_object_bool_value(fixture, "sorted");
+        let threshold = fixture_object_u64_value(fixture, "threshold").unwrap();
+        let master_blinding_key = fixture_object_hex_value(fixture, "master_blinding_key");
+        let signers = fixture_array_entries(fixture, "signers");
+
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str(multisig_name)
+            .unwrap()
+            .str("descriptor")
+            .unwrap()
+            .map(if master_blinding_key.is_some() { 5 } else { 4 })
+            .unwrap()
+            .str("variant")
+            .unwrap()
+            .str(variant)
+            .unwrap()
+            .str("sorted")
+            .unwrap()
+            .bool(sorted)
+            .unwrap()
+            .str("threshold")
+            .unwrap()
+            .u64(threshold)
+            .unwrap();
+        if let Some(master_blinding_key) = master_blinding_key {
+            encoder
+                .str("master_blinding_key")
+                .unwrap()
+                .bytes(&decode_hex::<32>(master_blinding_key))
+                .unwrap();
+        }
+        encoder
+            .str("signers")
+            .unwrap()
+            .array(signers.len() as u64)
+            .unwrap();
+        for signer in signers {
+            let signer = signer.unwrap();
+            let fingerprint =
+                decode_hex_vec(fixture_object_required_hex_value(signer, "fingerprint"));
+            let derivation = fixture_object_u32_array(signer, "derivation");
+            let xpub = fixture_object_string_value(signer, "xpub").unwrap();
+            let path = fixture_object_path(signer);
+            encoder
+                .map(4)
+                .unwrap()
+                .str("fingerprint")
+                .unwrap()
+                .bytes(&fingerprint)
+                .unwrap()
+                .str("derivation")
+                .unwrap();
+            encode_fixture_u32_array(&mut encoder, &derivation);
+            encoder
+                .str("xpub")
+                .unwrap()
+                .str(xpub)
+                .unwrap()
+                .str("path")
+                .unwrap();
+            encode_fixture_u32_array(&mut encoder, &path);
+        }
+
+        let request = Request {
+            id: Cow::Borrowed("r"),
+            method: Cow::Borrowed("register_multisig"),
+            params: Some(&params),
+        };
+        emulator.handle_v1_request(&request)
+    }
+
+    fn receive_address_for_multisig_fixture(
+        emulator: &mut Emulator,
+        fixture: &str,
+        address_test: &str,
+    ) -> V1Outcome {
+        let network = fixture_object_string_value(fixture, "network").unwrap();
+        let multisig_name = fixture_object_string_value(fixture, "multisig_name").unwrap();
+        let paths = fixture_object_u32_array_arrays(address_test, "paths");
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(3)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str(multisig_name)
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(paths.len() as u64)
+            .unwrap();
+        for path in &paths {
+            encode_fixture_u32_array(&mut encoder, path);
+        }
+        let request = Request {
+            id: Cow::Borrowed("a"),
+            method: Cow::Borrowed("get_receive_address"),
+            params: Some(&params),
+        };
+        emulator.handle_v1_request(&request)
+    }
+
+    fn assert_multisig_fixture_blinding_tests(emulator: &mut Emulator, fixture: &str) {
+        if !fixture.contains("\"blinding_key_tests\": [") {
+            return;
+        }
+        let multisig_name = fixture_object_string_value(fixture, "multisig_name").unwrap();
+        for blinding_test in fixture_array_entries(fixture, "blinding_key_tests") {
+            let blinding_test = blinding_test.unwrap();
+            let script = decode_hex_vec(fixture_object_required_hex_value(blinding_test, "script"));
+            let their_pubkey = decode_hex_vec(fixture_object_required_hex_value(
+                blinding_test,
+                "their_pubkey",
+            ));
+
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(2)
+                .unwrap()
+                .str("script")
+                .unwrap()
+                .bytes(&script)
+                .unwrap()
+                .str("multisig_name")
+                .unwrap()
+                .str(multisig_name)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("blind"),
+                method: Cow::Borrowed("get_blinding_key"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult {
+                    result: decode_hex_vec(fixture_object_required_hex_value(
+                        blinding_test,
+                        "expected_blinding_key"
+                    ))
+                }
+            );
+
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(3)
+                .unwrap()
+                .str("script")
+                .unwrap()
+                .bytes(&script)
+                .unwrap()
+                .str("their_pubkey")
+                .unwrap()
+                .bytes(&their_pubkey)
+                .unwrap()
+                .str("multisig_name")
+                .unwrap()
+                .str(multisig_name)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("nonce"),
+                method: Cow::Borrowed("get_shared_nonce"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult {
+                    result: decode_hex_vec(fixture_object_required_hex_value(
+                        blinding_test,
+                        "expected_shared_nonce"
+                    ))
+                }
+            );
+        }
+    }
+
+    fn assert_multisig_fixture_commitment_tests(emulator: &mut Emulator, fixture: &str) {
+        if !fixture.contains("\"commitments_tests\": [") {
+            return;
+        }
+        let multisig_name = fixture_object_string_value(fixture, "multisig_name").unwrap();
+        for commitment_test in fixture_array_entries(fixture, "commitments_tests") {
+            let commitment_test = commitment_test.unwrap();
+            let asset_id = decode_hex::<32>(fixture_object_required_hex_value(
+                commitment_test,
+                "asset_id",
+            ));
+            let hash_prevouts = decode_hex::<32>(fixture_object_required_hex_value(
+                commitment_test,
+                "hash_prevouts",
+            ));
+            let value = fixture_object_u64_value(commitment_test, "value").unwrap();
+            let output_index = fixture_object_u64_value(commitment_test, "output_index").unwrap();
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(5)
+                .unwrap()
+                .str("asset_id")
+                .unwrap()
+                .bytes(&asset_id)
+                .unwrap()
+                .str("value")
+                .unwrap()
+                .u64(value)
+                .unwrap()
+                .str("hash_prevouts")
+                .unwrap()
+                .bytes(&hash_prevouts)
+                .unwrap()
+                .str("output_index")
+                .unwrap()
+                .u64(output_index)
+                .unwrap()
+                .str("multisig_name")
+                .unwrap()
+                .str(multisig_name)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("commitments"),
+                method: Cow::Borrowed("get_commitments"),
+                params: Some(&params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::OwnedMapResult {
+                    entries: vec![
+                        OwnedResultMapEntry {
+                            key: "abf".to_string(),
+                            value: OwnedV1Value::Bytes(decode_hex_vec(
+                                fixture_object_required_hex_value(commitment_test, "abf")
+                            ))
+                        },
+                        OwnedResultMapEntry {
+                            key: "vbf".to_string(),
+                            value: OwnedV1Value::Bytes(decode_hex_vec(
+                                fixture_object_required_hex_value(commitment_test, "vbf")
+                            ))
+                        },
+                        OwnedResultMapEntry {
+                            key: "asset_generator".to_string(),
+                            value: OwnedV1Value::Bytes(decode_hex_vec(
+                                fixture_object_required_hex_value(
+                                    commitment_test,
+                                    "asset_generator"
+                                )
+                            ))
+                        },
+                        OwnedResultMapEntry {
+                            key: "value_commitment".to_string(),
+                            value: OwnedV1Value::Bytes(decode_hex_vec(
+                                fixture_object_required_hex_value(
+                                    commitment_test,
+                                    "value_commitment"
+                                )
+                            ))
+                        },
+                        OwnedResultMapEntry {
+                            key: "asset_id".to_string(),
+                            value: OwnedV1Value::Bytes(asset_id.to_vec())
+                        },
+                        OwnedResultMapEntry {
+                            key: "value".to_string(),
+                            value: OwnedV1Value::U64(value)
+                        },
+                    ]
+                }
+            );
+        }
+    }
+
     fn stored_multisig_details(emulator: &Emulator, name: &str) -> MultisigDetails {
         let mut record = Vec::new();
         emulator
@@ -9603,6 +9949,9 @@ mod tests {
                     }
                 );
             }
+
+            assert_multisig_fixture_blinding_tests(&mut emulator, fixture);
+            assert_multisig_fixture_commitment_tests(&mut emulator, fixture);
         }
     }
 
@@ -15110,6 +15459,63 @@ mod tests {
                 result: expected_confidential
             }
         );
+    }
+
+    #[test]
+    fn register_multisig_matches_original_registration_fixtures() {
+        for fixture in [
+            include_str!("../../../test_data/multisig_reg_15of15.json"),
+            include_str!("../../../test_data/multisig_reg_1of1.json"),
+            include_str!("../../../test_data/multisig_reg_liquid_matches_ga_2of2.json"),
+            include_str!("../../../test_data/multisig_reg_matches_ga_2of2.json"),
+            include_str!("../../../test_data/multisig_reg_ss_liquid_1of2.json"),
+            include_str!("../../../test_data/multisig_reg_ss_matches_ga_2of3.json"),
+            include_str!("../../../test_data/multisig_reg_ss_p2sh.json"),
+            include_str!("../../../test_data/multisig_reg_ss_qr_example.json"),
+            include_str!("../../../test_data/multisig_reg_ss_wsh_sorted.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+            assert_eq!(
+                register_multisig_fixture(&mut emulator, fixture),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            let name = fixture_object_string_value(fixture, "multisig_name").unwrap();
+            let details = stored_multisig_details(&emulator, name);
+            assert_eq!(details.summary.variant, fixture_multisig_variant(fixture));
+            assert_eq!(
+                details.summary.sorted,
+                fixture_object_bool_value(fixture, "sorted")
+            );
+            assert_eq!(
+                details.summary.threshold,
+                fixture_object_u64_value(fixture, "threshold").unwrap() as u8
+            );
+            assert_eq!(
+                details.summary.num_signers,
+                fixture_array_entries(fixture, "signers").len() as u8
+            );
+            assert_eq!(
+                details.summary.master_blinding_key,
+                fixture_object_hex_value(fixture, "master_blinding_key").map(decode_hex::<32>)
+            );
+
+            for address_test in fixture_array_entries(fixture, "address_tests") {
+                let address_test = address_test.unwrap();
+                assert_eq!(
+                    receive_address_for_multisig_fixture(&mut emulator, fixture, address_test),
+                    V1Outcome::TextResult {
+                        result: fixture_object_string_value(address_test, "expected_address")
+                            .unwrap()
+                            .to_string()
+                    }
+                );
+            }
+        }
     }
 
     #[test]

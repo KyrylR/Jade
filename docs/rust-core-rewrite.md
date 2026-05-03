@@ -168,7 +168,11 @@ The hard parts are hard for concrete compatibility reasons:
   original accepted and rejected JSON/DAT fixture pair, including Jade,
   BlueWallet, Nunchuk, Sparrow, Specter, P2SH, P2WSH, wrapped P2WSH, bad
   derivation, duplicate-field, missing-field, format, policy, signer-count,
-  signer-membership, and sorted-flag cases.
+  signer-membership, and sorted-flag cases. Direct multisig registration now
+  covers all original `multisig_reg_*` fixtures, including 15-of-15,
+  1-of-1, Green/GA-compatible 2-of-2 and 2-of-3, singlesig Liquid 1-of-2,
+  P2SH, sorted P2WSH, QR-example, Liquid blinding-key/shared-nonce, and
+  Liquid commitment vectors.
 - Receive addresses: default Green 2-of-2, Green 2-of-3 recovery-xpub, and
   Green CSV p2sh-p2wsh addresses for Bitcoin and Liquid, plus Bitcoin
   singlesig, Bitcoin multisig, Bitcoin descriptors, Liquid singlesig
@@ -285,7 +289,7 @@ The hard parts are hard for concrete compatibility reasons:
    where parity is implemented and tracks remaining signing and Liquid
    transaction flows as active implementation work.
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
-   Rust fixture gate now directly references 155 of 210 original `test_data`
+   Rust fixture gate now directly references 164 of 210 original `test_data`
    files; unreferenced fixtures remain active parity work rather than retired
    coverage.
 
