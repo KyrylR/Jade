@@ -41,7 +41,7 @@ the continuation methods used by multi-message flows.
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
 | Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
-| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` is the active Liquid signing implementation target |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session and validates Liquid `tx_input` continuations, with signature production still active implementation work |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -163,10 +163,14 @@ The hard parts are hard for concrete compatibility reasons:
   commitment/entropy consistency check. Liquid `sign_liquid_tx` now enters the
   Rust v1 adapter for network validation, public `elements` transaction
   parsing, input-count validation, trusted-commitment array checks, change
-  output metadata checks, and asset-info shape validation before the remaining
-  signature-production implementation. PSBT anti-exfil, Taproot anti-exfil
-  signing, registered/generic multisig policy validation, and complete Liquid
-  confidential transaction signing remain active implementation work.
+  output metadata checks, and asset-info shape validation, then starts a
+  stateful Liquid legacy or anti-exfil signing session. Liquid `tx_input`
+  continuations now use Jade-compatible validation for signing paths, scripts,
+  witness value commitments, sighash values, and anti-exfil host commitments,
+  including empty byte replies for pathless no-sign inputs. PSBT anti-exfil,
+  Taproot anti-exfil signing, registered/generic multisig policy validation,
+  and complete Liquid confidential transaction signature production remain
+  active implementation work.
 
 ## First Parity Gates
 

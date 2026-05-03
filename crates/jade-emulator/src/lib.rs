@@ -80,6 +80,18 @@ struct ExtendedDataSession {
 enum BitcoinSignTxFlow {
     Legacy,
     Staged,
+    LiquidLegacy,
+    LiquidStaged,
+}
+
+impl BitcoinSignTxFlow {
+    fn is_liquid(self) -> bool {
+        matches!(self, Self::LiquidLegacy | Self::LiquidStaged)
+    }
+
+    fn is_staged(self) -> bool {
+        matches!(self, Self::Staged | Self::LiquidStaged)
+    }
 }
 
 const EXTENDED_DATA_CHUNK_SIZE: usize = 3 * 1024 - 64;
@@ -2236,9 +2248,21 @@ impl Emulator {
             return bad_parameters(message);
         }
 
-        V1Outcome::DeferredToCore {
-            method: "sign_liquid_tx signing".to_string(),
-        }
+        let flow = if optional_bool(params, "use_ae_signatures") {
+            BitcoinSignTxFlow::LiquidStaged
+        } else {
+            BitcoinSignTxFlow::LiquidLegacy
+        };
+
+        self.sign_tx = Some(BitcoinSignTxSession {
+            txn: txn.to_vec(),
+            expected_inputs,
+            received_inputs: 0,
+            next_signature: 0,
+            flow,
+            inputs: Vec::with_capacity(expected_inputs),
+        });
+        V1Outcome::BoolResult { result: true }
     }
 
     fn tx_input_result(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -2247,6 +2271,13 @@ impl Emulator {
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string(),
             };
+        }
+        if self
+            .sign_tx
+            .as_ref()
+            .is_some_and(|session| session.flow.is_liquid())
+        {
+            return self.liquid_tx_input_result(request);
         }
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -2327,6 +2358,63 @@ impl Emulator {
                     result: ae_signer_commitment,
                 }
             }
+            BitcoinSignTxFlow::LiquidLegacy | BitcoinSignTxFlow::LiquidStaged => {
+                V1Outcome::Reject {
+                    code: ErrorCode::ProtocolError,
+                    message: "Unexpected method".to_string(),
+                }
+            }
+        }
+    }
+
+    fn liquid_tx_input_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let flow = self
+            .sign_tx
+            .as_ref()
+            .expect("checked active sign_tx session")
+            .flow;
+        let input =
+            match parse_liquid_tx_input_params(params, flow == BitcoinSignTxFlow::LiquidStaged) {
+                Ok(input) => input,
+                Err(message) => return bad_parameters(message),
+            };
+        let session = self
+            .sign_tx
+            .as_mut()
+            .expect("checked active sign_tx session");
+        if session.received_inputs >= session.expected_inputs {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Too many tx_input messages".to_string(),
+            };
+        }
+        session.received_inputs += 1;
+        let done = session.received_inputs == session.expected_inputs;
+
+        if !input.signs_input {
+            if done {
+                self.sign_tx = None;
+            }
+            return V1Outcome::BytesResult { result: Vec::new() };
+        }
+
+        if done {
+            self.sign_tx = None;
+        }
+        if input.uses_ae_signature {
+            return V1Outcome::DeferredToCore {
+                method: "sign_liquid_tx anti-exfil signing".to_string(),
+            };
+        }
+
+        V1Outcome::DeferredToCore {
+            method: "sign_liquid_tx signing".to_string(),
         }
     }
 
@@ -2341,12 +2429,15 @@ impl Emulator {
                 message: "Unexpected method".to_string(),
             };
         };
-        if session.flow != BitcoinSignTxFlow::Staged
-            || session.received_inputs < session.expected_inputs
-        {
+        if !session.flow.is_staged() || session.received_inputs < session.expected_inputs {
             return V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
                 message: "Unexpected method".to_string(),
+            };
+        }
+        if session.flow == BitcoinSignTxFlow::LiquidStaged {
+            return V1Outcome::DeferredToCore {
+                method: "sign_liquid_tx anti-exfil signing".to_string(),
             };
         }
         let Some(params) = request.params() else {
@@ -3785,6 +3876,97 @@ fn parse_bitcoin_tx_input_params(
         input_tx,
         ae_host_commitment,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiquidTxInputParams {
+    signs_input: bool,
+    uses_ae_signature: bool,
+}
+
+fn parse_liquid_tx_input_params(
+    params: jade_protocol_v1::Params<'_>,
+    use_ae_signatures: bool,
+) -> Result<LiquidTxInputParams, &'static str> {
+    let path = match params.u32_array("path", MAX_PATH_LEN) {
+        Ok(Some(path)) if !path.is_empty() => Some(path),
+        Ok(Some(_)) | Err(_) => return Err("Failed to extract valid path from parameters"),
+        Ok(None) => None,
+    };
+    if path.is_none() {
+        return Ok(LiquidTxInputParams {
+            signs_input: false,
+            uses_ae_signature: false,
+        });
+    }
+
+    let is_witness = match params.bool("is_witness") {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return Err("Failed to extract is_witness from parameters"),
+    };
+    let script = match params.bytes("script") {
+        Ok(Some(script)) if !script.is_empty() => script,
+        Ok(_) | Err(_) => return Err("Failed to extract script from parameters"),
+    };
+    let sighash = match cbor_map_u64(params.raw(), "sighash") {
+        Ok(Some(sighash)) if sighash <= u8::MAX as u64 => sighash as u32,
+        Ok(None) if is_taproot_script_pubkey(script) => 0,
+        Ok(None) => 1,
+        Ok(Some(_)) | Err(()) => return Err("Failed to fetch valid sighash from parameters"),
+    };
+    if !liquid_sighash_is_supported(script, sighash) {
+        return Err("Unsupported sighash value");
+    }
+    if is_witness {
+        match cbor_map_bytes_or_null_alias(params.raw(), &["value_commitment", "value commitment"])
+        {
+            Ok(Some(commitment))
+                if commitment.len() == jade_crypto::LIQUID_COMMITMENT_LEN
+                    || commitment.len() == LIQUID_EXPLICIT_VALUE_LEN => {}
+            Ok(_) | Err(()) => return Err("Failed to extract value commitment from parameters"),
+        }
+    }
+    let uses_ae_signature = if use_ae_signatures {
+        match cbor_map_bytes_or_null(params.raw(), "ae_host_commitment") {
+            Ok(Some(commitment)) if commitment.len() == jade_crypto::SHA256_LEN => true,
+            Ok(Some([])) | Ok(None) => false,
+            Ok(Some(_)) | Err(()) => {
+                return Err("Failed to extract valid host commitment from parameters")
+            }
+        }
+    } else {
+        false
+    };
+    if uses_ae_signature && is_taproot_script_pubkey(script) {
+        return Err("Invalid non-empty taproot host commitment");
+    }
+
+    Ok(LiquidTxInputParams {
+        signs_input: true,
+        uses_ae_signature,
+    })
+}
+
+const LIQUID_EXPLICIT_VALUE_LEN: usize = 9;
+
+fn liquid_sighash_is_supported(script: &[u8], sighash: u32) -> bool {
+    match sighash {
+        0 => is_taproot_script_pubkey(script),
+        1 | 3 => true,
+        _ => false,
+    }
+}
+
+fn cbor_map_bytes_or_null_alias<'a>(
+    raw: &'a [u8],
+    fields: &[&str],
+) -> Result<Option<&'a [u8]>, ()> {
+    for field in fields {
+        if let Some(value) = cbor_map_field(raw, field)? {
+            return cbor_bytes_or_null(value);
+        }
+    }
+    Ok(None)
 }
 
 fn sign_bitcoin_tx_input(
@@ -6007,6 +6189,78 @@ mod tests {
         params
     }
 
+    fn liquid_tx_input_params_missing_script() -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(2)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap();
+        params
+    }
+
+    fn liquid_tx_input_params_with_script_only() -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(3)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(&[0xab, 0xcd, 0x12])
+            .unwrap();
+        params
+    }
+
+    fn liquid_tx_input_params_with_value_commitment_and_sighash(sighash: u64) -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(5)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .str("script")
+            .unwrap()
+            .bytes(&[0xab, 0xcd, 0x12])
+            .unwrap()
+            .str("value commitment")
+            .unwrap()
+            .bytes(&decode_hex::<33>(
+                "094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43",
+            ))
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(sighash)
+            .unwrap();
+        params
+    }
+
     fn decode_xpub(input: &str) -> [u8; BIP32_SERIALIZED_LEN] {
         let bytes = base58ck::decode_check(input).unwrap();
         bytes.try_into().unwrap()
@@ -6170,7 +6424,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_liquid_tx_validates_front_door_before_signing_defer() {
+    fn sign_liquid_tx_validates_front_door_and_starts_session() {
         let mut emulator = Emulator::new();
         let good_tx = good_liquid_tx();
         let request = Request {
@@ -6357,9 +6611,7 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "sign_liquid_tx signing".to_string()
-            }
+            V1Outcome::BoolResult { result: true }
         );
 
         params = Vec::new();
@@ -6445,6 +6697,115 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Invalid asset info passed".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sign_liquid_tx_session_validates_tx_input_messages() {
+        let mut emulator = Emulator::new();
+        let good_tx = good_liquid_tx();
+        let start_params =
+            sign_liquid_tx_start_params_with_trusted("localtest-liquid", &good_tx, 1);
+        let start_request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let request = Request {
+            id: Cow::Borrowed("badliqin1"),
+            method: Cow::Borrowed("tx_input"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string()
+            }
+        );
+
+        let input_params = liquid_tx_input_params_missing_script();
+        let request = Request {
+            id: Cow::Borrowed("badliqin2"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract script from parameters".to_string()
+            }
+        );
+
+        let input_params = liquid_tx_input_params_with_script_only();
+        let request = Request {
+            id: Cow::Borrowed("badliqin5"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract value commitment from parameters".to_string()
+            }
+        );
+
+        let input_params = liquid_tx_input_params_with_value_commitment_and_sighash(0);
+        let request = Request {
+            id: Cow::Borrowed("badliqin11"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Unsupported sighash value".to_string()
+            }
+        );
+
+        let input_params = liquid_tx_input_params_with_value_commitment_and_sighash(300);
+        let request = Request {
+            id: Cow::Borrowed("badliqin10"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to fetch valid sighash from parameters".to_string()
+            }
+        );
+
+        let input_params = sign_tx_unsigned_input_params(true, None, None);
+        let request = Request {
+            id: Cow::Borrowed("liqin-nosign"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: Vec::new() }
+        );
+        let request = Request {
+            id: Cow::Borrowed("liqin-extra"),
+            method: Cow::Borrowed("tx_input"),
+            params: Some(&input_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string()
             }
         );
     }
