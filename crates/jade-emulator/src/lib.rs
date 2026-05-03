@@ -4225,10 +4225,10 @@ fn parse_liquid_tx_input_params(
 const LIQUID_EXPLICIT_VALUE_LEN: usize = 9;
 
 fn liquid_sighash_is_supported(script: &[u8], sighash: u32) -> bool {
-    match sighash {
-        0 => is_taproot_script_pubkey(script),
-        1 | 3 => true,
-        _ => false,
+    if is_taproot_script_pubkey(script) {
+        matches!(sighash, 0 | 1)
+    } else {
+        matches!(sighash, 1 | 2 | 3 | 0x81 | 0x82 | 0x83)
     }
 }
 
@@ -6253,6 +6253,97 @@ mod tests {
         quoted_hex_strings(&expected_block[..end])
     }
 
+    fn fixture_input_objects(fixture: &str) -> Vec<&str> {
+        let marker = "\"inputs\": [";
+        let start = fixture.find(marker).unwrap() + marker.len();
+        let rest = &fixture[start..];
+        let mut objects = Vec::new();
+        let mut depth = 0usize;
+        let mut object_start = None;
+
+        for (index, byte) in rest.bytes().enumerate() {
+            match byte {
+                b'{' => {
+                    if depth == 0 {
+                        object_start = Some(index);
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    depth = depth.checked_sub(1).unwrap();
+                    if depth == 0 {
+                        let start = object_start.take().unwrap();
+                        objects.push(&rest[start..=index]);
+                    }
+                }
+                b']' if depth == 0 => break,
+                _ => {}
+            }
+        }
+
+        objects
+    }
+
+    fn fixture_input_hex_values<'a>(fixture: &'a str, field: &str) -> Vec<&'a str> {
+        fixture_input_objects(fixture)
+            .into_iter()
+            .map(|input| {
+                let values = fixture_hex_values(input, field);
+                assert_eq!(values.len(), 1, "expected one {field} in fixture input");
+                values[0]
+            })
+            .collect()
+    }
+
+    fn fixture_input_paths(fixture: &str) -> Vec<Vec<u32>> {
+        fixture_input_objects(fixture)
+            .into_iter()
+            .map(|input| {
+                let marker = "\"path\": [";
+                let start = input.find(marker).unwrap() + marker.len();
+                let rest = &input[start..];
+                let end = rest.find(']').unwrap();
+                rest[..end]
+                    .split(',')
+                    .map(|value| value.trim().parse().unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn fixture_input_bool_values(fixture: &str, field: &str) -> Vec<bool> {
+        let marker = format!("\"{field}\": ");
+        fixture_input_objects(fixture)
+            .into_iter()
+            .map(|input| {
+                let start = input.find(&marker).unwrap() + marker.len();
+                let rest = &input[start..];
+                if rest.starts_with("true") {
+                    true
+                } else if rest.starts_with("false") {
+                    false
+                } else {
+                    panic!("expected boolean {field} in fixture input");
+                }
+            })
+            .collect()
+    }
+
+    fn fixture_input_u32_values(fixture: &str, field: &str) -> Vec<u32> {
+        let marker = format!("\"{field}\": ");
+        fixture_input_objects(fixture)
+            .into_iter()
+            .map(|input| {
+                let start = input.find(&marker).unwrap() + marker.len();
+                let rest = &input[start..];
+                let end = rest
+                    .find(|byte: char| !byte.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                rest[..end].parse().unwrap()
+            })
+            .collect()
+    }
+
     fn quoted_hex_strings(block: &str) -> Vec<&str> {
         let mut values = Vec::new();
         let mut rest = block;
@@ -6385,6 +6476,48 @@ mod tests {
             .unwrap();
         encode_good_liquid_commitment(&mut encoder);
         encoder.map(0).unwrap();
+        params
+    }
+
+    fn sign_liquid_tx_start_params_with_dummy_trusted_ae(
+        network: &str,
+        txn: &[u8],
+        num_inputs: u64,
+    ) -> Vec<u8> {
+        let (_, output_confidentiality) =
+            jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(txn).unwrap();
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(num_inputs)
+            .unwrap()
+            .str("use_ae_signatures")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(output_confidentiality.len() as u64)
+            .unwrap();
+        for confidential in output_confidentiality {
+            if confidential {
+                encode_good_liquid_commitment(&mut encoder);
+            } else {
+                encoder.map(0).unwrap();
+            }
+        }
         params
     }
 
@@ -6699,6 +6832,55 @@ mod tests {
             .str("ae_host_commitment")
             .unwrap()
             .bytes(&[])
+            .unwrap();
+        params
+    }
+
+    fn sign_liquid_input_params_with_ae(
+        is_witness: bool,
+        path: &[u32],
+        script: &[u8],
+        sighash: u64,
+        asset_generator: &[u8],
+        value_commitment: &[u8],
+        ae_host_commitment: &[u8; jade_crypto::SHA256_LEN],
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(7)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(is_witness)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(path.len() as u64)
+            .unwrap();
+        for child in path {
+            encoder.u32(*child).unwrap();
+        }
+        encoder
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(sighash)
+            .unwrap()
+            .str("asset_generator")
+            .unwrap()
+            .bytes(asset_generator)
+            .unwrap()
+            .str("value_commitment")
+            .unwrap()
+            .bytes(value_commitment)
+            .unwrap()
+            .str("ae_host_commitment")
+            .unwrap()
+            .bytes(ae_host_commitment)
             .unwrap();
         params
     }
@@ -7571,6 +7753,111 @@ mod tests {
                     result: decode_hex_vec(signature)
                 }
             );
+        }
+    }
+
+    #[test]
+    fn sign_liquid_tx_staged_flow_signs_anti_exfil_singlesig_inputs() {
+        let fixtures = [
+            include_str!("../../../test_data/tx_liquid_ss_p2pkh.json"),
+            include_str!("../../../test_data/tx_liquid_ss_p2wpkh.json"),
+            include_str!("../../../test_data/tx_liquid_ss_p2sh_p2wpkh.json"),
+            include_str!("../../../test_data/tx_liquid_ss_p2sh_p2wpkh_maker_swap.json"),
+        ];
+
+        for fixture in fixtures {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+            let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+            let paths = fixture_input_paths(fixture);
+            let is_witness = fixture_input_bool_values(fixture, "is_witness");
+            let sighashes = fixture_input_u32_values(fixture, "sighash");
+            let scripts: Vec<_> = fixture_input_hex_values(fixture, "script")
+                .into_iter()
+                .map(decode_hex_vec)
+                .collect();
+            let asset_generators: Vec<_> = fixture_input_hex_values(fixture, "asset_generator")
+                .into_iter()
+                .map(decode_hex_vec)
+                .collect();
+            let value_commitments: Vec<_> = fixture_input_hex_values(fixture, "value_commitment")
+                .into_iter()
+                .map(decode_hex_vec)
+                .collect();
+            let host_commitments: Vec<[u8; jade_crypto::SHA256_LEN]> =
+                fixture_input_hex_values(fixture, "ae_host_commitment")
+                    .into_iter()
+                    .map(decode_hex)
+                    .collect();
+            let host_entropies: Vec<[u8; jade_crypto::SHA256_LEN]> =
+                fixture_input_hex_values(fixture, "ae_host_entropy")
+                    .into_iter()
+                    .map(decode_hex)
+                    .collect();
+            let expected = fixture_expected_output_signatures(fixture);
+            assert_eq!(paths.len(), scripts.len());
+            assert_eq!(paths.len(), is_witness.len());
+            assert_eq!(paths.len(), sighashes.len());
+            assert_eq!(paths.len(), asset_generators.len());
+            assert_eq!(paths.len(), value_commitments.len());
+            assert_eq!(paths.len(), host_commitments.len());
+            assert_eq!(paths.len(), host_entropies.len());
+            assert_eq!(paths.len() * 2, expected.len());
+
+            let start_params = sign_liquid_tx_start_params_with_dummy_trusted_ae(
+                fixture_network(fixture),
+                &txn,
+                paths.len() as u64,
+            );
+            let start_request = Request {
+                id: Cow::Borrowed("liq"),
+                method: Cow::Borrowed("sign_liquid_tx"),
+                params: Some(&start_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&start_request),
+                V1Outcome::BoolResult { result: true }
+            );
+
+            for index in 0..paths.len() {
+                let input_params = sign_liquid_input_params_with_ae(
+                    is_witness[index],
+                    &paths[index],
+                    &scripts[index],
+                    sighashes[index] as u64,
+                    &asset_generators[index],
+                    &value_commitments[index],
+                    &host_commitments[index],
+                );
+                let input_request = Request {
+                    id: Cow::Borrowed("input"),
+                    method: Cow::Borrowed("tx_input"),
+                    params: Some(&input_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&input_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index * 2])
+                    }
+                );
+            }
+
+            for index in 0..paths.len() {
+                let signature_params = get_signature_params_with_entropy(&host_entropies[index]);
+                let signature_request = Request {
+                    id: Cow::Borrowed("sig"),
+                    method: Cow::Borrowed("get_signature"),
+                    params: Some(&signature_params),
+                };
+                assert_eq!(
+                    emulator.handle_v1_request(&signature_request),
+                    V1Outcome::BytesResult {
+                        result: decode_hex_vec(expected[index * 2 + 1])
+                    }
+                );
+            }
         }
     }
 

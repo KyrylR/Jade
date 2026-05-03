@@ -41,7 +41,7 @@ the continuation methods used by multi-message flows.
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
 | Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
-| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session, validates Liquid `tx_input` continuations, signs non-Taproot legacy/segwit ECDSA inputs, including anti-exfil continuations, and signs staged Liquid Taproot key-path inputs through the public `elements` sighash API |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session, validates Liquid `tx_input` continuations, signs non-Taproot legacy/segwit ECDSA inputs, including anti-exfil continuations and standard Elements ECDSA sighash flags, and signs staged Liquid Taproot key-path inputs through the public `elements` sighash API |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -89,17 +89,20 @@ reference. The Rust `sign_liquid_tx` signer covers non-Taproot legacy/segwit
 ECDSA inputs by parsing Elements transactions with `elements`, constructing
 Elements legacy/BIP143 sighashes with `SighashCache`, parsing confidential or
 explicit value commitments, and reusing Jade's low-R and anti-exfil ECDSA
-signers. It also covers staged Liquid Taproot key-path inputs by collecting the
-full prevout set from `tx_input`, using the Jade-compatible Liquid
-main/testnet/regtest genesis hashes for ELIP-0101 Taproot sighashes, verifying
-Elements Taproot tweaked output keys against the supplied script pubkeys, and
-producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now covers
-singlesig and the current Green witness-script fixtures. Remaining Liquid work
-is now narrower: script-path Taproot, generic PSET policy/finalization beyond
-the covered Green cases, and full confidential transaction proof validation.
-Direct `secp256k1-zkp` usage
-should still stay behind narrow Liquid helper APIs unless there is a reason to
-expose the lower-level backend.
+signers. The v1 adapter now accepts the standard Elements ECDSA sighash set,
+including `SIGHASH_SINGLE|ANYONECANPAY`, and matches the Jade single-sig
+Liquid anti-exfil fixtures for P2PKH, P2WPKH, P2SH-P2WPKH, and the Liquidex
+partial-swap maker flow. It also covers staged Liquid Taproot key-path inputs
+by collecting the full prevout set from `tx_input`, using the Jade-compatible
+Liquid main/testnet/regtest genesis hashes for ELIP-0101 Taproot sighashes,
+verifying Elements Taproot tweaked output keys against the supplied script
+pubkeys, and producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now
+covers singlesig and the current Green witness-script fixtures. Remaining
+Liquid work is now narrower: script-path Taproot, generic PSET
+policy/finalization beyond the covered Green cases, and full confidential
+transaction proof validation. Direct `secp256k1-zkp` usage should still stay
+behind narrow Liquid helper APIs unless there is a reason to expose the
+lower-level backend.
 
 The hard parts are hard for concrete compatibility reasons:
 
@@ -184,17 +187,19 @@ The hard parts are hard for concrete compatibility reasons:
   output metadata checks, and asset-info shape validation, then starts a
   stateful Liquid legacy or anti-exfil signing session. Liquid `tx_input`
   continuations now use Jade-compatible validation for signing paths, scripts,
-  witness value commitments, sighash values, and anti-exfil host commitments,
-  including empty byte replies for pathless no-sign inputs. Non-Taproot
-  legacy/segwit ECDSA Liquid inputs now produce DER+sighash signatures through
-  the `elements` sighash backend in both immediate legacy signing and staged
-  anti-exfil signing: `tx_input` returns the signer commitment and
-  `get_signature` returns the final DER+sighash signature. Staged Liquid
-  Taproot key-path inputs now collect all prevouts, compute genesis-aware
-  Elements Taproot sighashes, reject non-matching output keys, and return
-  DEFAULT/ALL Schnorr signatures matching the Jade fixture. Liquid PSET
-  signing now covers p2pkh, p2wpkh, p2sh-p2wpkh, Taproot key-path, Green CSV
-  witness-script, and Green no-recovery P2WSH fixtures through `sign_psbt`,
+  witness value commitments, standard Elements ECDSA sighash values, and
+  anti-exfil host commitments, including empty byte replies for pathless
+  no-sign inputs. Non-Taproot legacy/segwit ECDSA Liquid inputs now produce
+  DER+sighash signatures through the `elements` sighash backend in both
+  immediate legacy signing and staged anti-exfil signing: `tx_input` returns
+  the signer commitment and `get_signature` returns the final DER+sighash
+  signature. This matches the P2PKH, P2WPKH, P2SH-P2WPKH, and Liquidex partial
+  swap anti-exfil fixtures, including `SIGHASH_SINGLE|ANYONECANPAY`. Staged
+  Liquid Taproot key-path inputs now collect all prevouts, compute
+  genesis-aware Elements Taproot sighashes, reject non-matching output keys,
+  and return DEFAULT/ALL Schnorr signatures matching the Jade fixture. Liquid
+  PSET signing now covers p2pkh, p2wpkh, p2sh-p2wpkh, Taproot key-path, Green
+  CSV witness-script, and Green no-recovery P2WSH fixtures through `sign_psbt`,
   with unsupported Liquid PSET policy/finalization cases returning the explicit
   core-defer outcome. PSBT anti-exfil, Liquid script-path Taproot,
   registered/generic multisig policy validation, generic Liquid PSET
