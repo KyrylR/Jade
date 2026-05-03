@@ -370,6 +370,23 @@ where
         })
     }
 
+    pub fn poll_v1_transport_streams(
+        &mut self,
+        serial_frames: &mut CborFrameBuffer<'_>,
+        usb_frames: &mut CborFrameBuffer<'_>,
+        ble_frames: &mut CborFrameBuffer<'_>,
+    ) -> Result<Esp32s3V1PollReport, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+
+        Ok(Esp32s3V1PollReport {
+            serial: poll_serial_full_v1_stream(&mut self.runtime, serial_frames)?,
+            usb: poll_usb_full_v1_stream(&mut self.runtime, usb_frames)?,
+            ble: poll_ble_full_v1_stream(&mut self.runtime, ble_frames)?,
+        })
+    }
+
     pub fn tick<'a>(
         &mut self,
         tick: Esp32s3BoardTick<'a>,
@@ -386,6 +403,41 @@ where
         let monotonic_millis = self.monotonic_millis()?;
         let rollback_secure_version = self.rollback_secure_version()?;
         let qr_payload = match tick.qr_buffer {
+            Some(out) => self.poll_camera_qr(out)?,
+            None => None,
+        };
+
+        Ok(Esp32s3BoardTickReport {
+            transports,
+            qr_payload,
+            touch,
+            confirmation,
+            monotonic_millis,
+            rollback_secure_version,
+        })
+    }
+
+    pub fn tick_streams<'a>(
+        &mut self,
+        serial_frames: &mut CborFrameBuffer<'_>,
+        usb_frames: &mut CborFrameBuffer<'_>,
+        ble_frames: &mut CborFrameBuffer<'_>,
+        qr_buffer: Option<&'a mut [u8]>,
+        display_status: Option<DisplayStatus<'a>>,
+        confirmation: Option<UserConfirmation<'a>>,
+    ) -> Result<Esp32s3BoardTickReport<'a>, FirmwareFrameError> {
+        let transports = self.poll_v1_transport_streams(serial_frames, usb_frames, ble_frames)?;
+        if let Some(status) = display_status {
+            self.display_status(status)?;
+        }
+        let confirmation = match confirmation {
+            Some(request) => Some(self.confirm_user(request)?),
+            None => None,
+        };
+        let touch = self.poll_touch()?;
+        let monotonic_millis = self.monotonic_millis()?;
+        let rollback_secure_version = self.rollback_secure_version()?;
+        let qr_payload = match qr_buffer {
             Some(out) => self.poll_camera_qr(out)?,
             None => None,
         };
@@ -1482,6 +1534,62 @@ mod tests {
     }
 
     #[test]
+    fn s3_board_runtime_polls_all_v1_transport_streams() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        let usb = v1_request("u", "ping");
+        let split = usb.len() / 2;
+        board.platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        board.platform_mut().usb_rx = Some(usb[..split].to_vec());
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+
+        let mut serial_storage = [0u8; 256];
+        let mut usb_storage = [0u8; 256];
+        let mut ble_storage = [0u8; 256];
+        let mut serial_frames = CborFrameBuffer::new(&mut serial_storage);
+        let mut usb_frames = CborFrameBuffer::new(&mut usb_storage);
+        let mut ble_frames = CborFrameBuffer::new(&mut ble_storage);
+        assert_eq!(
+            board.poll_v1_transport_streams(&mut serial_frames, &mut usb_frames, &mut ble_frames),
+            Err(FirmwareFrameError::BootRequired)
+        );
+
+        board.boot().unwrap();
+        let report = board
+            .poll_v1_transport_streams(&mut serial_frames, &mut usb_frames, &mut ble_frames)
+            .unwrap();
+        assert_eq!(
+            report,
+            Esp32s3V1PollReport {
+                serial: true,
+                usb: false,
+                ble: true
+            }
+        );
+        assert_eq!(usb_frames.len(), split);
+        assert_eq!(board.platform().serial_tx.len(), 1);
+        assert_eq!(board.platform().usb_tx.len(), 0);
+        assert_eq!(board.platform().ble_tx.len(), 1);
+
+        board.platform_mut().usb_rx = Some(usb[split..].to_vec());
+        let report = board
+            .poll_v1_transport_streams(&mut serial_frames, &mut usb_frames, &mut ble_frames)
+            .unwrap();
+        assert_eq!(
+            report,
+            Esp32s3V1PollReport {
+                serial: false,
+                usb: true,
+                ble: false
+            }
+        );
+        assert!(usb_frames.is_empty());
+        assert_eq!(board.platform().usb_tx.len(), 1);
+    }
+
+    #[test]
     fn s3_board_runtime_tick_polls_services_once() {
         let mut board = Esp32s3V1BoardRuntime::new(
             TestPlatform::new(JADE_V2_MANIFEST),
@@ -1535,6 +1643,94 @@ mod tests {
         assert_eq!(report.rollback_secure_version, 4);
         assert_eq!(board.platform().display_status_count, 1);
         assert_eq!(board.platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn s3_board_runtime_stream_tick_polls_services() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        let usb = v1_request("u", "ping");
+        let split = usb.len() / 2;
+        board.platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        board.platform_mut().usb_rx = Some(usb[..split].to_vec());
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+        board.platform_mut().camera_rx = Some(b"ur:bytes/s3-stream-tick".to_vec());
+        board.platform_mut().touch_rx = Some(TouchEvent::Press { x: 10, y: 20 });
+        board.platform_mut().confirmation_decision = UserConfirmationDecision::Approved;
+        board.platform_mut().monotonic_millis = 66;
+        board.platform_mut().rollback_secure_version = 6;
+
+        let mut serial_storage = [0u8; 256];
+        let mut usb_storage = [0u8; 256];
+        let mut ble_storage = [0u8; 256];
+        let mut qr = [0u8; 64];
+        let mut serial_frames = CborFrameBuffer::new(&mut serial_storage);
+        let mut usb_frames = CborFrameBuffer::new(&mut usb_storage);
+        let mut ble_frames = CborFrameBuffer::new(&mut ble_storage);
+        assert!(matches!(
+            board.tick_streams(
+                &mut serial_frames,
+                &mut usb_frames,
+                &mut ble_frames,
+                Some(&mut qr),
+                Some(DisplayStatus::Busy("stream")),
+                Some(UserConfirmation::Export { label: "xpub" }),
+            ),
+            Err(FirmwareFrameError::BootRequired)
+        ));
+
+        board.boot().unwrap();
+        let report = board
+            .tick_streams(
+                &mut serial_frames,
+                &mut usb_frames,
+                &mut ble_frames,
+                Some(&mut qr),
+                Some(DisplayStatus::Busy("stream")),
+                Some(UserConfirmation::Export { label: "xpub" }),
+            )
+            .unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32s3V1PollReport {
+                serial: true,
+                usb: false,
+                ble: true
+            }
+        );
+        assert_eq!(report.qr_payload, Some(&b"ur:bytes/s3-stream-tick"[..]));
+        assert_eq!(report.touch, Some(TouchEvent::Press { x: 10, y: 20 }));
+        assert_eq!(
+            report.confirmation,
+            Some(UserConfirmationDecision::Approved)
+        );
+        assert_eq!(report.monotonic_millis, 66);
+        assert_eq!(report.rollback_secure_version, 6);
+        assert_eq!(board.platform().display_status_count, 1);
+        assert_eq!(board.platform().confirmation_count, 1);
+
+        board.platform_mut().usb_rx = Some(usb[split..].to_vec());
+        let report = board
+            .tick_streams(
+                &mut serial_frames,
+                &mut usb_frames,
+                &mut ble_frames,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32s3V1PollReport {
+                serial: false,
+                usb: true,
+                ble: false
+            }
+        );
+        assert_eq!(board.platform().usb_tx.len(), 1);
     }
 
     #[test]

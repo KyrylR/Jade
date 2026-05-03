@@ -320,6 +320,21 @@ where
         })
     }
 
+    pub fn poll_v1_transport_streams(
+        &mut self,
+        serial_frames: &mut CborFrameBuffer<'_>,
+        ble_frames: &mut CborFrameBuffer<'_>,
+    ) -> Result<Esp32V1PollReport, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+
+        Ok(Esp32V1PollReport {
+            serial: poll_serial_full_v1_stream(&mut self.runtime, serial_frames)?,
+            ble: poll_ble_full_v1_stream(&mut self.runtime, ble_frames)?,
+        })
+    }
+
     pub fn tick<'a>(
         &mut self,
         tick: Esp32BoardTick<'a>,
@@ -335,6 +350,38 @@ where
         let monotonic_millis = self.monotonic_millis()?;
         let rollback_secure_version = self.rollback_secure_version()?;
         let qr_payload = match tick.qr_buffer {
+            Some(out) => self.poll_camera_qr(out)?,
+            None => None,
+        };
+
+        Ok(Esp32BoardTickReport {
+            transports,
+            qr_payload,
+            confirmation,
+            monotonic_millis,
+            rollback_secure_version,
+        })
+    }
+
+    pub fn tick_streams<'a>(
+        &mut self,
+        serial_frames: &mut CborFrameBuffer<'_>,
+        ble_frames: &mut CborFrameBuffer<'_>,
+        qr_buffer: Option<&'a mut [u8]>,
+        display_status: Option<DisplayStatus<'a>>,
+        confirmation: Option<UserConfirmation<'a>>,
+    ) -> Result<Esp32BoardTickReport<'a>, FirmwareFrameError> {
+        let transports = self.poll_v1_transport_streams(serial_frames, ble_frames)?;
+        if let Some(status) = display_status {
+            self.display_status(status)?;
+        }
+        let confirmation = match confirmation {
+            Some(request) => Some(self.confirm_user(request)?),
+            None => None,
+        };
+        let monotonic_millis = self.monotonic_millis()?;
+        let rollback_secure_version = self.rollback_secure_version()?;
+        let qr_payload = match qr_buffer {
             Some(out) => self.poll_camera_qr(out)?,
             None => None,
         };
@@ -1193,6 +1240,56 @@ mod tests {
     }
 
     #[test]
+    fn esp32_board_runtime_polls_all_v1_transport_streams() {
+        let mut board = Esp32V1BoardRuntime::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        let serial = v1_request("s", "ping");
+        let split = serial.len() / 2;
+        board.platform_mut().serial_rx = Some(serial[..split].to_vec());
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+
+        let mut serial_storage = [0u8; 256];
+        let mut ble_storage = [0u8; 256];
+        let mut serial_frames = CborFrameBuffer::new(&mut serial_storage);
+        let mut ble_frames = CborFrameBuffer::new(&mut ble_storage);
+        assert_eq!(
+            board.poll_v1_transport_streams(&mut serial_frames, &mut ble_frames),
+            Err(FirmwareFrameError::BootRequired)
+        );
+
+        board.boot().unwrap();
+        let report = board
+            .poll_v1_transport_streams(&mut serial_frames, &mut ble_frames)
+            .unwrap();
+        assert_eq!(
+            report,
+            Esp32V1PollReport {
+                serial: false,
+                ble: true
+            }
+        );
+        assert_eq!(serial_frames.len(), split);
+        assert_eq!(board.platform().serial_tx.len(), 0);
+        assert_eq!(board.platform().ble_tx.len(), 1);
+
+        board.platform_mut().serial_rx = Some(serial[split..].to_vec());
+        let report = board
+            .poll_v1_transport_streams(&mut serial_frames, &mut ble_frames)
+            .unwrap();
+        assert_eq!(
+            report,
+            Esp32V1PollReport {
+                serial: true,
+                ble: false
+            }
+        );
+        assert!(serial_frames.is_empty());
+        assert_eq!(board.platform().serial_tx.len(), 1);
+    }
+
+    #[test]
     fn esp32_board_runtime_tick_polls_services_once() {
         let mut board = Esp32V1BoardRuntime::new(
             TestPlatform::new(JADE_MANIFEST),
@@ -1242,6 +1339,78 @@ mod tests {
         assert_eq!(report.rollback_secure_version, 4);
         assert_eq!(board.platform().display_status_count, 1);
         assert_eq!(board.platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_runtime_stream_tick_polls_services() {
+        let mut board = Esp32V1BoardRuntime::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        let serial = v1_request("s", "ping");
+        let split = serial.len() / 2;
+        board.platform_mut().serial_rx = Some(serial[..split].to_vec());
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+        board.platform_mut().camera_rx = Some(b"ur:bytes/stream-tick".to_vec());
+        board.platform_mut().confirmation_decision = UserConfirmationDecision::Approved;
+        board.platform_mut().monotonic_millis = 66;
+        board.platform_mut().rollback_secure_version = 6;
+
+        let mut serial_storage = [0u8; 256];
+        let mut ble_storage = [0u8; 256];
+        let mut qr = [0u8; 64];
+        let mut serial_frames = CborFrameBuffer::new(&mut serial_storage);
+        let mut ble_frames = CborFrameBuffer::new(&mut ble_storage);
+        assert!(matches!(
+            board.tick_streams(
+                &mut serial_frames,
+                &mut ble_frames,
+                Some(&mut qr),
+                Some(DisplayStatus::Busy("stream")),
+                Some(UserConfirmation::Export { label: "xpub" }),
+            ),
+            Err(FirmwareFrameError::BootRequired)
+        ));
+
+        board.boot().unwrap();
+        let report = board
+            .tick_streams(
+                &mut serial_frames,
+                &mut ble_frames,
+                Some(&mut qr),
+                Some(DisplayStatus::Busy("stream")),
+                Some(UserConfirmation::Export { label: "xpub" }),
+            )
+            .unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32V1PollReport {
+                serial: false,
+                ble: true
+            }
+        );
+        assert_eq!(report.qr_payload, Some(&b"ur:bytes/stream-tick"[..]));
+        assert_eq!(
+            report.confirmation,
+            Some(UserConfirmationDecision::Approved)
+        );
+        assert_eq!(report.monotonic_millis, 66);
+        assert_eq!(report.rollback_secure_version, 6);
+        assert_eq!(board.platform().display_status_count, 1);
+        assert_eq!(board.platform().confirmation_count, 1);
+
+        board.platform_mut().serial_rx = Some(serial[split..].to_vec());
+        let report = board
+            .tick_streams(&mut serial_frames, &mut ble_frames, None, None, None)
+            .unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32V1PollReport {
+                serial: true,
+                ble: false
+            }
+        );
+        assert_eq!(board.platform().serial_tx.len(), 1);
     }
 
     #[test]

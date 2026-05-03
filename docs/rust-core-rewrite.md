@@ -108,7 +108,10 @@ or oversized input explicitly. The ESP32 and ESP32-S3 firmware wrappers expose
 boot-gated stream pollers over those buffers for serial/BLE and serial/USB/BLE
 respectively, so the real board transport adapters can hand over arbitrary byte
 chunks and drain every complete v1 CBOR-RPC request without losing partial or
-back-to-back frames.
+back-to-back frames. The board-runtime tick path also has stream-aware aggregate
+polling, allowing firmware glue to keep one persistent `CborFrameBuffer` per
+transport while still running display, user confirmation, QR, touch, clock, and
+rollback checks through the same event-loop tick.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
