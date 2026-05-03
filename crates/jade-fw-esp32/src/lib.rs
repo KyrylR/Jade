@@ -141,6 +141,29 @@ where
         self.runtime.runtime_platform_mut()
     }
 
+    pub fn fill_random(&mut self, out: &mut [u8]) -> Result<(), FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        self.platform_mut()
+            .fill_random(out)
+            .map_err(FirmwareFrameError::Io)
+    }
+
+    pub fn monotonic_millis(&self) -> Result<u64, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        Ok(self.platform().monotonic_millis())
+    }
+
+    pub fn rollback_secure_version(&self) -> Result<u32, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        Ok(self.platform().rollback_secure_version())
+    }
+
     pub fn poll_serial_v1(&mut self, rx_buffer: &mut [u8]) -> Result<bool, FirmwareFrameError> {
         if !self.booted {
             return Err(FirmwareFrameError::BootRequired);
@@ -447,6 +470,8 @@ mod tests {
         display_status_count: usize,
         confirmation_count: usize,
         confirmation_decision: UserConfirmationDecision,
+        monotonic_millis: u64,
+        rollback_secure_version: u32,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,6 +534,8 @@ mod tests {
                 display_status_count: 0,
                 confirmation_count: 0,
                 confirmation_decision: UserConfirmationDecision::Approved,
+                monotonic_millis: 1,
+                rollback_secure_version: 1,
             }
         }
 
@@ -577,11 +604,11 @@ mod tests {
         }
 
         fn monotonic_millis(&self) -> u64 {
-            1
+            self.monotonic_millis
         }
 
         fn rollback_secure_version(&self) -> u32 {
-            1
+            self.rollback_secure_version
         }
     }
 
@@ -796,6 +823,36 @@ mod tests {
             UserConfirmationDecision::Rejected
         );
         assert_eq!(board.platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_runtime_gates_rng_clock_and_rollback_state() {
+        let mut board = Esp32V1BoardRuntime::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().monotonic_millis = 42;
+        board.platform_mut().rollback_secure_version = 7;
+
+        let mut random = [0u8; 4];
+        assert_eq!(
+            board.fill_random(&mut random),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        assert_eq!(
+            board.monotonic_millis(),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        assert_eq!(
+            board.rollback_secure_version(),
+            Err(FirmwareFrameError::BootRequired)
+        );
+
+        board.boot().unwrap();
+        board.fill_random(&mut random).unwrap();
+        assert_eq!(random, [0x5a; 4]);
+        assert_eq!(board.monotonic_millis().unwrap(), 42);
+        assert_eq!(board.rollback_secure_version().unwrap(), 7);
     }
 
     #[test]
