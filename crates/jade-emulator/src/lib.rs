@@ -298,6 +298,9 @@ impl Emulator {
             Some(MethodClass::Authenticated) if request.method == "sign_tx" => {
                 self.sign_tx_result(request)
             }
+            Some(MethodClass::Authenticated) if request.method == "sign_liquid_tx" => {
+                self.sign_liquid_tx_result(request)
+            }
             Some(MethodClass::Authenticated) if request.method == "sign_psbt" => {
                 self.sign_psbt_result(request)
             }
@@ -2181,6 +2184,38 @@ impl Emulator {
             inputs: Vec::with_capacity(expected_inputs),
         });
         V1Outcome::BoolResult { result: true }
+    }
+
+    fn sign_liquid_tx_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let network_name = match params.str("network") {
+            Ok(Some(network)) if valid_network_name(network) => network,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid network from parameters");
+            }
+        };
+        if liquid_network_for_name(network_name).is_none() {
+            return bad_parameters("sign_liquid_tx call only appropriate for liquid network");
+        }
+        match params.bytes("txn") {
+            Ok(Some(txn)) if !txn.is_empty() => {}
+            Ok(_) | Err(_) => return bad_parameters("Failed to extract tx from parameters"),
+        }
+        match params.u64("num_inputs") {
+            Ok(Some(num_inputs)) if num_inputs > 0 && num_inputs <= usize::MAX as u64 => {}
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract valid number of inputs from parameters")
+            }
+        }
+
+        V1Outcome::DeferredToCore {
+            method: "sign_liquid_tx signing".to_string(),
+        }
     }
 
     fn tx_input_result(&mut self, request: &Request<'_>) -> V1Outcome {
@@ -5433,6 +5468,30 @@ mod tests {
         params
     }
 
+    fn sign_liquid_tx_start_params(
+        network: &str,
+        txn: Option<&[u8]>,
+        num_inputs: Option<u64>,
+    ) -> Vec<u8> {
+        let len = 1 + usize::from(txn.is_some()) + usize::from(num_inputs.is_some());
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(len as u64)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap();
+        if let Some(txn) = txn {
+            encoder.str("txn").unwrap().bytes(txn).unwrap();
+        }
+        if let Some(num_inputs) = num_inputs {
+            encoder.str("num_inputs").unwrap().u64(num_inputs).unwrap();
+        }
+        params
+    }
+
     fn get_signature_params() -> Vec<u8> {
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
@@ -5763,6 +5822,120 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Expecting parameters map".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sign_liquid_tx_validates_front_door_before_signing_defer() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: None,
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("bad-liquid", None, None);
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid network from parameters".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("testnet", None, None);
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "sign_liquid_tx call only appropriate for liquid network".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", None, None);
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract tx from parameters".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", Some(&[]), None);
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract tx from parameters".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", Some(&[0x01, 0x02]), None);
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid number of inputs from parameters".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", Some(&[0x01, 0x02]), Some(0));
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract valid number of inputs from parameters".to_string()
+            }
+        );
+
+        let params = sign_liquid_tx_start_params("localtest-liquid", Some(&[0x01, 0x02]), Some(1));
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::DeferredToCore {
+                method: "sign_liquid_tx signing".to_string()
             }
         );
     }

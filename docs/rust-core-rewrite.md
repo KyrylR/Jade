@@ -41,7 +41,7 @@ the continuation methods used by multi-message flows.
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
 | Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
-| Liquid TX | `sign_liquid_tx`, `get_commitments` | deferred until audited pure-Rust Liquid transaction milestone |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | front-door v1 validation for `sign_liquid_tx`; signing and commitments deferred until audited pure-Rust Liquid transaction milestone |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -140,9 +140,11 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   P2SH-P2WPKH, P2WSH, and multi-input legacy P2PKH anti-exfil fixtures,
   including empty responses for pathless inputs. Bad anti-exfil host-entropy
   lengths now return the v1-compatible protocol error before the
-  commitment/entropy consistency check. PSBT anti-exfil, Taproot anti-exfil
-  signing, registered/generic multisig policy validation, and Liquid
-  `sign_liquid_tx` remain explicit defers.
+  commitment/entropy consistency check. Liquid `sign_liquid_tx` now enters the
+  Rust v1 adapter for network, transaction, and input-count validation before
+  the explicit signing defer. PSBT anti-exfil, Taproot anti-exfil signing,
+  registered/generic multisig policy validation, and Liquid confidential
+  transaction signing remain explicit defers.
 
 ## First Parity Gates
 
