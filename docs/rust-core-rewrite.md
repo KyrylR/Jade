@@ -135,6 +135,11 @@ The runners support both bounded host/test execution with `run_until_stop` and
 unbounded firmware execution with `run_until_hook_stop`, so production glue can
 run until the hook layer requests shutdown without inventing a synthetic tick
 limit.
+The target crates also expose `run_board_stream_loop_from_storage` and
+`run_board_stream_loop_with_nvs_storage` helpers, which are the current
+Rust-side `app_main` contract: pass the concrete platform shim, concrete NVS
+backend, target stream storage, and loop hooks, then let the firmware crate
+construct and run the boot-gated stream loop.
 Those runners also have startup constructors over named buffer bundles,
 `Esp32BoardStreamBuffers` and `Esp32s3BoardStreamBuffers`, plus NVS-backed
 `new_with_nvs` constructors. This gives board startup code one typed object

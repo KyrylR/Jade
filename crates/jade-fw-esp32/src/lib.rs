@@ -203,6 +203,12 @@ pub enum Esp32BoardLoopError {
     Tick(FirmwareFrameError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Esp32BoardEntrypointError {
+    App(Esp32BoardAppError),
+    Loop(Esp32BoardLoopError),
+}
+
 pub trait Esp32BoardLoopHooks {
     fn next_inputs(&mut self) -> Esp32BoardLoopInputs {
         Esp32BoardLoopInputs::default()
@@ -242,6 +248,43 @@ where
         .validate_ota_request(&request)
         .map_err(Esp32OtaStartError::Partition)?;
     OtaWriteSession::begin(writer, request).map_err(Esp32OtaStartError::Writer)
+}
+
+pub fn run_board_stream_loop_from_storage<P, B, H>(
+    platform: P,
+    storage_backend: B,
+    storage: &mut Esp32BoardStreamStorage,
+    hooks: &mut H,
+) -> Result<Esp32BoardLoopRun, Esp32BoardEntrypointError>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+    H: Esp32BoardLoopHooks,
+{
+    let mut event_loop = Esp32BoardStreamLoop::new_from_storage(platform, storage_backend, storage)
+        .map_err(Esp32BoardEntrypointError::App)?;
+    event_loop
+        .run_until_hook_stop(hooks)
+        .map_err(Esp32BoardEntrypointError::Loop)
+}
+
+pub fn run_board_stream_loop_with_nvs_storage<P, B, H>(
+    platform: P,
+    nvs_backend: B,
+    storage: &mut Esp32BoardStreamStorage,
+    hooks: &mut H,
+) -> Result<Esp32BoardLoopRun, Esp32BoardEntrypointError>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+    H: Esp32BoardLoopHooks,
+{
+    run_board_stream_loop_from_storage(
+        platform,
+        jade_storage::NvsStorage::new(nvs_backend),
+        storage,
+        hooks,
+    )
 }
 
 #[derive(Debug)]
@@ -2349,6 +2392,31 @@ mod tests {
         assert_eq!(run.stop_reason, Esp32BoardLoopStopReason::Hook);
         assert_eq!(run.ticks, 1);
         assert_eq!(event_loop.app().runtime().platform().serial_tx.len(), 1);
+    }
+
+    #[test]
+    fn esp32_board_entrypoint_runs_from_nvs_and_static_storage() {
+        let mut storage = Esp32BoardStreamStorage::default();
+        let mut hooks = Esp32LoopTestHooks::new(2);
+
+        let run = run_board_stream_loop_with_nvs_storage(
+            TestPlatform::new(JADE_MANIFEST),
+            TestNvs::new(),
+            &mut storage,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run,
+            Esp32BoardLoopRun {
+                booted: true,
+                ticks: 2,
+                stop_reason: Esp32BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 2);
     }
 
     #[test]

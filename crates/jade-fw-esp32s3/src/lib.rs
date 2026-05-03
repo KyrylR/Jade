@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use jade_core::{
     AllocationBudget, CborFrameBuffer, DeviceBootFailure, DeviceFeatureSet, DeviceManifest,
@@ -249,6 +251,12 @@ pub enum Esp32s3BoardLoopError {
     Tick(FirmwareFrameError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Esp32s3BoardEntrypointError {
+    App(Esp32s3BoardAppError),
+    Loop(Esp32s3BoardLoopError),
+}
+
 pub trait Esp32s3BoardLoopHooks {
     fn next_inputs(&mut self) -> Esp32s3BoardLoopInputs {
         Esp32s3BoardLoopInputs::default()
@@ -288,6 +296,44 @@ where
         .validate_ota_request(&request)
         .map_err(Esp32s3OtaStartError::Partition)?;
     OtaWriteSession::begin(writer, request).map_err(Esp32s3OtaStartError::Writer)
+}
+
+pub fn run_board_stream_loop_from_storage<P, B, H>(
+    platform: P,
+    storage_backend: B,
+    storage: &mut Esp32s3BoardStreamStorage,
+    hooks: &mut H,
+) -> Result<Esp32s3BoardLoopRun, Esp32s3BoardEntrypointError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+    H: Esp32s3BoardLoopHooks,
+{
+    let mut event_loop =
+        Esp32s3BoardStreamLoop::new_from_storage(platform, storage_backend, storage)
+            .map_err(Esp32s3BoardEntrypointError::App)?;
+    event_loop
+        .run_until_hook_stop(hooks)
+        .map_err(Esp32s3BoardEntrypointError::Loop)
+}
+
+pub fn run_board_stream_loop_with_nvs_storage<P, B, H>(
+    platform: P,
+    nvs_backend: B,
+    storage: &mut Esp32s3BoardStreamStorage,
+    hooks: &mut H,
+) -> Result<Esp32s3BoardLoopRun, Esp32s3BoardEntrypointError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+    H: Esp32s3BoardLoopHooks,
+{
+    run_board_stream_loop_from_storage(
+        platform,
+        jade_storage::NvsStorage::new(nvs_backend),
+        storage,
+        hooks,
+    )
 }
 
 #[derive(Debug)]
@@ -2729,6 +2775,33 @@ mod tests {
         assert_eq!(Esp32s3BoardStreamStorage::USB_CAPACITY, RX_BUFFER_BYTES);
         assert_eq!(Esp32s3BoardStreamStorage::BLE_CAPACITY, RX_BUFFER_BYTES);
         assert_eq!(Esp32s3BoardStreamStorage::QR_CAPACITY, QR_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn s3_board_entrypoint_runs_from_nvs_and_static_storage() {
+        static STORAGE: std::sync::Mutex<Esp32s3BoardStreamStorage> =
+            std::sync::Mutex::new(Esp32s3BoardStreamStorage::new());
+        let mut storage = STORAGE.lock().unwrap();
+        let mut hooks = S3LoopTestHooks::new(2);
+
+        let run = run_board_stream_loop_with_nvs_storage(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            TestNvs::new(),
+            &mut storage,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run,
+            Esp32s3BoardLoopRun {
+                booted: true,
+                ticks: 2,
+                stop_reason: Esp32s3BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 2);
     }
 
     #[test]
