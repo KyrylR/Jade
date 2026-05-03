@@ -368,6 +368,24 @@ where
             stop_reason: Esp32BoardLoopStopReason::TickLimit,
         })
     }
+
+    pub fn run_until_hook_stop<H>(
+        &mut self,
+        hooks: &mut H,
+    ) -> Result<Esp32BoardLoopRun, Esp32BoardLoopError>
+    where
+        H: Esp32BoardLoopHooks,
+    {
+        loop {
+            if self.run_once(hooks)? == Esp32BoardLoopDecision::Stop {
+                return Ok(Esp32BoardLoopRun {
+                    booted: self.app.is_booted(),
+                    ticks: self.ticks,
+                    stop_reason: Esp32BoardLoopStopReason::Hook,
+                });
+            }
+        }
+    }
 }
 
 impl<'a, P, B> Esp32BoardStreamLoop<'a, P, Esp32NvsStorage<B>>
@@ -2249,6 +2267,45 @@ mod tests {
             1
         );
         assert_eq!(event_loop.app().runtime().platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_stream_loop_runs_without_tick_limit_until_hook_stop() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32BoardStreamApp::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+        app.runtime_mut().platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        app.runtime_mut().platform_mut().confirmation_decision = UserConfirmationDecision::Approved;
+
+        let mut event_loop = Esp32BoardStreamLoop::new(app);
+        let mut hooks = Esp32LoopTestHooks::new(2);
+        let run = event_loop.run_until_hook_stop(&mut hooks).unwrap();
+
+        assert_eq!(
+            run,
+            Esp32BoardLoopRun {
+                booted: true,
+                ticks: 2,
+                stop_reason: Esp32BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(event_loop.ticks(), 2);
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 2);
+        assert_eq!(event_loop.app().runtime().platform().serial_tx.len(), 1);
+        assert_eq!(
+            event_loop.app().runtime().platform().display_status_count,
+            2
+        );
+        assert_eq!(event_loop.app().runtime().platform().confirmation_count, 2);
     }
 
     #[test]

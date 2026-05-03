@@ -415,6 +415,24 @@ where
             stop_reason: Esp32s3BoardLoopStopReason::TickLimit,
         })
     }
+
+    pub fn run_until_hook_stop<H>(
+        &mut self,
+        hooks: &mut H,
+    ) -> Result<Esp32s3BoardLoopRun, Esp32s3BoardLoopError>
+    where
+        H: Esp32s3BoardLoopHooks,
+    {
+        loop {
+            if self.run_once(hooks)? == Esp32s3BoardLoopDecision::Stop {
+                return Ok(Esp32s3BoardLoopRun {
+                    booted: self.app.is_booted(),
+                    ticks: self.ticks,
+                    stop_reason: Esp32s3BoardLoopStopReason::Hook,
+                });
+            }
+        }
+    }
 }
 
 impl<'a, P, B> Esp32s3BoardStreamLoop<'a, P, Esp32s3NvsStorage<B>>
@@ -2632,6 +2650,47 @@ mod tests {
             1
         );
         assert_eq!(event_loop.app().runtime().platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn s3_board_stream_loop_runs_without_tick_limit_until_hook_stop() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut usb_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32s3BoardStreamApp::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut usb_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+        app.runtime_mut().platform_mut().usb_rx = Some(v1_request("u", "ping"));
+        app.runtime_mut().platform_mut().confirmation_decision = UserConfirmationDecision::Approved;
+
+        let mut event_loop = Esp32s3BoardStreamLoop::new(app);
+        let mut hooks = S3LoopTestHooks::new(2);
+        let run = event_loop.run_until_hook_stop(&mut hooks).unwrap();
+
+        assert_eq!(
+            run,
+            Esp32s3BoardLoopRun {
+                booted: true,
+                ticks: 2,
+                stop_reason: Esp32s3BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(event_loop.ticks(), 2);
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 2);
+        assert_eq!(event_loop.app().runtime().platform().usb_tx.len(), 1);
+        assert_eq!(
+            event_loop.app().runtime().platform().display_status_count,
+            2
+        );
+        assert_eq!(event_loop.app().runtime().platform().confirmation_count, 2);
     }
 
     #[test]

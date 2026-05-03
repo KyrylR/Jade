@@ -131,6 +131,10 @@ stream app owners with a boot-once/tick-many loop, hook-supplied UI inputs,
 per-tick reports, and explicit tick-error surfacing. A real `app_main` can now
 own platform drivers, static buffers, NVS, and a small hook object while
 delegating the repeated boot/tick/stop policy to the Rust firmware crate.
+The runners support both bounded host/test execution with `run_until_stop` and
+unbounded firmware execution with `run_until_hook_stop`, so production glue can
+run until the hook layer requests shutdown without inventing a synthetic tick
+limit.
 Those runners also have startup constructors over named buffer bundles,
 `Esp32BoardStreamBuffers` and `Esp32s3BoardStreamBuffers`, plus NVS-backed
 `new_with_nvs` constructors. This gives board startup code one typed object
