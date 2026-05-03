@@ -26,6 +26,8 @@ pub const MEMORY_BUDGET: DeviceMemoryBudget = DeviceMemoryBudget {
     stack_bytes: 24 * 1024,
     heap_bytes: 768 * 1024,
 };
+pub const RX_BUFFER_BYTES: usize = AllocationBudget::ESP32_SPIRAM.max_request_bytes;
+pub const QR_BUFFER_BYTES: usize = 1024;
 
 pub const JADE_V2_MANIFEST: DeviceManifest = DeviceManifest {
     target: DeviceTarget::JadeV2,
@@ -120,6 +122,12 @@ pub struct Esp32s3BoardTickReport<'a> {
     pub rollback_secure_version: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Esp32s3BoardAppError {
+    RxBufferTooSmall { required: usize, actual: usize },
+    QrBufferTooSmall { required: usize, actual: usize },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Esp32s3OtaStartError<E> {
     BootRequired,
@@ -141,6 +149,87 @@ where
         .validate_ota_request(&request)
         .map_err(Esp32s3OtaStartError::Partition)?;
     OtaWriteSession::begin(writer, request).map_err(Esp32s3OtaStartError::Writer)
+}
+
+#[derive(Debug)]
+pub struct Esp32s3BoardApp<'a, P, B> {
+    runtime: Esp32s3V1BoardRuntime<P, B>,
+    rx_buffer: &'a mut [u8],
+    qr_buffer: &'a mut [u8],
+}
+
+impl<'a, P, B> Esp32s3BoardApp<'a, P, B>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    pub fn new(
+        platform: P,
+        storage_backend: B,
+        rx_buffer: &'a mut [u8],
+        qr_buffer: &'a mut [u8],
+    ) -> Result<Self, Esp32s3BoardAppError> {
+        validate_board_buffers(rx_buffer, qr_buffer)?;
+        Ok(Self {
+            runtime: Esp32s3V1BoardRuntime::new(platform, storage_backend),
+            rx_buffer,
+            qr_buffer,
+        })
+    }
+
+    pub fn boot(&mut self) -> Result<jade_core::DeviceBootReport, DeviceRuntimeError> {
+        self.runtime.boot()
+    }
+
+    pub fn is_booted(&self) -> bool {
+        self.runtime.is_booted()
+    }
+
+    pub fn runtime(&self) -> &Esp32s3V1BoardRuntime<P, B> {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut Esp32s3V1BoardRuntime<P, B> {
+        &mut self.runtime
+    }
+
+    pub fn tick<'b>(
+        &'b mut self,
+        display_status: Option<DisplayStatus<'b>>,
+        confirmation: Option<UserConfirmation<'b>>,
+    ) -> Result<Esp32s3BoardTickReport<'b>, FirmwareFrameError> {
+        let Self {
+            runtime,
+            rx_buffer,
+            qr_buffer,
+        } = self;
+        runtime.tick(Esp32s3BoardTick {
+            rx_buffer: &mut **rx_buffer,
+            qr_buffer: Some(&mut **qr_buffer),
+            display_status,
+            confirmation,
+        })
+    }
+}
+
+impl<'a, P, B> Esp32s3BoardApp<'a, P, Esp32s3NvsStorage<B>>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+{
+    pub fn new_with_nvs(
+        platform: P,
+        nvs_backend: B,
+        rx_buffer: &'a mut [u8],
+        qr_buffer: &'a mut [u8],
+    ) -> Result<Self, Esp32s3BoardAppError> {
+        Self::new(
+            platform,
+            jade_storage::NvsStorage::new(nvs_backend),
+            rx_buffer,
+            qr_buffer,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -422,6 +511,25 @@ pub fn assert_manifest_matches_real_device(manifest: DeviceManifest) -> Result<(
         || !manifest.features.anti_rollback
     {
         return Err("esp32s3 target is missing release security gates");
+    }
+    Ok(())
+}
+
+pub fn validate_board_buffers(
+    rx_buffer: &[u8],
+    qr_buffer: &[u8],
+) -> Result<(), Esp32s3BoardAppError> {
+    if rx_buffer.len() < RX_BUFFER_BYTES {
+        return Err(Esp32s3BoardAppError::RxBufferTooSmall {
+            required: RX_BUFFER_BYTES,
+            actual: rx_buffer.len(),
+        });
+    }
+    if qr_buffer.len() < QR_BUFFER_BYTES {
+        return Err(Esp32s3BoardAppError::QrBufferTooSmall {
+            required: QR_BUFFER_BYTES,
+            actual: qr_buffer.len(),
+        });
     }
     Ok(())
 }
@@ -1314,6 +1422,77 @@ mod tests {
         assert_eq!(report.rollback_secure_version, 4);
         assert_eq!(board.platform().display_status_count, 1);
         assert_eq!(board.platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn s3_board_app_validates_static_buffer_sizes() {
+        let mut short_rx = Vec::new();
+        short_rx.resize(RX_BUFFER_BYTES - 1, 0);
+        let mut qr = Vec::new();
+        qr.resize(QR_BUFFER_BYTES, 0);
+        assert_eq!(
+            validate_board_buffers(&short_rx, &qr),
+            Err(Esp32s3BoardAppError::RxBufferTooSmall {
+                required: RX_BUFFER_BYTES,
+                actual: RX_BUFFER_BYTES - 1,
+            })
+        );
+
+        let mut rx = Vec::new();
+        rx.resize(RX_BUFFER_BYTES, 0);
+        let mut short_qr = Vec::new();
+        short_qr.resize(QR_BUFFER_BYTES - 1, 0);
+        assert_eq!(
+            validate_board_buffers(&rx, &short_qr),
+            Err(Esp32s3BoardAppError::QrBufferTooSmall {
+                required: QR_BUFFER_BYTES,
+                actual: QR_BUFFER_BYTES - 1,
+            })
+        );
+
+        assert_eq!(validate_board_buffers(&rx, &qr), Ok(()));
+    }
+
+    #[test]
+    fn s3_board_app_ticks_runtime_with_fixed_buffers() {
+        let mut rx = Vec::new();
+        rx.resize(RX_BUFFER_BYTES, 0);
+        let mut qr = Vec::new();
+        qr.resize(QR_BUFFER_BYTES, 0);
+        let mut app = Esp32s3BoardApp::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut rx,
+            &mut qr,
+        )
+        .unwrap();
+        app.runtime_mut().platform_mut().usb_rx = Some(v1_request("u", "ping"));
+        app.runtime_mut().platform_mut().camera_rx = Some(b"ur:bytes/s3-app".to_vec());
+        app.runtime_mut().platform_mut().touch_rx = Some(TouchEvent::Press { x: 10, y: 20 });
+        app.runtime_mut().platform_mut().monotonic_millis = 77;
+        app.runtime_mut().platform_mut().rollback_secure_version = 5;
+
+        assert!(matches!(
+            app.tick(Some(DisplayStatus::Busy("app")), None),
+            Err(FirmwareFrameError::BootRequired)
+        ));
+        app.boot().unwrap();
+        let report = app.tick(Some(DisplayStatus::Busy("app")), None).unwrap();
+
+        assert_eq!(
+            report.transports,
+            Esp32s3V1PollReport {
+                serial: false,
+                usb: true,
+                ble: false,
+            }
+        );
+        assert_eq!(report.qr_payload, Some(&b"ur:bytes/s3-app"[..]));
+        assert_eq!(report.touch, Some(TouchEvent::Press { x: 10, y: 20 }));
+        assert_eq!(report.monotonic_millis, 77);
+        assert_eq!(report.rollback_secure_version, 5);
+        assert_eq!(app.runtime().platform().usb_tx.len(), 1);
+        assert_eq!(app.runtime().platform().display_status_count, 1);
     }
 
     #[test]

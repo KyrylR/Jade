@@ -92,6 +92,15 @@ loops now begin OTA through the boot-gated runtime wrapper before streaming
 chunks through `OtaWriteSession<W>`. This is the entrypoint shape expected by a
 real board event loop.
 
+The firmware crates now also provide board-app owners for the real entrypoint
+shape: `Esp32BoardApp<'_, P, B>` and `Esp32s3BoardApp<'_, P, B>`. These types
+own the bootable full-v1 runtime and borrow fixed RX/QR scratch buffers supplied
+by board startup code. They validate those buffers before boot using the target
+allocation budgets (`17 KiB` RX on ESP32, `401 KiB` RX on ESP32-S3/SPIRAM, and
+`1024` bytes for QR payloads), then expose a single `boot` + `tick` flow. This
+keeps the production `app_main` boundary concrete without forcing the Rust core
+to know whether the buffers came from static memory, heap, or a HAL allocator.
+
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
 conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, create
