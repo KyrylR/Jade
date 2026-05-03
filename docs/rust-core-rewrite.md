@@ -256,6 +256,15 @@ board-app owners now expose that same boot-gated path, including the verified
 variant. The remaining board work is the concrete ESP OTA writer/verifier that
 maps these traits to the device OTA slot APIs and signed-image verification
 path.
+The v1 compatibility engine now also routes the public `ota`, `ota_data`, and
+`ota_complete` CBOR-RPC flow through `RuntimePlatform` OTA hooks. Host tests
+still keep an in-memory session for differential behavior, but device platforms
+can now start the platform OTA writer from the `ota` request, stream each
+compressed chunk with its offset from `ota_data`, finish after `ota_complete`,
+and abort the platform writer on protocol or hash failure. The ESP32 and
+ESP32-S3 hardware adapters forward those hooks to raw hardware methods, and
+target tests drive real v1 CBOR OTA messages through the full Rust v1 runtime
+into those hardware hooks.
 
 `jade-fw-esp32s3` now has a hardware-attestation platform boundary for the real
 device-specific key path: `sign_hardware_attestation` asks the platform shim

@@ -3463,6 +3463,10 @@ where
             }
         };
 
+        if let Err(err) = self.platform.ota_begin(&request) {
+            return reject_core_error(err);
+        }
+
         self.ota = Some(HostOtaSession {
             request,
             received_compressed: 0,
@@ -3494,6 +3498,13 @@ where
         };
         if next_received > session.request.compressed_size {
             return bad_parameters("Invalid OTA data");
+        }
+
+        if let Err(err) = self.platform.ota_write(session.received_compressed, data) {
+            self.platform.ota_abort();
+            self.ota = None;
+            self.state.operation = OperationState::Idle;
+            return reject_core_error(err);
         }
 
         session.compressed_hasher.update(data);
@@ -3531,6 +3542,7 @@ where
         self.state.operation = OperationState::Idle;
 
         if session.received_compressed != session.request.compressed_size {
+            self.platform.ota_abort();
             return V1Outcome::Reject {
                 code: ErrorCode::ProtocolError,
                 message: "Error completing OTA".to_string(),
@@ -3541,11 +3553,20 @@ where
             let calculated: [u8; jade_core::OTA_HASH_LEN] =
                 session.compressed_hasher.finalize().into();
             if calculated != session.request.expected_hash {
+                self.platform.ota_abort();
                 return V1Outcome::Reject {
                     code: ErrorCode::InternalError,
                     message: "Error completing OTA".to_string(),
                 };
             }
+        }
+
+        if let Err(err) = self
+            .platform
+            .ota_finish(&session.request, session.received_compressed)
+        {
+            self.platform.ota_abort();
+            return reject_core_error(err);
         }
 
         V1Outcome::BoolResult { result: true }
@@ -6874,6 +6895,10 @@ pub trait RuntimePlatform: Platform {
     fn debug_capture_image_data(&self) -> Option<&[u8]>;
     fn debug_capture_image_contains_qr(&self) -> bool;
     fn debug_scan_qr_result_for_image(&self, image_data: &[u8]) -> Option<Vec<u8>>;
+    fn ota_begin(&mut self, request: &OtaRequest) -> CoreResult<()>;
+    fn ota_write(&mut self, offset: u64, data: &[u8]) -> CoreResult<()>;
+    fn ota_finish(&mut self, request: &OtaRequest, received_compressed: u64) -> CoreResult<()>;
+    fn ota_abort(&mut self);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7107,6 +7132,24 @@ pub trait RuntimePlatformStateAccess: Platform {
     fn runtime_current_epoch(&self) -> Option<u64> {
         None
     }
+
+    fn runtime_ota_begin(&mut self, _request: &OtaRequest) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn runtime_ota_write(&mut self, _offset: u64, _data: &[u8]) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn runtime_ota_finish(
+        &mut self,
+        _request: &OtaRequest,
+        _received_compressed: u64,
+    ) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn runtime_ota_abort(&mut self) {}
 }
 
 impl<T> RuntimePlatform for T
@@ -7230,6 +7273,22 @@ where
         self.runtime_state()
             .debug_scan_qr_result_for_image(image_data)
     }
+
+    fn ota_begin(&mut self, request: &OtaRequest) -> CoreResult<()> {
+        self.runtime_ota_begin(request)
+    }
+
+    fn ota_write(&mut self, offset: u64, data: &[u8]) -> CoreResult<()> {
+        self.runtime_ota_write(offset, data)
+    }
+
+    fn ota_finish(&mut self, request: &OtaRequest, received_compressed: u64) -> CoreResult<()> {
+        self.runtime_ota_finish(request, received_compressed)
+    }
+
+    fn ota_abort(&mut self) {
+        self.runtime_ota_abort();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7238,6 +7297,10 @@ pub struct HostPlatform {
     entropy_bytes_received: usize,
     epoch: Option<u64>,
     runtime: RuntimePlatformState,
+    ota_begun: Option<OtaRequest>,
+    ota_writes: Vec<(u64, Vec<u8>)>,
+    ota_finished: Option<(OtaRequest, u64)>,
+    ota_aborted: bool,
 }
 
 impl Default for HostPlatform {
@@ -7247,6 +7310,10 @@ impl Default for HostPlatform {
             entropy_bytes_received: 0,
             epoch: None,
             runtime: RuntimePlatformState::default(),
+            ota_begun: None,
+            ota_writes: Vec::new(),
+            ota_finished: None,
+            ota_aborted: false,
         }
     }
 }
@@ -7270,6 +7337,22 @@ impl HostPlatform {
 
     pub fn runtime_state_mut(&mut self) -> &mut RuntimePlatformState {
         &mut self.runtime
+    }
+
+    pub fn ota_begun(&self) -> Option<OtaRequest> {
+        self.ota_begun
+    }
+
+    pub fn ota_writes(&self) -> &[(u64, Vec<u8>)] {
+        &self.ota_writes
+    }
+
+    pub fn ota_finished(&self) -> Option<(OtaRequest, u64)> {
+        self.ota_finished
+    }
+
+    pub fn ota_aborted(&self) -> bool {
+        self.ota_aborted
     }
 
     pub fn wallet_seed(&self) -> Option<&[u8]> {
@@ -7329,6 +7412,32 @@ impl RuntimePlatformStateAccess for HostPlatform {
 
     fn runtime_current_epoch(&self) -> Option<u64> {
         self.epoch
+    }
+
+    fn runtime_ota_begin(&mut self, request: &OtaRequest) -> CoreResult<()> {
+        self.ota_begun = Some(*request);
+        self.ota_writes.clear();
+        self.ota_finished = None;
+        self.ota_aborted = false;
+        Ok(())
+    }
+
+    fn runtime_ota_write(&mut self, offset: u64, data: &[u8]) -> CoreResult<()> {
+        self.ota_writes.push((offset, data.to_vec()));
+        Ok(())
+    }
+
+    fn runtime_ota_finish(
+        &mut self,
+        request: &OtaRequest,
+        received_compressed: u64,
+    ) -> CoreResult<()> {
+        self.ota_finished = Some((*request, received_compressed));
+        Ok(())
+    }
+
+    fn runtime_ota_abort(&mut self) {
+        self.ota_aborted = true;
     }
 }
 
@@ -12644,11 +12753,20 @@ mod tests {
             method: Cow::Borrowed("ota"),
             params: Some(&params),
         };
+        let expected_ota = OtaRequest::full(
+            10,
+            upload.len() as u64,
+            None,
+            Some(compressed_hash.into()),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(
             emulator.handle_v1_request(&request),
             V1Outcome::BoolResult { result: true }
         );
+        assert_eq!(emulator.platform().ota_begun(), Some(expected_ota));
         assert!(matches!(
             emulator.state.operation,
             OperationState::Ota { .. }
@@ -12676,6 +12794,7 @@ mod tests {
                 ],
             }
         );
+        assert_eq!(emulator.platform().ota_writes(), &[(0, b"a".to_vec())]);
 
         let mut chunk = Vec::new();
         minicbor::Encoder::new(&mut chunk).bytes(b"bc").unwrap();
@@ -12699,6 +12818,10 @@ mod tests {
                 ],
             }
         );
+        assert_eq!(
+            emulator.platform().ota_writes(),
+            &[(0, b"a".to_vec()), (1, b"bc".to_vec())]
+        );
 
         let complete_request = Request {
             id: Cow::Borrowed("ota-complete"),
@@ -12710,6 +12833,11 @@ mod tests {
             V1Outcome::BoolResult { result: true }
         );
         assert_eq!(emulator.state.operation, OperationState::Idle);
+        assert_eq!(
+            emulator.platform().ota_finished(),
+            Some((expected_ota, upload.len() as u64))
+        );
+        assert!(!emulator.platform().ota_aborted());
     }
 
     #[test]
@@ -12804,6 +12932,7 @@ mod tests {
             }
         );
         assert_eq!(emulator.state.operation, OperationState::Idle);
+        assert!(emulator.platform().ota_aborted());
 
         assert_eq!(
             emulator.handle_v1_request(&complete_request),

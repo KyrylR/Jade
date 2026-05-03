@@ -128,6 +128,16 @@ pub trait Esp32s3Hardware {
     fn current_epoch(&self) -> Option<u64> {
         None
     }
+    fn ota_begin(&mut self, _request: &OtaRequest) -> CoreResult<()> {
+        Ok(())
+    }
+    fn ota_write(&mut self, _offset: u64, _data: &[u8]) -> CoreResult<()> {
+        Ok(())
+    }
+    fn ota_finish(&mut self, _request: &OtaRequest, _received_compressed: u64) -> CoreResult<()> {
+        Ok(())
+    }
+    fn ota_abort(&mut self) {}
     fn serial_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure>;
     fn serial_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
     fn usb_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure>;
@@ -230,6 +240,26 @@ impl<H: Esp32s3Hardware> RuntimePlatformStateAccess for Esp32s3DevicePlatform<H>
 
     fn runtime_current_epoch(&self) -> Option<u64> {
         self.hardware.current_epoch()
+    }
+
+    fn runtime_ota_begin(&mut self, request: &OtaRequest) -> CoreResult<()> {
+        self.hardware.ota_begin(request)
+    }
+
+    fn runtime_ota_write(&mut self, offset: u64, data: &[u8]) -> CoreResult<()> {
+        self.hardware.ota_write(offset, data)
+    }
+
+    fn runtime_ota_finish(
+        &mut self,
+        request: &OtaRequest,
+        received_compressed: u64,
+    ) -> CoreResult<()> {
+        self.hardware.ota_finish(request, received_compressed)
+    }
+
+    fn runtime_ota_abort(&mut self) {
+        self.hardware.ota_abort();
     }
 }
 
@@ -1958,6 +1988,10 @@ mod tests {
         rollback_secure_version: u32,
         running_image: Option<DeviceRunningImage>,
         mark_valid_count: usize,
+        ota_begun: Option<OtaRequest>,
+        ota_writes: Vec<(u64, Vec<u8>)>,
+        ota_finished: Option<(OtaRequest, u64)>,
+        ota_aborted: bool,
         attestation_available: bool,
         attestation_pubkey_pem: Option<Vec<u8>>,
         attestation_ext_signature: Option<Vec<u8>>,
@@ -2148,6 +2182,10 @@ mod tests {
                 rollback_secure_version: 1,
                 running_image: None,
                 mark_valid_count: 0,
+                ota_begun: None,
+                ota_writes: Vec::new(),
+                ota_finished: None,
+                ota_aborted: false,
                 attestation_available: true,
                 attestation_pubkey_pem: None,
                 attestation_ext_signature: None,
@@ -2385,6 +2423,28 @@ mod tests {
 
         fn current_epoch(&self) -> Option<u64> {
             self.epoch
+        }
+
+        fn ota_begin(&mut self, request: &OtaRequest) -> CoreResult<()> {
+            self.ota_begun = Some(*request);
+            self.ota_writes.clear();
+            self.ota_finished = None;
+            self.ota_aborted = false;
+            Ok(())
+        }
+
+        fn ota_write(&mut self, offset: u64, data: &[u8]) -> CoreResult<()> {
+            self.ota_writes.push((offset, data.to_vec()));
+            Ok(())
+        }
+
+        fn ota_finish(&mut self, request: &OtaRequest, received_compressed: u64) -> CoreResult<()> {
+            self.ota_finished = Some((*request, received_compressed));
+            Ok(())
+        }
+
+        fn ota_abort(&mut self) {
+            self.ota_aborted = true;
         }
 
         fn serial_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
@@ -4016,6 +4076,47 @@ mod tests {
     }
 
     #[test]
+    fn s3_full_v1_ota_flow_reaches_hardware_ota_hooks() {
+        let expected_hash = [0x11; jade_core::OTA_HASH_LEN];
+        let expected_request = OtaRequest::full(10, 3, Some(expected_hash), None, false).unwrap();
+        let mut runtime = v1_runtime_for_v2(
+            Esp32s3DevicePlatform::new(TestPlatform::new(JADE_V2_MANIFEST)),
+            jade_storage::MemoryStorage::new(),
+        );
+
+        assert_v1_bool_result(
+            &runtime.handle_v1_cbor(&v1_ota_start_request("ota", expected_hash)),
+            "ota",
+            true,
+        );
+        assert_eq!(
+            runtime.runtime_platform().hardware().ota_begun,
+            Some(expected_request)
+        );
+
+        assert_v1_bool_result(
+            &runtime.handle_v1_cbor(&v1_ota_data_request("ota-data", b"abc")),
+            "ota-data",
+            true,
+        );
+        assert_eq!(
+            runtime.runtime_platform().hardware().ota_writes,
+            vec![(0, b"abc".to_vec())]
+        );
+
+        assert_v1_bool_result(
+            &runtime.handle_v1_cbor(&v1_request("ota-complete", "ota_complete")),
+            "ota-complete",
+            true,
+        );
+        assert_eq!(
+            runtime.runtime_platform().hardware().ota_finished,
+            Some((expected_request, 3))
+        );
+        assert!(!runtime.runtime_platform().hardware().ota_aborted);
+    }
+
+    #[test]
     fn s3_full_v1_transport_enforces_manifest_allocation_budget() {
         let request = v1_request("p", "ping");
         let mut request_runtime = v1_runtime_for_v2(
@@ -4145,6 +4246,49 @@ mod tests {
             .and_then(|encoder| encoder.str(method))
             .expect("Vec-backed CBOR encoding is infallible");
         output
+    }
+
+    fn v1_ota_start_request(id: &str, expected_hash: [u8; jade_core::OTA_HASH_LEN]) -> Vec<u8> {
+        let mut output = Vec::new();
+        Encoder::new(&mut output)
+            .map(3)
+            .and_then(|encoder| encoder.str("id"))
+            .and_then(|encoder| encoder.str(id))
+            .and_then(|encoder| encoder.str("method"))
+            .and_then(|encoder| encoder.str("ota"))
+            .and_then(|encoder| encoder.str("params"))
+            .and_then(|encoder| encoder.map(3))
+            .and_then(|encoder| encoder.str("fwsize"))
+            .and_then(|encoder| encoder.u64(10))
+            .and_then(|encoder| encoder.str("cmpsize"))
+            .and_then(|encoder| encoder.u64(3))
+            .and_then(|encoder| encoder.str("fwhash"))
+            .and_then(|encoder| encoder.bytes(&expected_hash))
+            .expect("Vec-backed CBOR encoding is infallible");
+        output
+    }
+
+    fn v1_ota_data_request(id: &str, data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        Encoder::new(&mut output)
+            .map(3)
+            .and_then(|encoder| encoder.str("id"))
+            .and_then(|encoder| encoder.str(id))
+            .and_then(|encoder| encoder.str("method"))
+            .and_then(|encoder| encoder.str("ota_data"))
+            .and_then(|encoder| encoder.str("params"))
+            .and_then(|encoder| encoder.bytes(data))
+            .expect("Vec-backed CBOR encoding is infallible");
+        output
+    }
+
+    fn assert_v1_bool_result(response: &[u8], id: &str, result: bool) {
+        let mut decoder = Decoder::new(response);
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "id");
+        assert_eq!(decoder.str().unwrap(), id);
+        assert_eq!(decoder.str().unwrap(), "result");
+        assert_eq!(decoder.bool().unwrap(), result);
     }
 
     fn v2_ping_request(id: &str) -> Vec<u8> {
