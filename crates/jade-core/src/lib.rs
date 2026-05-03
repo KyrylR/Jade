@@ -25,7 +25,9 @@ pub use device::{
 };
 pub use firmware::{handle_v1_cbor, FirmwareFrameError, FirmwareProtocol};
 pub use jade_protocol_v2::{NetworkRestriction, VersionDebugInfo, VersionInfo, VersionInfoState};
-pub use ota::{OtaHashType, OtaKind, OtaRequest, OTA_HASH_LEN};
+pub use ota::{
+    OtaHashType, OtaImageWriter, OtaKind, OtaRequest, OtaWriteError, OtaWriteSession, OTA_HASH_LEN,
+};
 pub use platform::Platform;
 pub use state::{InterfaceKind, InterfaceSession, OperationState, WalletLifecycle};
 

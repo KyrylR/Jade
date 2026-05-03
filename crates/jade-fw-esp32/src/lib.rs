@@ -6,7 +6,8 @@ extern crate alloc;
 use jade_core::{
     AllocationBudget, DeviceBootFailure, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
     DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
-    FirmwareFrameError, FirmwareProtocol,
+    FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
+    OtaWriteSession,
 };
 
 pub const TARGET_SOC: &str = "esp32";
@@ -50,6 +51,29 @@ pub trait Esp32PlatformShim: DevicePlatform {
 
 pub type Esp32Runtime<P> = DeviceRuntime<P>;
 pub type Esp32V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
+pub type Esp32OtaSession<W> = OtaWriteSession<W>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Esp32OtaStartError<E> {
+    Manifest(&'static str),
+    Partition(jade_core::DeviceOtaError),
+    Writer(OtaWriteError<E>),
+}
+
+pub fn begin_ota_update<W>(
+    manifest: DeviceManifest,
+    writer: W,
+    request: OtaRequest,
+) -> Result<Esp32OtaSession<W>, Esp32OtaStartError<W::Error>>
+where
+    W: OtaImageWriter,
+{
+    assert_manifest_matches_real_device(manifest).map_err(Esp32OtaStartError::Manifest)?;
+    manifest
+        .validate_ota_request(&request)
+        .map_err(Esp32OtaStartError::Partition)?;
+    OtaWriteSession::begin(writer, request).map_err(Esp32OtaStartError::Writer)
+}
 
 #[derive(Debug)]
 pub struct Esp32V1BoardRuntime<P, B> {
@@ -327,6 +351,52 @@ mod tests {
         ble_tx: Vec<Vec<u8>>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestOtaWriter {
+        writes: Vec<(u64, Vec<u8>)>,
+        begun: bool,
+        finished: bool,
+        aborted: bool,
+    }
+
+    impl TestOtaWriter {
+        fn new() -> Self {
+            Self {
+                writes: Vec::new(),
+                begun: false,
+                finished: false,
+                aborted: false,
+            }
+        }
+    }
+
+    impl OtaImageWriter for TestOtaWriter {
+        type Error = DeviceBootFailure;
+
+        fn begin(&mut self, _request: &OtaRequest) -> Result<(), Self::Error> {
+            self.begun = true;
+            Ok(())
+        }
+
+        fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
+            self.writes.push((offset, data.to_vec()));
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _request: &OtaRequest,
+            _received_compressed: u64,
+        ) -> Result<(), Self::Error> {
+            self.finished = true;
+            Ok(())
+        }
+
+        fn abort(&mut self) {
+            self.aborted = true;
+        }
+    }
+
     impl TestPlatform {
         fn new(manifest: DeviceManifest) -> Self {
             Self {
@@ -455,6 +525,38 @@ mod tests {
         assert_eq!(runtime.boot().unwrap().target, DeviceTarget::Jade);
         assert!(runtime.is_booted());
         assert_eq!(runtime.version_info().board_type, Cow::Borrowed("jade"));
+    }
+
+    #[test]
+    fn esp32_ota_update_uses_manifest_slot_gate_before_writer() {
+        let request = OtaRequest::full(
+            1_000,
+            600,
+            Some([0x11; jade_core::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut session = begin_ota_update(JADE_MANIFEST, TestOtaWriter::new(), request).unwrap();
+        assert!(session.writer().begun);
+        assert_eq!(session.write(&[0; 600]).unwrap(), 100);
+        let writer = session.finish().unwrap();
+        assert!(writer.finished);
+
+        let too_large = OtaRequest::full(
+            JADE_MANIFEST.partitions.ota_app_bytes as u64 + 1,
+            600,
+            Some([0x11; jade_core::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            begin_ota_update(JADE_MANIFEST, TestOtaWriter::new(), too_large),
+            Err(Esp32OtaStartError::Partition(
+                jade_core::DeviceOtaError::FirmwareTooLarge
+            ))
+        ));
     }
 
     #[test]

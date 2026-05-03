@@ -25,6 +25,111 @@ pub struct OtaRequest {
     pub extended_replies: bool,
 }
 
+pub trait OtaImageWriter {
+    type Error;
+
+    fn begin(&mut self, request: &OtaRequest) -> Result<(), Self::Error>;
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
+    fn finish(&mut self, request: &OtaRequest, received_compressed: u64)
+        -> Result<(), Self::Error>;
+    fn abort(&mut self);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtaWriteError<E> {
+    Writer(E),
+    TooMuchData,
+    IncompleteUpload,
+    Finalized,
+}
+
+#[derive(Debug)]
+pub struct OtaWriteSession<W> {
+    request: OtaRequest,
+    received_compressed: u64,
+    writer: W,
+    finalized: bool,
+}
+
+impl<W> OtaWriteSession<W>
+where
+    W: OtaImageWriter,
+{
+    pub fn begin(mut writer: W, request: OtaRequest) -> Result<Self, OtaWriteError<W::Error>> {
+        writer.begin(&request).map_err(OtaWriteError::Writer)?;
+        Ok(Self {
+            request,
+            received_compressed: 0,
+            writer,
+            finalized: false,
+        })
+    }
+
+    pub fn request(&self) -> &OtaRequest {
+        &self.request
+    }
+
+    pub fn received_compressed(&self) -> u64 {
+        self.received_compressed
+    }
+
+    pub fn progress_percent(&self) -> u64 {
+        self.request
+            .upload_progress_percent(self.received_compressed)
+    }
+
+    pub fn writer(&self) -> &W {
+        &self.writer
+    }
+
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> Result<u64, OtaWriteError<W::Error>> {
+        if self.finalized {
+            return Err(OtaWriteError::Finalized);
+        }
+
+        let next = self
+            .received_compressed
+            .checked_add(data.len() as u64)
+            .ok_or(OtaWriteError::TooMuchData)?;
+        if next > self.request.compressed_size {
+            return Err(OtaWriteError::TooMuchData);
+        }
+
+        self.writer
+            .write(self.received_compressed, data)
+            .map_err(OtaWriteError::Writer)?;
+        self.received_compressed = next;
+        Ok(self.progress_percent())
+    }
+
+    pub fn finish(mut self) -> Result<W, OtaWriteError<W::Error>> {
+        if self.finalized {
+            return Err(OtaWriteError::Finalized);
+        }
+        if self.received_compressed != self.request.compressed_size {
+            return Err(OtaWriteError::IncompleteUpload);
+        }
+
+        self.writer
+            .finish(&self.request, self.received_compressed)
+            .map_err(OtaWriteError::Writer)?;
+        self.finalized = true;
+        Ok(self.writer)
+    }
+
+    pub fn abort(mut self) -> W {
+        if !self.finalized {
+            self.writer.abort();
+            self.finalized = true;
+        }
+        self.writer
+    }
+}
+
 impl OtaRequest {
     pub fn full(
         firmware_size: u64,
@@ -157,5 +262,103 @@ mod tests {
             OtaRequest::full(1_000, 600, None, None, false),
             Err(CoreError::BadParameters)
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestWriteError {
+        Fail,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestWriter {
+        writes: alloc::vec::Vec<(u64, alloc::vec::Vec<u8>)>,
+        begun: bool,
+        finished: bool,
+        aborted: bool,
+        fail_write: bool,
+    }
+
+    impl TestWriter {
+        fn new() -> Self {
+            Self {
+                writes: alloc::vec::Vec::new(),
+                begun: false,
+                finished: false,
+                aborted: false,
+                fail_write: false,
+            }
+        }
+    }
+
+    impl OtaImageWriter for TestWriter {
+        type Error = TestWriteError;
+
+        fn begin(&mut self, _request: &OtaRequest) -> Result<(), Self::Error> {
+            self.begun = true;
+            Ok(())
+        }
+
+        fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
+            if self.fail_write {
+                return Err(TestWriteError::Fail);
+            }
+            self.writes.push((offset, data.to_vec()));
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _request: &OtaRequest,
+            _received_compressed: u64,
+        ) -> Result<(), Self::Error> {
+            self.finished = true;
+            Ok(())
+        }
+
+        fn abort(&mut self) {
+            self.aborted = true;
+        }
+    }
+
+    #[test]
+    fn ota_write_session_streams_chunks_with_offsets_and_progress() {
+        let request =
+            OtaRequest::full(1_000, 600, None, Some([0x22; OTA_HASH_LEN]), false).unwrap();
+        let mut session = OtaWriteSession::begin(TestWriter::new(), request).unwrap();
+
+        assert!(session.writer().begun);
+        assert_eq!(session.write(&[1; 150]).unwrap(), 25);
+        assert_eq!(session.write(&[2; 450]).unwrap(), 100);
+        assert_eq!(
+            session.writer().writes,
+            alloc::vec![(0, alloc::vec![1; 150]), (150, alloc::vec![2; 450])]
+        );
+
+        let writer = session.finish().unwrap();
+        assert!(writer.finished);
+        assert!(!writer.aborted);
+    }
+
+    #[test]
+    fn ota_write_session_rejects_overflow_and_incomplete_finish() {
+        let request =
+            OtaRequest::full(1_000, 600, None, Some([0x22; OTA_HASH_LEN]), false).unwrap();
+        let mut session = OtaWriteSession::begin(TestWriter::new(), request).unwrap();
+
+        assert_eq!(session.write(&[0; 601]), Err(OtaWriteError::TooMuchData));
+        assert_eq!(session.write(&[0; 300]).unwrap(), 50);
+        assert_eq!(session.finish(), Err(OtaWriteError::IncompleteUpload));
+    }
+
+    #[test]
+    fn ota_write_session_aborts_unfinished_writer() {
+        let request =
+            OtaRequest::full(1_000, 600, None, Some([0x22; OTA_HASH_LEN]), false).unwrap();
+        let mut session = OtaWriteSession::begin(TestWriter::new(), request).unwrap();
+        session.write(&[0; 300]).unwrap();
+
+        let writer = session.abort();
+        assert!(writer.aborted);
+        assert!(!writer.finished);
     }
 }

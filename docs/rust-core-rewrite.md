@@ -111,6 +111,15 @@ compressed uploads, and delta patches that do not fit the configured OTA slot,
 making partition fit a shared core release gate instead of a late board-script
 check.
 
+`jade-core::OtaWriteSession<W>` now provides the generic Rust OTA writer
+lifecycle over a platform `OtaImageWriter`: begin, stream compressed chunks with
+offset and byte-count checks, finalize only after the declared compressed size
+has arrived, and abort unfinished uploads. The ESP32 and ESP32-S3 firmware
+crates expose `begin_ota_update` helpers that first assert the official target
+manifest and OTA partition fit, then start the platform writer. The remaining
+board work is the concrete ESP OTA writer that maps this trait to the device
+OTA slot APIs and signed-image verification path.
+
 ## State Domains
 
 The Rust core models state as orthogonal domains:
