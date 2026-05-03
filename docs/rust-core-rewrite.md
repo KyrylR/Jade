@@ -130,9 +130,11 @@ The hard parts are hard for concrete compatibility reasons:
   logout, OTA metadata flow, pinserver update/reset, attestation
   registration/signing request validation plus RustCrypto RSA PKCS#1 v1.5
   SHA-256 signing behind host platform state, and debug seed/mnemonic
-  injection. ESP32-S3 eFuse/DS burning remains a target firmware platform
-  shim, but the v1 core response shape and signing semantics no longer require
-  Jade-owned C application code.
+  injection. Adapter-only debug handshake, QR image capture, and QR scan calls
+  now route through Rust host platform byte hooks instead of the C debug
+  handlers. ESP32-S3 eFuse/DS burning and real camera/QR backends remain target
+  firmware platform shims, but the v1 core response shapes and request
+  validation no longer require Jade-owned C application code.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
   BIP85 RSA public-key PEM export and RSA-PSS digest signing, P-256 identity
   pubkey/sign/ECDH, OTP storage,

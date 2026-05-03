@@ -232,6 +232,15 @@ impl Emulator {
             Some(MethodClass::Debug) if request.method == "debug_selfcheck" => {
                 V1Outcome::UintResult { result: 0 }
             }
+            Some(MethodClass::Debug) if request.method == "debug_handshake" => {
+                self.debug_handshake_result()
+            }
+            Some(MethodClass::Debug) if request.method == "debug_scan_qr" => {
+                self.debug_scan_qr_result(request)
+            }
+            Some(MethodClass::Debug) if request.method == "debug_capture_image_data" => {
+                self.debug_capture_image_data_result(request)
+            }
             Some(MethodClass::Debug) if request.method == "debug_set_mnemonic" => {
                 self.debug_set_mnemonic(request)
             }
@@ -3680,6 +3689,60 @@ impl Emulator {
         }
     }
 
+    fn debug_handshake_result(&mut self) -> V1Outcome {
+        self.platform.debug_handshake_count = self.platform.debug_handshake_count.saturating_add(1);
+        V1Outcome::BoolResult { result: true }
+    }
+
+    fn debug_capture_image_data_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let check_qr = params.bool("check_qr").ok().flatten().unwrap_or(false);
+
+        let Some(image) = &self.platform.debug_capture_image_data else {
+            return V1Outcome::Reject {
+                code: ErrorCode::UserCancelled,
+                message: "User declined to capture image".to_string(),
+            };
+        };
+        if check_qr && !self.platform.debug_capture_image_contains_qr {
+            return V1Outcome::Reject {
+                code: ErrorCode::UserCancelled,
+                message: "User declined to capture image".to_string(),
+            };
+        }
+
+        V1Outcome::BytesResult {
+            result: image.clone(),
+        }
+    }
+
+    fn debug_scan_qr_result(&self, request: &Request<'_>) -> V1Outcome {
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Expecting parameters map".to_string(),
+            };
+        };
+        let image = match params.bytes("image") {
+            Ok(Some(image)) if !image.is_empty() => image,
+            Ok(_) | Err(_) => {
+                return bad_parameters("Failed to extract image data from parameters");
+            }
+        };
+
+        V1Outcome::BytesResult {
+            result: self
+                .platform
+                .debug_scan_qr_result_for_image(image)
+                .unwrap_or_default(),
+        }
+    }
+
     fn debug_set_mnemonic(&mut self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             return V1Outcome::Reject {
@@ -6222,6 +6285,11 @@ pub struct HostPlatform {
     wallet_seed: Option<Vec<u8>>,
     master_unblinding_key: [u8; 64],
     attestation: Option<HostAttestationData>,
+    debug_handshake_count: u64,
+    debug_capture_image_data: Option<Vec<u8>>,
+    debug_capture_image_contains_qr: bool,
+    debug_scan_qr_image: Option<Vec<u8>>,
+    debug_scan_qr_result: Option<Vec<u8>>,
     bip85_ephemeral_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
     bip85_iv: [u8; 16],
     confirm_export_blinding_key: bool,
@@ -6236,6 +6304,11 @@ impl Default for HostPlatform {
             wallet_seed: None,
             master_unblinding_key: [0; 64],
             attestation: None,
+            debug_handshake_count: 0,
+            debug_capture_image_data: None,
+            debug_capture_image_contains_qr: false,
+            debug_scan_qr_image: None,
+            debug_scan_qr_result: None,
             bip85_ephemeral_private_key: [
                 0x0b, 0x6b, 0x3d, 0xc9, 0x0d, 0x20, 0x3d, 0x85, 0x41, 0x00, 0x11, 0x07, 0x88, 0xac,
                 0x87, 0xd4, 0x3a, 0xa0, 0x06, 0x20, 0xc9, 0xcd, 0xb3, 0x61, 0xb2, 0x81, 0xb0, 0x90,
@@ -6276,6 +6349,11 @@ impl HostPlatform {
         self.master_unblinding_key = [0; 64];
         self.confirm_export_blinding_key = false;
         self.attestation = None;
+        self.debug_handshake_count = 0;
+        self.debug_capture_image_data = None;
+        self.debug_capture_image_contains_qr = false;
+        self.debug_scan_qr_image = None;
+        self.debug_scan_qr_result = None;
     }
 
     pub fn set_master_unblinding_key(&mut self, key: [u8; 64]) {
@@ -6284,6 +6362,37 @@ impl HostPlatform {
 
     pub fn set_confirm_export_blinding_key(&mut self, confirm: bool) {
         self.confirm_export_blinding_key = confirm;
+    }
+
+    pub fn debug_handshake_count(&self) -> u64 {
+        self.debug_handshake_count
+    }
+
+    pub fn set_debug_capture_image_data(&mut self, image_data: Vec<u8>, contains_qr: bool) {
+        self.debug_capture_image_data = Some(image_data);
+        self.debug_capture_image_contains_qr = contains_qr;
+    }
+
+    pub fn clear_debug_capture_image_data(&mut self) {
+        self.debug_capture_image_data = None;
+        self.debug_capture_image_contains_qr = false;
+    }
+
+    pub fn set_debug_scan_qr_result(&mut self, image_data: Vec<u8>, qr_result: Vec<u8>) {
+        self.debug_scan_qr_image = Some(image_data);
+        self.debug_scan_qr_result = Some(qr_result);
+    }
+
+    fn debug_scan_qr_result_for_image(&self, image_data: &[u8]) -> Option<Vec<u8>> {
+        if self
+            .debug_scan_qr_image
+            .as_deref()
+            .is_some_and(|expected| expected == image_data)
+        {
+            self.debug_scan_qr_result.clone()
+        } else {
+            None
+        }
     }
 
     fn master_blinding_key(&self) -> &[u8] {
@@ -15889,6 +15998,128 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Invalid Oracle pubkey".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn debug_handshake_returns_ok_without_core_fallback() {
+        let mut emulator = Emulator::new();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_handshake"),
+            params: None,
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.platform().debug_handshake_count(), 1);
+    }
+
+    #[test]
+    fn debug_capture_image_data_uses_host_platform_boundary() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params).map(0).unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_capture_image_data"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::UserCancelled,
+                message: "User declined to capture image".to_string(),
+            }
+        );
+
+        emulator
+            .platform_mut()
+            .set_debug_capture_image_data(vec![0x78, 0x9c, 0x03, 0x00], false);
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: vec![0x78, 0x9c, 0x03, 0x00],
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("check_qr")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_capture_image_data"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::UserCancelled,
+                message: "User declined to capture image".to_string(),
+            }
+        );
+        emulator
+            .platform_mut()
+            .set_debug_capture_image_data(vec![0x78, 0x9c, 0x63, 0x00], true);
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: vec![0x78, 0x9c, 0x63, 0x00],
+            }
+        );
+    }
+
+    #[test]
+    fn debug_scan_qr_validates_image_and_returns_host_scan_result() {
+        let mut emulator = Emulator::new();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params).map(0).unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_scan_qr"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to extract image data from parameters".to_string(),
+            }
+        );
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("image")
+            .unwrap()
+            .bytes(&[0x78, 0x9c, 0x03, 0x00])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("debug"),
+            method: Cow::Borrowed("debug_scan_qr"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult { result: vec![] }
+        );
+
+        emulator
+            .platform_mut()
+            .set_debug_scan_qr_result(vec![0x78, 0x9c, 0x03, 0x00], b"jade-qr".to_vec());
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::BytesResult {
+                result: b"jade-qr".to_vec(),
             }
         );
     }
