@@ -125,6 +125,12 @@ budget before dispatching a request or sending a response. Oversized request
 frames and oversized handler replies return explicit allocation errors instead
 of being forwarded to serial, BLE, or USB, which is a required step before the
 Rust transport path can run against fixed real-device buffers.
+The ESP32 and ESP32-S3 crates now also expose stream board-loop runners,
+`Esp32BoardStreamLoop` and `Esp32s3BoardStreamLoop`, which wrap the production
+stream app owners with a boot-once/tick-many loop, hook-supplied UI inputs,
+per-tick reports, and explicit tick-error surfacing. A real `app_main` can now
+own platform drivers, static buffers, NVS, and a small hook object while
+delegating the repeated boot/tick/stop policy to the Rust firmware crate.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or

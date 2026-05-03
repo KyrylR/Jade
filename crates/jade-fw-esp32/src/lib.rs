@@ -96,6 +96,55 @@ pub enum Esp32BoardAppError {
     QrBufferTooSmall { required: usize, actual: usize },
 }
 
+#[derive(Debug, Default)]
+pub struct Esp32BoardLoopInputs {
+    pub display_status: Option<DisplayStatus<'static>>,
+    pub confirmation: Option<UserConfirmation<'static>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Esp32BoardLoopDecision {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Esp32BoardLoopStopReason {
+    Hook,
+    TickLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Esp32BoardLoopRun {
+    pub booted: bool,
+    pub ticks: u64,
+    pub stop_reason: Esp32BoardLoopStopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Esp32BoardLoopError {
+    Boot(DeviceRuntimeError),
+    Tick(FirmwareFrameError),
+}
+
+pub trait Esp32BoardLoopHooks {
+    fn next_inputs(&mut self) -> Esp32BoardLoopInputs {
+        Esp32BoardLoopInputs::default()
+    }
+
+    fn on_boot(&mut self, _report: &jade_core::DeviceBootReport) -> Esp32BoardLoopDecision {
+        Esp32BoardLoopDecision::Continue
+    }
+
+    fn on_tick(&mut self, _report: &Esp32BoardTickReport<'_>) -> Esp32BoardLoopDecision {
+        Esp32BoardLoopDecision::Continue
+    }
+
+    fn on_tick_error(&mut self, _error: FirmwareFrameError) -> Esp32BoardLoopDecision {
+        Esp32BoardLoopDecision::Stop
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Esp32OtaStartError<E> {
     BootRequired,
@@ -132,6 +181,97 @@ pub struct Esp32BoardStreamApp<'a, P, B> {
     serial_frames: CborFrameBuffer<'a>,
     ble_frames: CborFrameBuffer<'a>,
     qr_buffer: &'a mut [u8],
+}
+
+#[derive(Debug)]
+pub struct Esp32BoardStreamLoop<'a, P, B> {
+    app: Esp32BoardStreamApp<'a, P, B>,
+    ticks: u64,
+}
+
+impl<'a, P, B> Esp32BoardStreamLoop<'a, P, B>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    pub fn new(app: Esp32BoardStreamApp<'a, P, B>) -> Self {
+        Self { app, ticks: 0 }
+    }
+
+    pub fn app(&self) -> &Esp32BoardStreamApp<'a, P, B> {
+        &self.app
+    }
+
+    pub fn app_mut(&mut self) -> &mut Esp32BoardStreamApp<'a, P, B> {
+        &mut self.app
+    }
+
+    pub fn into_app(self) -> Esp32BoardStreamApp<'a, P, B> {
+        self.app
+    }
+
+    pub fn ticks(&self) -> u64 {
+        self.ticks
+    }
+
+    pub fn run_once<H>(
+        &mut self,
+        hooks: &mut H,
+    ) -> Result<Esp32BoardLoopDecision, Esp32BoardLoopError>
+    where
+        H: Esp32BoardLoopHooks,
+    {
+        if !self.app.is_booted() {
+            let report = self.app.boot().map_err(Esp32BoardLoopError::Boot)?;
+            if hooks.on_boot(&report) == Esp32BoardLoopDecision::Stop {
+                return Ok(Esp32BoardLoopDecision::Stop);
+            }
+        }
+
+        let tick = {
+            let inputs = hooks.next_inputs();
+            self.app.tick(inputs.display_status, inputs.confirmation)
+        };
+        match tick {
+            Ok(report) => {
+                self.ticks = self.ticks.saturating_add(1);
+                Ok(hooks.on_tick(&report))
+            }
+            Err(error) => {
+                let decision = hooks.on_tick_error(error);
+                if decision == Esp32BoardLoopDecision::Stop {
+                    Err(Esp32BoardLoopError::Tick(error))
+                } else {
+                    Ok(decision)
+                }
+            }
+        }
+    }
+
+    pub fn run_until_stop<H>(
+        &mut self,
+        hooks: &mut H,
+        max_ticks: usize,
+    ) -> Result<Esp32BoardLoopRun, Esp32BoardLoopError>
+    where
+        H: Esp32BoardLoopHooks,
+    {
+        for _ in 0..max_ticks {
+            if self.run_once(hooks)? == Esp32BoardLoopDecision::Stop {
+                return Ok(Esp32BoardLoopRun {
+                    booted: self.app.is_booted(),
+                    ticks: self.ticks,
+                    stop_reason: Esp32BoardLoopStopReason::Hook,
+                });
+            }
+        }
+
+        Ok(Esp32BoardLoopRun {
+            booted: self.app.is_booted(),
+            ticks: self.ticks,
+            stop_reason: Esp32BoardLoopStopReason::TickLimit,
+        })
+    }
 }
 
 impl<'a, P, B> Esp32BoardApp<'a, P, B>
@@ -1823,6 +1963,138 @@ mod tests {
         );
         assert!(app.serial_pending().is_empty());
         assert_eq!(app.runtime().platform().serial_tx.len(), 1);
+    }
+
+    #[derive(Debug)]
+    struct Esp32LoopTestHooks {
+        boots: usize,
+        ticks: usize,
+        stop_after: usize,
+        last_transports: Esp32V1PollReport,
+        last_confirmation: Option<UserConfirmationDecision>,
+    }
+
+    impl Esp32LoopTestHooks {
+        fn new(stop_after: usize) -> Self {
+            Self {
+                boots: 0,
+                ticks: 0,
+                stop_after,
+                last_transports: Esp32V1PollReport::default(),
+                last_confirmation: None,
+            }
+        }
+    }
+
+    impl Esp32BoardLoopHooks for Esp32LoopTestHooks {
+        fn next_inputs(&mut self) -> Esp32BoardLoopInputs {
+            Esp32BoardLoopInputs {
+                display_status: Some(DisplayStatus::Busy("loop")),
+                confirmation: Some(UserConfirmation::Export { label: "xpub" }),
+            }
+        }
+
+        fn on_boot(&mut self, report: &jade_core::DeviceBootReport) -> Esp32BoardLoopDecision {
+            self.boots += 1;
+            assert_eq!(report.target, DeviceTarget::Jade);
+            Esp32BoardLoopDecision::Continue
+        }
+
+        fn on_tick(&mut self, report: &Esp32BoardTickReport<'_>) -> Esp32BoardLoopDecision {
+            self.ticks += 1;
+            self.last_transports = report.transports;
+            self.last_confirmation = report.confirmation;
+            if self.ticks >= self.stop_after {
+                Esp32BoardLoopDecision::Stop
+            } else {
+                Esp32BoardLoopDecision::Continue
+            }
+        }
+    }
+
+    #[test]
+    fn esp32_board_stream_loop_boots_and_runs_until_hook_stop() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32BoardStreamApp::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+        app.runtime_mut().platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        app.runtime_mut().platform_mut().confirmation_decision = UserConfirmationDecision::Approved;
+
+        let mut event_loop = Esp32BoardStreamLoop::new(app);
+        let mut hooks = Esp32LoopTestHooks::new(1);
+        let run = event_loop.run_until_stop(&mut hooks, 4).unwrap();
+
+        assert_eq!(
+            run,
+            Esp32BoardLoopRun {
+                booted: true,
+                ticks: 1,
+                stop_reason: Esp32BoardLoopStopReason::Hook,
+            }
+        );
+        assert_eq!(event_loop.ticks(), 1);
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 1);
+        assert_eq!(
+            hooks.last_transports,
+            Esp32V1PollReport {
+                serial: true,
+                ble: false,
+            }
+        );
+        assert_eq!(
+            hooks.last_confirmation,
+            Some(UserConfirmationDecision::Approved)
+        );
+        assert_eq!(event_loop.app().runtime().platform().serial_tx.len(), 1);
+        assert_eq!(
+            event_loop.app().runtime().platform().display_status_count,
+            1
+        );
+        assert_eq!(event_loop.app().runtime().platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_stream_loop_surfaces_tick_errors_without_sending() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32BoardStreamApp::new(
+            TestPlatform::new(manifest_with_allocation(
+                JADE_MANIFEST,
+                AllocationBudget {
+                    max_request_bytes: 1024,
+                    max_response_bytes: 4,
+                    max_scratch_bytes: 1024,
+                },
+            )),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+        app.runtime_mut().platform_mut().serial_rx = Some(v1_request("s", "ping"));
+
+        let mut event_loop = Esp32BoardStreamLoop::new(app);
+        let mut hooks = Esp32LoopTestHooks::new(1);
+        assert!(matches!(
+            event_loop.run_once(&mut hooks),
+            Err(Esp32BoardLoopError::Tick(FirmwareFrameError::Allocation(
+                jade_core::AllocationFailure::ResponseTooLarge { limit: 4, .. }
+            )))
+        ));
+        assert_eq!(hooks.boots, 1);
+        assert_eq!(hooks.ticks, 0);
+        assert_eq!(event_loop.app().runtime().platform().serial_tx.len(), 0);
     }
 
     #[test]
