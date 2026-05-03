@@ -126,6 +126,14 @@ pub struct Esp32BoardApp<'a, P, B> {
     qr_buffer: &'a mut [u8],
 }
 
+#[derive(Debug)]
+pub struct Esp32BoardStreamApp<'a, P, B> {
+    runtime: Esp32V1BoardRuntime<P, B>,
+    serial_frames: CborFrameBuffer<'a>,
+    ble_frames: CborFrameBuffer<'a>,
+    qr_buffer: &'a mut [u8],
+}
+
 impl<'a, P, B> Esp32BoardApp<'a, P, B>
 where
     P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
@@ -195,6 +203,94 @@ where
             platform,
             jade_storage::NvsStorage::new(nvs_backend),
             rx_buffer,
+            qr_buffer,
+        )
+    }
+}
+
+impl<'a, P, B> Esp32BoardStreamApp<'a, P, B>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    pub fn new(
+        platform: P,
+        storage_backend: B,
+        serial_frame_buffer: &'a mut [u8],
+        ble_frame_buffer: &'a mut [u8],
+        qr_buffer: &'a mut [u8],
+    ) -> Result<Self, Esp32BoardAppError> {
+        validate_board_stream_buffers(serial_frame_buffer, ble_frame_buffer, qr_buffer)?;
+        Ok(Self {
+            runtime: Esp32V1BoardRuntime::new(platform, storage_backend),
+            serial_frames: CborFrameBuffer::new(serial_frame_buffer),
+            ble_frames: CborFrameBuffer::new(ble_frame_buffer),
+            qr_buffer,
+        })
+    }
+
+    pub fn boot(&mut self) -> Result<jade_core::DeviceBootReport, DeviceRuntimeError> {
+        self.runtime.boot()
+    }
+
+    pub fn is_booted(&self) -> bool {
+        self.runtime.is_booted()
+    }
+
+    pub fn runtime(&self) -> &Esp32V1BoardRuntime<P, B> {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut Esp32V1BoardRuntime<P, B> {
+        &mut self.runtime
+    }
+
+    pub fn serial_pending(&self) -> &[u8] {
+        self.serial_frames.pending()
+    }
+
+    pub fn ble_pending(&self) -> &[u8] {
+        self.ble_frames.pending()
+    }
+
+    pub fn tick<'b>(
+        &'b mut self,
+        display_status: Option<DisplayStatus<'b>>,
+        confirmation: Option<UserConfirmation<'b>>,
+    ) -> Result<Esp32BoardTickReport<'b>, FirmwareFrameError> {
+        let Self {
+            runtime,
+            serial_frames,
+            ble_frames,
+            qr_buffer,
+        } = self;
+        runtime.tick_streams(
+            serial_frames,
+            ble_frames,
+            Some(qr_buffer),
+            display_status,
+            confirmation,
+        )
+    }
+}
+
+impl<'a, P, B> Esp32BoardStreamApp<'a, P, Esp32NvsStorage<B>>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+{
+    pub fn new_with_nvs(
+        platform: P,
+        nvs_backend: B,
+        serial_frame_buffer: &'a mut [u8],
+        ble_frame_buffer: &'a mut [u8],
+        qr_buffer: &'a mut [u8],
+    ) -> Result<Self, Esp32BoardAppError> {
+        Self::new(
+            platform,
+            jade_storage::NvsStorage::new(nvs_backend),
+            serial_frame_buffer,
+            ble_frame_buffer,
             qr_buffer,
         )
     }
@@ -514,12 +610,31 @@ pub fn validate_board_buffers(
     rx_buffer: &[u8],
     qr_buffer: &[u8],
 ) -> Result<(), Esp32BoardAppError> {
+    validate_rx_buffer(rx_buffer)?;
+    validate_qr_buffer(qr_buffer)
+}
+
+pub fn validate_board_stream_buffers(
+    serial_frame_buffer: &[u8],
+    ble_frame_buffer: &[u8],
+    qr_buffer: &[u8],
+) -> Result<(), Esp32BoardAppError> {
+    validate_rx_buffer(serial_frame_buffer)?;
+    validate_rx_buffer(ble_frame_buffer)?;
+    validate_qr_buffer(qr_buffer)
+}
+
+fn validate_rx_buffer(rx_buffer: &[u8]) -> Result<(), Esp32BoardAppError> {
     if rx_buffer.len() < RX_BUFFER_BYTES {
         return Err(Esp32BoardAppError::RxBufferTooSmall {
             required: RX_BUFFER_BYTES,
             actual: rx_buffer.len(),
         });
     }
+    Ok(())
+}
+
+fn validate_qr_buffer(qr_buffer: &[u8]) -> Result<(), Esp32BoardAppError> {
     if qr_buffer.len() < QR_BUFFER_BYTES {
         return Err(Esp32BoardAppError::QrBufferTooSmall {
             required: QR_BUFFER_BYTES,
@@ -1474,6 +1589,62 @@ mod tests {
         assert_eq!(report.rollback_secure_version, 5);
         assert_eq!(app.runtime().platform().serial_tx.len(), 1);
         assert_eq!(app.runtime().platform().display_status_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_stream_app_preserves_transport_frames_across_ticks() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32BoardStreamApp::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+        let serial = v1_request("s", "ping");
+        let split = serial.len() / 2;
+        app.runtime_mut().platform_mut().serial_rx = Some(serial[..split].to_vec());
+        app.runtime_mut().platform_mut().ble_rx = Some(v1_request("b", "ping"));
+        app.runtime_mut().platform_mut().camera_rx = Some(b"ur:bytes/stream-app".to_vec());
+        app.runtime_mut().platform_mut().monotonic_millis = 88;
+        app.runtime_mut().platform_mut().rollback_secure_version = 6;
+
+        assert!(matches!(
+            app.tick(Some(DisplayStatus::Busy("stream-app")), None),
+            Err(FirmwareFrameError::BootRequired)
+        ));
+        app.boot().unwrap();
+        let report = app
+            .tick(Some(DisplayStatus::Busy("stream-app")), None)
+            .unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32V1PollReport {
+                serial: false,
+                ble: true,
+            }
+        );
+        assert_eq!(report.qr_payload, Some(&b"ur:bytes/stream-app"[..]));
+        assert_eq!(report.monotonic_millis, 88);
+        assert_eq!(report.rollback_secure_version, 6);
+        assert_eq!(app.serial_pending(), &serial[..split]);
+        assert_eq!(app.runtime().platform().serial_tx.len(), 0);
+        assert_eq!(app.runtime().platform().ble_tx.len(), 1);
+
+        app.runtime_mut().platform_mut().serial_rx = Some(serial[split..].to_vec());
+        let report = app.tick(None, None).unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32V1PollReport {
+                serial: true,
+                ble: false,
+            }
+        );
+        assert!(app.serial_pending().is_empty());
+        assert_eq!(app.runtime().platform().serial_tx.len(), 1);
     }
 
     #[test]

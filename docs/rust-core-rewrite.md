@@ -93,13 +93,16 @@ chunks through `OtaWriteSession<W>`. This is the entrypoint shape expected by a
 real board event loop.
 
 The firmware crates now also provide board-app owners for the real entrypoint
-shape: `Esp32BoardApp<'_, P, B>` and `Esp32s3BoardApp<'_, P, B>`. These types
-own the bootable full-v1 runtime and borrow fixed RX/QR scratch buffers supplied
-by board startup code. They validate those buffers before boot using the target
-allocation budgets (`17 KiB` RX on ESP32, `401 KiB` RX on ESP32-S3/SPIRAM, and
-`1024` bytes for QR payloads), then expose a single `boot` + `tick` flow. This
-keeps the production `app_main` boundary concrete without forcing the Rust core
-to know whether the buffers came from static memory, heap, or a HAL allocator.
+shape: `Esp32BoardApp<'_, P, B>` and `Esp32s3BoardApp<'_, P, B>` for legacy
+one-shot receive buffers, plus `Esp32BoardStreamApp<'_, P, B>` and
+`Esp32s3BoardStreamApp<'_, P, B>` for the production stream path. These types
+own the bootable full-v1 runtime and borrow fixed transport/QR scratch buffers
+supplied by board startup code. They validate those buffers before boot using
+the target allocation budgets (`17 KiB` per ESP32 transport buffer,
+`401 KiB` per ESP32-S3/SPIRAM transport buffer, and `1024` bytes for QR
+payloads), then expose a single `boot` + `tick` flow. This keeps the production
+`app_main` boundary concrete without forcing the Rust core to know whether the
+buffers came from static memory, heap, or a HAL allocator.
 `jade-core::CborFrameBuffer` now mirrors the important `main/wire.c` buffering
 behavior in pure Rust: append transport bytes, detect the first complete CBOR
 object without allocation, leave trailing bytes pending for the next frame, and
@@ -108,10 +111,10 @@ or oversized input explicitly. The ESP32 and ESP32-S3 firmware wrappers expose
 boot-gated stream pollers over those buffers for serial/BLE and serial/USB/BLE
 respectively, so the real board transport adapters can hand over arbitrary byte
 chunks and drain every complete v1 CBOR-RPC request without losing partial or
-back-to-back frames. The board-runtime tick path also has stream-aware aggregate
-polling, allowing firmware glue to keep one persistent `CborFrameBuffer` per
-transport while still running display, user confirmation, QR, touch, clock, and
-rollback checks through the same event-loop tick.
+back-to-back frames. The stream board-app owners now keep those persistent
+`CborFrameBuffer`s inside the app object, so firmware glue can allocate the
+storage once at startup while still running display, user confirmation, QR,
+touch, clock, and rollback checks through the same event-loop tick.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
