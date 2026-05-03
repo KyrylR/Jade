@@ -171,9 +171,10 @@ The hard parts are hard for concrete compatibility reasons:
   the legacy core boundary until their parity is implemented.
   `sign_psbt` itself has no staged anti-exfil subprotocol in the current Jade
   client or C handler; anti-exfil parity belongs to `sign_tx`,
-  `sign_liquid_tx`, and message signing. Script-path Taproot,
-  registered/generic multisig policy validation, and generic Liquid PSET
-  policy/finalization remain active transaction-signing implementation work.
+  `sign_liquid_tx`, and message signing. Script-path Taproot, generic multisig
+  policy validation beyond registered change-output checks, and generic Liquid
+  PSET policy/finalization remain active transaction-signing implementation
+  work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -188,10 +189,14 @@ The hard parts are hard for concrete compatibility reasons:
   grinding compatible with libwally. Bitcoin `sign_tx` start now validates
   declared `change` entries against the actual transaction output scripts for
   Green 2-of-2, Green 2-of-3 recovery-xpub, Green CSV, and singlesig
-  P2PKH/P2WPKH/P2SH-P2WPKH/Taproot key-path change outputs, and rejects the
-  existing non-matching Green CSV change fixture with `Receive script cannot be
-  validated` before any input signature is requested. Taproot key-path
-  `sign_tx` signs
+  P2PKH/P2WPKH/P2SH-P2WPKH/Taproot key-path change outputs. It also validates
+  registered multisig and registered descriptor change entries by loading the
+  authenticated storage record, deriving the exact receive scriptPubKey from
+  the stored policy and supplied path/branch/pointer metadata, and comparing it
+  with the raw transaction output script before any input signature is
+  requested. Mismatched Green CSV, registered multisig, and registered
+  descriptor change metadata now reject with `Receive script cannot be
+  validated`. Taproot key-path `sign_tx` signs
   SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures, and rejects non-empty
   Taproot anti-exfil host commitments with the v1-compatible error. Non-Taproot
   Bitcoin anti-exfil `sign_tx` now returns signer commitments from `tx_input`
@@ -228,8 +233,9 @@ The hard parts are hard for concrete compatibility reasons:
   fixtures through `sign_psbt`, with unsupported Liquid PSET
   policy/finalization cases returning the explicit core-defer outcome.
   `sign_psbt` has no staged anti-exfil continuation in current Jade; Liquid
-  script-path Taproot, registered/generic multisig policy validation, and
-  generic Liquid PSET policy/finalization remain active implementation work.
+  script-path Taproot, generic multisig policy validation beyond registered
+  change-output checks, and generic Liquid PSET policy/finalization remain
+  active implementation work.
 
 ## First Parity Gates
 

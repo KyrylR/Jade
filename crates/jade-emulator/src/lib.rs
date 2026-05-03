@@ -2218,9 +2218,13 @@ impl Emulator {
             return bad_parameters("Wrong number of inputs");
         }
         if let Some(seed) = self.platform.wallet_seed() {
-            if let Err(message) =
-                validate_bitcoin_change_outputs(params.raw(), &txn, seed, network_name)
-            {
+            if let Err(message) = validate_bitcoin_change_outputs(
+                params.raw(),
+                &txn,
+                seed,
+                network_name,
+                &self.storage,
+            ) {
                 return bad_parameters(message);
             }
         }
@@ -4662,6 +4666,7 @@ fn validate_bitcoin_change_outputs(
     txn: &[u8],
     seed: &[u8],
     network_name: &str,
+    storage: &JadeStorage<MemoryStorage>,
 ) -> Result<(), &'static str> {
     let Some(raw) = cbor_map_field(raw_params, "change")
         .map_err(|_| "Unexpected number of output entries for transaction")?
@@ -4684,6 +4689,8 @@ fn validate_bitcoin_change_outputs(
         .ok_or("Receive script cannot be constructed")?;
     let xpub_prefix =
         xpub_prefix_for_network(network_name).ok_or("Receive script cannot be constructed")?;
+    let network =
+        bitcoin_network_for_name(network_name).ok_or("Receive script cannot be constructed")?;
 
     for (item, expected_script) in items.iter().zip(output_scripts.iter()) {
         if cbor_is_null(item) {
@@ -4692,45 +4699,44 @@ fn validate_bitcoin_change_outputs(
         if !cbor_is_map(item) {
             return Err("Failed to extract valid receive path from parameters");
         }
-        if cbor_map_field(item, "descriptor_name")
-            .map_err(|_| "Failed to extract valid receive path from parameters")?
-            .is_some()
+        let actual_script = if let Some(descriptor_name) = cbor_map_str(item, "descriptor_name")
+            .map_err(|_| "Invalid descriptor name parameter")?
         {
-            return Err("Descriptor change validation is not implemented");
-        }
-        if cbor_map_field(item, "multisig_name")
-            .map_err(|_| "Failed to extract valid receive path from parameters")?
-            .is_some()
+            registered_descriptor_change_script_pubkey(storage, descriptor_name, item, network)?
+        } else if let Some(multisig_name) =
+            cbor_map_str(item, "multisig_name").map_err(|_| "Invalid multisig name parameter")?
         {
-            return Err("Registered multisig change validation is not implemented");
-        }
-
-        let path = cbor_map_field(item, "path")
-            .map_err(|_| "Failed to extract valid receive path from parameters")?
-            .ok_or("Failed to extract valid receive path from parameters")?;
-        let path = cbor_u32_array(path, MAX_PATH_LEN)
-            .map_err(|_| "Failed to extract valid receive path from parameters")?;
-        if path.is_empty() {
-            return Err("Failed to extract valid receive path from parameters");
-        }
-
-        let actual_script = if let Some(variant) = cbor_optional_singlesig_variant(item)? {
-            jade_crypto::pure_rust::bitcoin_singlesig_script_pubkey_from_seed(seed, &path, variant)
+            registered_multisig_change_script_pubkey(storage, multisig_name, item)?
         } else {
-            let csv_blocks = cbor_optional_u32(item, "csv_blocks")?.unwrap_or(0);
-            if csv_blocks != 0 && !network_allows_csv_blocks(network_name, csv_blocks) {
-                return Err("Receive script cannot be constructed");
+            let path = cbor_map_field(item, "path")
+                .map_err(|_| "Failed to extract valid receive path from parameters")?
+                .ok_or("Failed to extract valid receive path from parameters")?;
+            let path = cbor_u32_array(path, MAX_PATH_LEN)
+                .map_err(|_| "Failed to extract valid receive path from parameters")?;
+            if path.is_empty() {
+                return Err("Failed to extract valid receive path from parameters");
             }
-            let recovery_xpub = cbor_optional_recovery_xpub(item, xpub_prefix)?;
-            jade_crypto::pure_rust::bitcoin_green_script_pubkey_from_seed(
-                seed,
-                &path,
-                &service_xpub,
-                recovery_xpub.as_ref(),
-                csv_blocks,
-            )
-        }
-        .ok_or("Receive script cannot be constructed")?;
+
+            if let Some(variant) = cbor_optional_singlesig_variant(item)? {
+                jade_crypto::pure_rust::bitcoin_singlesig_script_pubkey_from_seed(
+                    seed, &path, variant,
+                )
+            } else {
+                let csv_blocks = cbor_optional_u32(item, "csv_blocks")?.unwrap_or(0);
+                if csv_blocks != 0 && !network_allows_csv_blocks(network_name, csv_blocks) {
+                    return Err("Receive script cannot be constructed");
+                }
+                let recovery_xpub = cbor_optional_recovery_xpub(item, xpub_prefix)?;
+                jade_crypto::pure_rust::bitcoin_green_script_pubkey_from_seed(
+                    seed,
+                    &path,
+                    &service_xpub,
+                    recovery_xpub.as_ref(),
+                    csv_blocks,
+                )
+            }
+            .ok_or("Receive script cannot be constructed")?
+        };
 
         if actual_script != *expected_script {
             return Err("Receive script cannot be validated");
@@ -4738,6 +4744,96 @@ fn validate_bitcoin_change_outputs(
     }
 
     Ok(())
+}
+
+fn registered_descriptor_change_script_pubkey(
+    storage: &JadeStorage<MemoryStorage>,
+    descriptor_name: &str,
+    raw: &[u8],
+    network: jade_crypto::BitcoinNetwork,
+) -> Result<Vec<u8>, &'static str> {
+    if !key_name_valid(descriptor_name) {
+        return Err("Invalid descriptor name parameter");
+    }
+
+    let mut record = Vec::new();
+    storage
+        .get_record(
+            StorageRecord::DescriptorRegistration {
+                name: descriptor_name,
+            },
+            &mut record,
+        )
+        .map_err(|_| "Cannot find named descriptor wallet")?;
+    let details = parse_descriptor_details(&record, &HostRecordAuthenticator)
+        .map_err(|_| "Cannot de-serialise descriptor wallet data")?;
+    if details.descriptor.is_empty()
+        || details.descriptor_type > 2
+        || details.datavalues.len() > jade_storage::MAX_ALLOWED_SIGNERS
+    {
+        return Err("Descriptor wallet data invalid");
+    }
+
+    let branch = cbor_optional_u32(raw, "branch")?.unwrap_or(0);
+    let pointer = cbor_optional_u32(raw, "pointer")?
+        .ok_or("Failed to extract path elements from parameters")?;
+    descriptor_receive_script_pubkey(&details, branch, pointer, network)
+        .ok_or("Receive script cannot be constructed")
+}
+
+fn registered_multisig_change_script_pubkey(
+    storage: &JadeStorage<MemoryStorage>,
+    multisig_name: &str,
+    raw: &[u8],
+) -> Result<Vec<u8>, &'static str> {
+    if !key_name_valid(multisig_name) {
+        return Err("Invalid multisig name parameter");
+    }
+
+    let mut record = Vec::new();
+    storage
+        .get_record(
+            StorageRecord::MultisigRegistration {
+                name: multisig_name,
+            },
+            &mut record,
+        )
+        .map_err(|_| "Cannot find named multisig wallet")?;
+    let details = parse_multisig_details(&record, &HostRecordAuthenticator)
+        .map_err(|_| "Cannot de-serialise multisig wallet data")?;
+    let signer_count = details
+        .signers
+        .as_ref()
+        .map(|signers| signers.len())
+        .unwrap_or(details.address_xpubs.len());
+    if signer_count != details.summary.num_signers as usize
+        || details.summary.threshold == 0
+        || details.summary.threshold > details.summary.num_signers
+    {
+        return Err("Multisig wallet data invalid");
+    }
+
+    let paths = cbor_nested_u32_arrays(
+        raw,
+        "paths",
+        jade_storage::MAX_ALLOWED_SIGNERS,
+        MAX_PATH_LEN,
+    )
+    .map_err(|_| "Failed to extract signer paths from parameters")?
+    .ok_or("Failed to extract signer paths from parameters")?;
+    if paths.is_empty() || paths.len() != signer_count {
+        return Err("Unexpected number of signer paths or invalid path for multisig");
+    }
+
+    let (xpubs, effective_paths) = registered_multisig_xpubs_and_paths(&details, paths);
+    jade_crypto::pure_rust::bitcoin_multisig_script_pubkey_from_xpubs(
+        &xpubs,
+        &effective_paths,
+        crypto_multisig_variant(details.summary.variant),
+        details.summary.sorted,
+        details.summary.threshold,
+    )
+    .ok_or("Unexpected number of signer paths or invalid path for multisig")
 }
 
 fn cbor_optional_singlesig_variant(
@@ -5140,7 +5236,16 @@ fn nested_u32_arrays(
     max_outer_len: usize,
     max_inner_len: usize,
 ) -> Result<Option<Vec<Vec<u32>>>, ()> {
-    let mut decoder = Decoder::new(params.raw());
+    cbor_nested_u32_arrays(params.raw(), field, max_outer_len, max_inner_len)
+}
+
+fn cbor_nested_u32_arrays(
+    raw: &[u8],
+    field: &str,
+    max_outer_len: usize,
+    max_inner_len: usize,
+) -> Result<Option<Vec<Vec<u32>>>, ()> {
+    let mut decoder = Decoder::new(raw);
     let Some(len) = decoder.map().map_err(|_| ())? else {
         return Err(());
     };
@@ -5186,6 +5291,27 @@ fn nested_u32_arrays(
     }
 
     Ok(None)
+}
+
+fn registered_multisig_xpubs_and_paths(
+    details: &MultisigDetails,
+    paths: Vec<Vec<u32>>,
+) -> (Vec<[u8; jade_storage::BIP32_SERIALIZED_LEN]>, Vec<Vec<u32>>) {
+    match details.signers.as_ref() {
+        Some(signers) => {
+            let mut xpubs = Vec::with_capacity(signers.len());
+            let mut effective_paths = Vec::with_capacity(paths.len());
+            for (signer, path) in signers.iter().zip(paths.iter()) {
+                let mut effective_path = Vec::with_capacity(signer.path.len() + path.len());
+                effective_path.extend_from_slice(&signer.path);
+                effective_path.extend_from_slice(path);
+                xpubs.push(signer.xpub);
+                effective_paths.push(effective_path);
+            }
+            (xpubs, effective_paths)
+        }
+        None => (details.address_xpubs.clone(), paths),
+    }
 }
 
 fn crypto_multisig_variant(variant: MultisigVariant) -> jade_crypto::MultisigScriptVariant {
@@ -5237,9 +5363,28 @@ fn descriptor_receive_address(
     pointer: u32,
     network: jade_crypto::BitcoinNetwork,
 ) -> Option<String> {
-    let inner = descriptor_function_body(&details.descriptor, "wsh")?;
-    let script = descriptor_script(inner, &details.datavalues, branch, pointer, network)?;
+    let script = descriptor_receive_script(details, branch, pointer, network)?;
     jade_crypto::pure_rust::bitcoin_wsh_address_from_script(&script, network)
+}
+
+fn descriptor_receive_script_pubkey(
+    details: &DescriptorDetails,
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<Vec<u8>> {
+    let script = descriptor_receive_script(details, branch, pointer, network)?;
+    Some(jade_crypto::pure_rust::bitcoin_wsh_script_pubkey_from_script(&script))
+}
+
+fn descriptor_receive_script(
+    details: &DescriptorDetails,
+    branch: u32,
+    pointer: u32,
+    network: jade_crypto::BitcoinNetwork,
+) -> Option<Vec<u8>> {
+    let inner = descriptor_function_body(&details.descriptor, "wsh")?;
+    descriptor_script(inner, &details.datavalues, branch, pointer, network)
 }
 
 fn descriptor_script(
@@ -6868,6 +7013,124 @@ mod tests {
             }
         }
 
+        params
+    }
+
+    fn bitcoin_tx_with_single_output_script(script: &[u8]) -> Vec<u8> {
+        assert!(
+            script.len() < 253,
+            "test helper only supports short scripts"
+        );
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&[1; 32]);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(0);
+        tx.extend_from_slice(&0xffff_fffeu32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&1_000u64.to_le_bytes());
+        tx.push(script.len() as u8);
+        tx.extend_from_slice(script);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx
+    }
+
+    fn sign_tx_start_params_with_registered_multisig_change(
+        network: &str,
+        txn: &[u8],
+        multisig_name: &str,
+        paths: &[Vec<u32>],
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("use_ae_signatures")
+            .unwrap()
+            .bool(false)
+            .unwrap()
+            .str("change")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .map(2)
+            .unwrap()
+            .str("multisig_name")
+            .unwrap()
+            .str(multisig_name)
+            .unwrap()
+            .str("paths")
+            .unwrap()
+            .array(paths.len() as u64)
+            .unwrap();
+        for path in paths {
+            encoder.array(path.len() as u64).unwrap();
+            for value in path {
+                encoder.u32(*value).unwrap();
+            }
+        }
+        params
+    }
+
+    fn sign_tx_start_params_with_registered_descriptor_change(
+        network: &str,
+        txn: &[u8],
+        descriptor_name: &str,
+        branch: u32,
+        pointer: u32,
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("use_ae_signatures")
+            .unwrap()
+            .bool(false)
+            .unwrap()
+            .str("change")
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .map(3)
+            .unwrap()
+            .str("descriptor_name")
+            .unwrap()
+            .str(descriptor_name)
+            .unwrap()
+            .str("branch")
+            .unwrap()
+            .u32(branch)
+            .unwrap()
+            .str("pointer")
+            .unwrap()
+            .u32(pointer)
+            .unwrap();
         params
     }
 
@@ -9388,6 +9651,148 @@ mod tests {
         let start_params = sign_tx_start_params_from_fixture(fixture, &txn, 1, false);
         let start_request = Request {
             id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Receive script cannot be validated".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_tx_start_validates_registered_multisig_change_script() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let xpub = decode_xpub(
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhe\
+             PY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[3, MultisigVariant::P2wsh as u8, 0, 1]);
+        payload.push(0);
+        payload.push(1);
+        payload.extend_from_slice(&[0; 4]);
+        payload.push(0);
+        payload.extend_from_slice(&xpub);
+        payload.push(0);
+        emulator
+            .storage_mut()
+            .set_multisig_registration("wallet-a", &authenticated_record(payload))
+            .unwrap();
+
+        let paths = [vec![0]];
+        let script = jade_crypto::pure_rust::bitcoin_multisig_script_pubkey_from_xpubs(
+            &[xpub],
+            &paths,
+            jade_crypto::MultisigScriptVariant::P2wsh,
+            false,
+            1,
+        )
+        .unwrap();
+        let txn = bitcoin_tx_with_single_output_script(&script);
+        let start_params = sign_tx_start_params_with_registered_multisig_change(
+            "mainnet", &txn, "wallet-a", &paths,
+        );
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let bad_txn = bitcoin_tx_with_single_output_script(&[OP_0]);
+        let start_params = sign_tx_start_params_with_registered_multisig_change(
+            "mainnet", &bad_txn, "wallet-a", &paths,
+        );
+        let start_request = Request {
+            id: Cow::Borrowed("bad"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Receive script cannot be validated".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_tx_start_validates_registered_descriptor_change_script() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let descriptor =
+            "wsh(or_d(multi(2,@0/<0;1>/*,@1/<0;1>/*),and_v(v:pkh(@2/<0;1>/*),older(100))))";
+        let datavalues = [
+            (
+                "@0",
+                "[7897b5b3/48'/1'/0'/2']\
+                 tpubDE8B47dY4JuGLnXVyDzG76UuhBM5hTjc6sXeJjG6ThbPsryiAnKqQY8CmxWcYjM6eVvkyH7CNTVrmPMxSWP9ZzCfHVHo6preHp6Xhgd42JH",
+            ),
+            (
+                "@1",
+                "[1bf12fe0/48'/1'/0'/2']\
+                 tpubDEHXLZfMAAM5duEnX6SSnZjGYbrxqXvRJmMxw8MFwr3gu4LC4DSxR9KVEfVDVcZxre4XL5tGcwVRrHwQ9euTMnSq6P6BqREemaqrFsC96Fy",
+            ),
+            (
+                "@2",
+                "[7897b5b3/48'/1'/1'/2']\
+                 tpubDFf2ES1oUSZRgiCFT4mvBQ4jC2xTfRzVwfa6KewXZthgtL83UquqirWXzo1EKi4et3bx2wQz9QFKLDeu6vXoKpgQnJHyV8DomjCjJRT3d57",
+            ),
+        ];
+        emulator
+            .storage_mut()
+            .set_descriptor_registration(
+                "liana-a",
+                &authenticated_record(descriptor_registration_payload(2, descriptor, &datavalues)),
+            )
+            .unwrap();
+        let details = DescriptorDetails {
+            descriptor_type: 2,
+            descriptor: descriptor.to_string(),
+            datavalues: datavalues
+                .iter()
+                .map(|(key, value)| DescriptorDataValue {
+                    key: (*key).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+        };
+        let script =
+            descriptor_receive_script_pubkey(&details, 1, 0, jade_crypto::BitcoinNetwork::Test)
+                .unwrap();
+        let txn = bitcoin_tx_with_single_output_script(&script);
+        let start_params = sign_tx_start_params_with_registered_descriptor_change(
+            "testnet", &txn, "liana-a", 1, 0,
+        );
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        let bad_txn = bitcoin_tx_with_single_output_script(&[OP_0]);
+        let start_params = sign_tx_start_params_with_registered_descriptor_change(
+            "testnet", &bad_txn, "liana-a", 1, 0,
+        );
+        let start_request = Request {
+            id: Cow::Borrowed("bad"),
             method: Cow::Borrowed("sign_tx"),
             params: Some(&start_params),
         };

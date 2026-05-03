@@ -3348,6 +3348,25 @@ pub mod pure_rust {
         bitcoin_multisig_address_from_pubkeys(&pubkeys, network, variant, sorted, threshold)
     }
 
+    pub fn bitcoin_multisig_script_pubkey_from_xpubs(
+        xpubs: &[[u8; 78]],
+        paths: &[Vec<u32>],
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<Vec<u8>> {
+        if xpubs.len() != paths.len() {
+            return None;
+        }
+
+        let mut pubkeys = Vec::with_capacity(xpubs.len());
+        for (xpub, path) in xpubs.iter().zip(paths.iter()) {
+            pubkeys.push(public_key_from_serialized_xpub_path(xpub, path)?);
+        }
+
+        bitcoin_multisig_script_pubkey_from_pubkeys(&pubkeys, variant, sorted, threshold)
+    }
+
     pub fn bitcoin_multisig_address_from_pubkeys(
         pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
         network: BitcoinNetwork,
@@ -3372,6 +3391,27 @@ pub mod pure_rust {
                 witness_program[2..].copy_from_slice(witness_script_hash.as_ref());
                 let script_hash = hash160(&witness_program);
                 p2sh_address(network, &script_hash)
+            }
+        }
+    }
+
+    pub fn bitcoin_multisig_script_pubkey_from_pubkeys(
+        pubkeys: &[[u8; EC_PUBLIC_KEY_COMPRESSED_LEN]],
+        variant: MultisigScriptVariant,
+        sorted: bool,
+        threshold: u8,
+    ) -> Option<Vec<u8>> {
+        let multisig_script = multisig_script(pubkeys, sorted, threshold)?;
+        match variant {
+            MultisigScriptVariant::P2wsh => {
+                let script_hash = Sha256::digest(&multisig_script);
+                Some(witness_v0_script_pubkey(script_hash.as_ref()))
+            }
+            MultisigScriptVariant::P2sh => Some(p2sh_script_pubkey(&hash160(&multisig_script))),
+            MultisigScriptVariant::P2wshP2sh => {
+                let witness_script_hash = Sha256::digest(&multisig_script);
+                let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
+                Some(p2sh_script_pubkey(&hash160(&witness_program)))
             }
         }
     }
@@ -3547,6 +3587,11 @@ pub mod pure_rust {
     ) -> Option<String> {
         let script_hash = Sha256::digest(script);
         bech32::segwit::encode_v0(segwit_hrp(network), script_hash.as_ref()).ok()
+    }
+
+    pub fn bitcoin_wsh_script_pubkey_from_script(script: &[u8]) -> Vec<u8> {
+        let script_hash = Sha256::digest(script);
+        witness_v0_script_pubkey(script_hash.as_ref())
     }
 
     pub fn hash160_digest(bytes: &[u8]) -> [u8; 20] {
