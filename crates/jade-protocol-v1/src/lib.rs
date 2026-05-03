@@ -613,6 +613,23 @@ pub fn encode_bytes_result(id: &str, result: &[u8]) -> Vec<u8> {
     output
 }
 
+pub fn encode_bytes_sequence_result(id: &str, seqnum: u64, seqlen: u64, result: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(4)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("seqnum"))
+        .and_then(|e| e.u64(seqnum))
+        .and_then(|e| e.str("seqlen"))
+        .and_then(|e| e.u64(seqlen))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.bytes(result))
+        .expect("Vec-backed CBOR encoding is infallible");
+    output
+}
+
 pub fn encode_text_result(id: &str, result: &str) -> Vec<u8> {
     let mut output = Vec::new();
     let mut encoder = Encoder::new(&mut output);
@@ -938,6 +955,18 @@ mod tests {
             [
                 0xa2, 0x62, b'i', b'd', 0x61, b'b', 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x43,
                 1, 2, 3,
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_v1_bytes_sequence_result_shape() {
+        assert_eq!(
+            encode_bytes_sequence_result("b", 2, 3, &[4, 5]),
+            [
+                0xa4, 0x62, b'i', b'd', 0x61, b'b', 0x66, b's', b'e', b'q', b'n', b'u', b'm', 0x02,
+                0x66, b's', b'e', b'q', b'l', b'e', b'n', 0x03, 0x66, b'r', b'e', b's', b'u', b'l',
+                b't', 0x42, 4, 5,
             ]
         );
     }

@@ -12,10 +12,10 @@ use jade_core::{
     Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
 };
 use jade_protocol_v1::{
-    decode_request, encode_bool_result, encode_bytes_result, encode_error_response,
-    encode_map_result, encode_owned_map_result, encode_text_result, encode_uint_result,
-    method_spec, ErrorCode, ErrorResponse, MethodClass, OwnedResultMapEntry, OwnedV1Value, Request,
-    ResultMapEntry, V1Value,
+    decode_request, encode_bool_result, encode_bytes_result, encode_bytes_sequence_result,
+    encode_error_response, encode_map_result, encode_owned_map_result, encode_text_result,
+    encode_uint_result, method_spec, ErrorCode, ErrorResponse, MethodClass, OwnedResultMapEntry,
+    OwnedV1Value, Request, ResultMapEntry, V1Value,
 };
 use jade_storage::{
     key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
@@ -34,6 +34,7 @@ pub struct Emulator {
     ota: Option<HostOtaSession>,
     sign_tx: Option<BitcoinSignTxSession>,
     sign_message_ae: Option<BitcoinSignMessageAeSession>,
+    extended_data: Option<ExtendedDataSession>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +68,21 @@ struct BitcoinSignMessageAeSession {
     path: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtendedDataSession {
+    original_id: String,
+    original_method: String,
+    chunks: Vec<Vec<u8>>,
+    next_seqnum: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BitcoinSignTxFlow {
     Legacy,
     Staged,
 }
+
+const EXTENDED_DATA_CHUNK_SIZE: usize = 3 * 1024 - 64;
 
 impl Default for Emulator {
     fn default() -> Self {
@@ -82,6 +93,7 @@ impl Default for Emulator {
             ota: None,
             sign_tx: None,
             sign_message_ae: None,
+            extended_data: None,
         }
     }
 }
@@ -193,6 +205,7 @@ impl Emulator {
                         self.ota = None;
                         self.sign_tx = None;
                         self.sign_message_ae = None;
+                        self.extended_data = None;
                         V1Outcome::BoolResult { result: true }
                     }
                     Err(_) => V1Outcome::Reject {
@@ -294,6 +307,9 @@ impl Emulator {
             Some(MethodClass::Continuation) if request.method == "get_signature" => {
                 self.get_signature_result(request)
             }
+            Some(MethodClass::Continuation) if request.method == "get_extended_data" => {
+                self.get_extended_data_result(request)
+            }
             Some(MethodClass::Continuation) if request.method == "ota_data" => {
                 self.handle_ota_data(request)
             }
@@ -324,7 +340,14 @@ impl Emulator {
                 V1Outcome::BoolResult { result } => encode_bool_result(&request.id, result),
                 V1Outcome::UintResult { result } => encode_uint_result(&request.id, result),
                 V1Outcome::TextResult { result } => encode_text_result(&request.id, &result),
-                V1Outcome::BytesResult { result } => encode_bytes_result(&request.id, &result),
+                V1Outcome::BytesResult { result } => {
+                    self.encode_bytes_result_maybe_sequence(&request.id, &request.method, result)
+                }
+                V1Outcome::BytesSequenceResult {
+                    result,
+                    seqnum,
+                    seqlen,
+                } => encode_bytes_sequence_result(&request.id, seqnum, seqlen, &result),
                 V1Outcome::EmptyMapResult => encode_map_result(&request.id, &[]),
                 V1Outcome::OwnedMapResult { entries } => {
                     encode_owned_map_result(&request.id, &entries)
@@ -2380,6 +2403,89 @@ impl Emulator {
         V1Outcome::BytesResult { result: signature }
     }
 
+    fn get_extended_data_result(&mut self, request: &Request<'_>) -> V1Outcome {
+        let Some(session) = self.extended_data.as_ref() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Unexpected method".to_string(),
+            };
+        };
+        let Some(params) = request.params() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Mismatched fields in 'get_extended_data' message".to_string(),
+            };
+        };
+
+        let matches = params
+            .str("orig")
+            .ok()
+            .flatten()
+            .is_some_and(|orig| orig == session.original_method.as_str())
+            && params
+                .str("origid")
+                .ok()
+                .flatten()
+                .is_some_and(|origid| origid == session.original_id.as_str())
+            && params
+                .u64("seqnum")
+                .ok()
+                .flatten()
+                .is_some_and(|seqnum| seqnum == session.next_seqnum as u64)
+            && params
+                .u64("seqlen")
+                .ok()
+                .flatten()
+                .is_some_and(|seqlen| seqlen == session.chunks.len() as u64);
+        if !matches {
+            return V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Mismatched fields in 'get_extended_data' message".to_string(),
+            };
+        }
+
+        let seqnum = session.next_seqnum;
+        let seqlen = session.chunks.len();
+        let result = session.chunks[seqnum - 1].clone();
+        if seqnum == seqlen {
+            self.extended_data = None;
+        } else if let Some(session) = self.extended_data.as_mut() {
+            session.next_seqnum += 1;
+        }
+
+        V1Outcome::BytesSequenceResult {
+            result,
+            seqnum: seqnum as u64,
+            seqlen: seqlen as u64,
+        }
+    }
+
+    fn encode_bytes_result_maybe_sequence(
+        &mut self,
+        id: &str,
+        method: &str,
+        result: Vec<u8>,
+    ) -> Vec<u8> {
+        if result.len() <= EXTENDED_DATA_CHUNK_SIZE {
+            self.extended_data = None;
+            return encode_bytes_result(id, &result);
+        }
+
+        let chunks: Vec<Vec<u8>> = result
+            .chunks(EXTENDED_DATA_CHUNK_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let seqlen = chunks.len();
+        let first = chunks[0].clone();
+        self.extended_data = Some(ExtendedDataSession {
+            original_id: id.to_string(),
+            original_method: method.to_string(),
+            chunks,
+            next_seqnum: 2,
+        });
+        encode_bytes_sequence_result(id, 1, seqlen as u64, &first)
+    }
+
     fn get_message_signature_result(&mut self, request: &Request<'_>) -> V1Outcome {
         let Some(params) = request.params() else {
             self.sign_message_ae = None;
@@ -3557,7 +3663,7 @@ fn parse_bitcoin_tx_input_params(
                 bytes.copy_from_slice(commitment);
                 Some(bytes)
             }
-            Ok(Some(commitment)) if commitment.is_empty() => None,
+            Ok(Some([])) => None,
             Ok(Some(_)) | Err(()) => {
                 return Err("Failed to extract valid host commitment from parameters")
             }
@@ -5071,17 +5177,41 @@ impl StaticVersionInfo for VersionInfo<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V1Outcome {
-    ImmediatePing { activity: jade_core::OperationState },
-    VersionInfo { info: Box<VersionInfo<'static>> },
-    BoolResult { result: bool },
-    UintResult { result: u64 },
-    TextResult { result: String },
-    BytesResult { result: Vec<u8> },
+    ImmediatePing {
+        activity: jade_core::OperationState,
+    },
+    VersionInfo {
+        info: Box<VersionInfo<'static>>,
+    },
+    BoolResult {
+        result: bool,
+    },
+    UintResult {
+        result: u64,
+    },
+    TextResult {
+        result: String,
+    },
+    BytesResult {
+        result: Vec<u8>,
+    },
+    BytesSequenceResult {
+        result: Vec<u8>,
+        seqnum: u64,
+        seqlen: u64,
+    },
     EmptyMapResult,
-    OwnedMapResult { entries: Vec<OwnedResultMapEntry> },
+    OwnedMapResult {
+        entries: Vec<OwnedResultMapEntry>,
+    },
     NoReply,
-    DeferredToCore { method: String },
-    Reject { code: ErrorCode, message: String },
+    DeferredToCore {
+        method: String,
+    },
+    Reject {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -5140,6 +5270,32 @@ mod tests {
         }
 
         (code.unwrap(), message.unwrap())
+    }
+
+    fn decode_v1_bytes_sequence(response: &[u8]) -> (String, u64, u64, Vec<u8>) {
+        let mut decoder = Decoder::new(response);
+        let mut id = None;
+        let mut seqnum = None;
+        let mut seqlen = None;
+        let mut result = None;
+
+        assert_eq!(decoder.map().unwrap(), Some(4));
+        for _ in 0..4 {
+            match decoder.str().unwrap() {
+                "id" => id = Some(decoder.str().unwrap().to_string()),
+                "seqnum" => seqnum = Some(decoder.u64().unwrap()),
+                "seqlen" => seqlen = Some(decoder.u64().unwrap()),
+                "result" => result = Some(decoder.bytes().unwrap().to_vec()),
+                _ => decoder.skip().unwrap(),
+            }
+        }
+
+        (
+            id.unwrap(),
+            seqnum.unwrap(),
+            seqlen.unwrap(),
+            result.unwrap(),
+        )
     }
 
     fn decode_hex<const N: usize>(input: &str) -> [u8; N] {
@@ -6802,6 +6958,140 @@ mod tests {
                 V1Outcome::BytesResult { result: expected }
             );
         }
+    }
+
+    #[test]
+    fn raw_v1_sign_psbt_uses_get_extended_data_for_large_results() {
+        let fixture = include_str!("../../../test_data/psbt_tm_multisig_segwit_many_inputs.json");
+        let psbt = fixture_psbt_base64(fixture);
+        let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+        assert!(expected.len() > EXTENDED_DATA_CHUNK_SIZE);
+
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+
+        let mut request = Vec::new();
+        minicbor::Encoder::new(&mut request)
+            .map(3)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("psbtlong")
+            .unwrap()
+            .str("method")
+            .unwrap()
+            .str("sign_psbt")
+            .unwrap()
+            .str("params")
+            .unwrap()
+            .map(2)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(fixture_network(fixture))
+            .unwrap()
+            .str("psbt")
+            .unwrap()
+            .str(psbt)
+            .unwrap();
+
+        let (id, seqnum, seqlen, first_chunk) =
+            decode_v1_bytes_sequence(&emulator.handle_v1_cbor(&request));
+        assert_eq!(id, "psbtlong");
+        assert_eq!(seqnum, 1);
+        assert!(seqlen > 1);
+
+        let mut combined = first_chunk;
+        for next_seqnum in 2..=seqlen {
+            let mut request = Vec::new();
+            minicbor::Encoder::new(&mut request)
+                .map(3)
+                .unwrap()
+                .str("id")
+                .unwrap()
+                .str("chunk")
+                .unwrap()
+                .str("method")
+                .unwrap()
+                .str("get_extended_data")
+                .unwrap()
+                .str("params")
+                .unwrap()
+                .map(4)
+                .unwrap()
+                .str("orig")
+                .unwrap()
+                .str("sign_psbt")
+                .unwrap()
+                .str("origid")
+                .unwrap()
+                .str("psbtlong")
+                .unwrap()
+                .str("seqnum")
+                .unwrap()
+                .u64(next_seqnum)
+                .unwrap()
+                .str("seqlen")
+                .unwrap()
+                .u64(seqlen)
+                .unwrap();
+
+            let (id, seqnum, returned_seqlen, chunk) =
+                decode_v1_bytes_sequence(&emulator.handle_v1_cbor(&request));
+            assert_eq!(id, "chunk");
+            assert_eq!(seqnum, next_seqnum);
+            assert_eq!(returned_seqlen, seqlen);
+            combined.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn get_extended_data_rejects_mismatched_origin_fields() {
+        let mut emulator = Emulator::new();
+        let response = emulator.encode_bytes_result_maybe_sequence(
+            "orig-id",
+            "sign_psbt",
+            vec![0x5a; EXTENDED_DATA_CHUNK_SIZE + 1],
+        );
+        let (_, _, seqlen, _) = decode_v1_bytes_sequence(&response);
+
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(4)
+            .unwrap()
+            .str("orig")
+            .unwrap()
+            .str("wrong_method")
+            .unwrap()
+            .str("origid")
+            .unwrap()
+            .str("orig-id")
+            .unwrap()
+            .str("seqnum")
+            .unwrap()
+            .u64(2)
+            .unwrap()
+            .str("seqlen")
+            .unwrap()
+            .u64(seqlen)
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("chunk"),
+            method: Cow::Borrowed("get_extended_data"),
+            params: Some(&params),
+        };
+
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::ProtocolError,
+                message: "Mismatched fields in 'get_extended_data' message".to_string()
+            }
+        );
     }
 
     #[test]

@@ -116,9 +116,11 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   partial signatures for P2SH, P2WSH, P2SH-P2WSH, Green 2-of-2 CSV, and
   Green 2-of-3 fixtures, including multi-input Green PSBT byte-order golden
   parity plus Green 2-of-3 recovery signing with both short parent-fingerprint
-  and full-path derivations. PSBT anti-exfil, script-path Taproot, full
-  multisig finalization, and Liquid/PSET signing still defer to the
-  transaction-signing milestone.
+  and full-path derivations. Raw v1 CBOR responses now chunk large signed PSBT
+  byte results with `seqnum`/`seqlen` and validate `get_extended_data`
+  continuation requests against the originating id and method. PSBT
+  anti-exfil, script-path Taproot, full multisig finalization, and Liquid/PSET
+  signing still defer to the transaction-signing milestone.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
