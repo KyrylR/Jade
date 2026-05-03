@@ -1200,10 +1200,15 @@ mod tests {
 
     #[test]
     fn esp32_runtime_uses_shared_core_boot_path() {
-        let mut runtime = runtime_for_v1(TestPlatform::new(JADE_MANIFEST));
-        assert_eq!(runtime.boot().unwrap().target, DeviceTarget::Jade);
-        assert!(runtime.is_booted());
-        assert_eq!(runtime.version_info().board_type, Cow::Borrowed("jade"));
+        for (manifest, target, board_type) in [
+            (JADE_MANIFEST, DeviceTarget::Jade, "jade"),
+            (JADE_V1_1_MANIFEST, DeviceTarget::JadeV1_1, "jade_v1_1"),
+        ] {
+            let mut runtime = runtime_for_v1(TestPlatform::new(manifest));
+            assert_eq!(runtime.boot().unwrap().target, target);
+            assert!(runtime.is_booted());
+            assert_eq!(runtime.version_info().board_type, Cow::Borrowed(board_type));
+        }
     }
 
     #[test]
@@ -1381,6 +1386,39 @@ mod tests {
         assert_eq!(decoder.str().unwrap(), "p");
         assert_eq!(decoder.str().unwrap(), "result");
         assert_eq!(decoder.u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn esp32_board_constructors_preserve_v1_1_target() {
+        let mut board = Esp32V1BoardRuntime::new(
+            TestPlatform::new(JADE_V1_1_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        assert_eq!(board.boot().unwrap().target, DeviceTarget::JadeV1_1);
+
+        let mut rx = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32BoardApp::new(
+            TestPlatform::new(JADE_V1_1_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut rx,
+            &mut qr,
+        )
+        .unwrap();
+        assert_eq!(app.boot().unwrap().target, DeviceTarget::JadeV1_1);
+
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        let mut stream_app = Esp32BoardStreamApp::new(
+            TestPlatform::new(JADE_V1_1_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut stream_qr,
+        )
+        .unwrap();
+        assert_eq!(stream_app.boot().unwrap().target, DeviceTarget::JadeV1_1);
     }
 
     #[test]

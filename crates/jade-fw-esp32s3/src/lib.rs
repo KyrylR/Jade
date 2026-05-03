@@ -1506,10 +1506,15 @@ mod tests {
 
     #[test]
     fn s3_runtime_uses_shared_core_boot_path() {
-        let mut runtime = runtime_for_v2(TestPlatform::new(JADE_V2_MANIFEST));
-        assert_eq!(runtime.boot().unwrap().target, DeviceTarget::JadeV2);
-        assert!(runtime.is_booted());
-        assert_eq!(runtime.version_info().board_type, Cow::Borrowed("jade_v2"));
+        for (manifest, target, board_type) in [
+            (JADE_V2_MANIFEST, DeviceTarget::JadeV2, "jade_v2"),
+            (JADE_V2C_MANIFEST, DeviceTarget::JadeV2c, "jade_v2c"),
+        ] {
+            let mut runtime = runtime_for_v2(TestPlatform::new(manifest));
+            assert_eq!(runtime.boot().unwrap().target, target);
+            assert!(runtime.is_booted());
+            assert_eq!(runtime.version_info().board_type, Cow::Borrowed(board_type));
+        }
     }
 
     #[test]
@@ -1692,6 +1697,41 @@ mod tests {
         assert_eq!(decoder.str().unwrap(), "p");
         assert_eq!(decoder.str().unwrap(), "result");
         assert_eq!(decoder.u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn s3_board_constructors_preserve_v2c_target() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2C_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        assert_eq!(board.boot().unwrap().target, DeviceTarget::JadeV2c);
+
+        let mut rx = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32s3BoardApp::new(
+            TestPlatform::new(JADE_V2C_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut rx,
+            &mut qr,
+        )
+        .unwrap();
+        assert_eq!(app.boot().unwrap().target, DeviceTarget::JadeV2c);
+
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut usb_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        let mut stream_app = Esp32s3BoardStreamApp::new(
+            TestPlatform::new(JADE_V2C_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut usb_frames,
+            &mut ble_frames,
+            &mut stream_qr,
+        )
+        .unwrap();
+        assert_eq!(stream_app.boot().unwrap().target, DeviceTarget::JadeV2c);
     }
 
     #[test]

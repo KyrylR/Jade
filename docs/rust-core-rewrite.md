@@ -62,8 +62,10 @@ Both firmware crates also expose constructors for the full generic v1 runtime:
 Those constructors instantiate `JadeRuntime<P, B>` with `jade-emulator`
 compiled as `no_std + alloc` and default features disabled, so board code can
 wire the full Rust v1 behavior engine to ESP platform hooks and storage
-without pulling in host `std`. Each target crate now also has an NVS-specific
-constructor, `nvs_runtime_for_v1` or `nvs_runtime_for_v2`, plus
+without pulling in host `std`. The boot-path tests now cover all official
+manifest identities through these constructors: `jade`, `jade_v1_1`, `jade_v2`,
+and `jade_v2c`. Each target crate now also has an NVS-specific constructor,
+`nvs_runtime_for_v1` or `nvs_runtime_for_v2`, plus
 `Esp32V1BoardRuntime::new_with_nvs` and
 `Esp32s3V1BoardRuntime::new_with_nvs`, so a real ESP NVS driver only needs to
 implement `jade_storage::NvsKeyValueBackend` to become the runtime storage
@@ -90,7 +92,10 @@ boundary for touch press/release events and hardware attestation challenge
 signing. OTA start is also exposed on the board runtimes, so firmware event
 loops now begin OTA through the boot-gated runtime wrapper before streaming
 chunks through `OtaWriteSession<W>`. This is the entrypoint shape expected by a
-real board event loop.
+real board event loop. Tests also verify that the board runtime and both
+board-app owner shapes preserve the alternate shipping variants,
+`jade_v1_1` and `jade_v2c`, rather than silently normalizing them to the base
+ESP32 or ESP32-S3 target.
 
 The firmware crates now also provide board-app owners for the real entrypoint
 shape: `Esp32BoardApp<'_, P, B>` and `Esp32s3BoardApp<'_, P, B>` for legacy
