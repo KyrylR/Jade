@@ -77,8 +77,11 @@ Rust v1 runtime, call the platform boot report before accepting traffic, return
 serial/BLE/USB traffic through the full Rust v1 behavior engine. They also
 offer a single boot-gated `poll_v1_transports` helper per target, returning a
 small report of which links handled frames in that board-loop tick. They also
-expose boot-gated hardware RNG, monotonic clock, rollback secure-version, and
-camera QR polling over caller-owned buffers, returning
+offer a higher-level `tick` API that performs one board-loop iteration over
+v1 transports, QR, display status, user confirmation, monotonic time, rollback
+state, and ESP32-S3 touch events. The individual methods still expose
+boot-gated hardware RNG, monotonic clock, rollback secure-version, and camera
+QR polling over caller-owned buffers, returning
 `Ok(None)` when no QR payload is ready and surfacing platform buffer/transport
 failures without panicking. Both target families now expose boot-gated display
 status and user-confirmation hooks for address, message, transaction, and

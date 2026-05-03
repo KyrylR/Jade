@@ -102,6 +102,24 @@ impl Esp32s3V1PollReport {
     }
 }
 
+#[derive(Debug)]
+pub struct Esp32s3BoardTick<'a> {
+    pub rx_buffer: &'a mut [u8],
+    pub qr_buffer: Option<&'a mut [u8]>,
+    pub display_status: Option<DisplayStatus<'a>>,
+    pub confirmation: Option<UserConfirmation<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Esp32s3BoardTickReport<'a> {
+    pub transports: Esp32s3V1PollReport,
+    pub qr_payload: Option<&'a [u8]>,
+    pub touch: Option<TouchEvent>,
+    pub confirmation: Option<UserConfirmationDecision>,
+    pub monotonic_millis: u64,
+    pub rollback_secure_version: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Esp32s3OtaStartError<E> {
     BootRequired,
@@ -230,6 +248,36 @@ where
             serial: poll_serial_full_v1(&mut self.runtime, rx_buffer)?,
             usb: poll_usb_full_v1(&mut self.runtime, rx_buffer)?,
             ble: poll_ble_full_v1(&mut self.runtime, rx_buffer)?,
+        })
+    }
+
+    pub fn tick<'a>(
+        &mut self,
+        tick: Esp32s3BoardTick<'a>,
+    ) -> Result<Esp32s3BoardTickReport<'a>, FirmwareFrameError> {
+        let transports = self.poll_v1_transports(tick.rx_buffer)?;
+        if let Some(status) = tick.display_status {
+            self.display_status(status)?;
+        }
+        let confirmation = match tick.confirmation {
+            Some(request) => Some(self.confirm_user(request)?),
+            None => None,
+        };
+        let touch = self.poll_touch()?;
+        let monotonic_millis = self.monotonic_millis()?;
+        let rollback_secure_version = self.rollback_secure_version()?;
+        let qr_payload = match tick.qr_buffer {
+            Some(out) => self.poll_camera_qr(out)?,
+            None => None,
+        };
+
+        Ok(Esp32s3BoardTickReport {
+            transports,
+            qr_payload,
+            touch,
+            confirmation,
+            monotonic_millis,
+            rollback_secure_version,
         })
     }
 
@@ -1210,6 +1258,62 @@ mod tests {
             board.poll_v1_transports(&mut rx).unwrap(),
             Esp32s3V1PollReport::default()
         );
+    }
+
+    #[test]
+    fn s3_board_runtime_tick_polls_services_once() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().serial_rx = Some(v1_request("s", "ping"));
+        board.platform_mut().usb_rx = Some(v1_request("u", "ping"));
+        board.platform_mut().ble_rx = Some(v1_request("b", "ping"));
+        board.platform_mut().camera_rx = Some(b"ur:bytes/s3-tick".to_vec());
+        board.platform_mut().touch_rx = Some(TouchEvent::Release);
+        board.platform_mut().confirmation_decision = UserConfirmationDecision::Approved;
+        board.platform_mut().monotonic_millis = 55;
+        board.platform_mut().rollback_secure_version = 4;
+
+        let mut rx = [0u8; 128];
+        let mut qr = [0u8; 64];
+        assert!(matches!(
+            board.tick(Esp32s3BoardTick {
+                rx_buffer: &mut rx,
+                qr_buffer: Some(&mut qr),
+                display_status: Some(DisplayStatus::Busy("tick")),
+                confirmation: Some(UserConfirmation::Export { label: "xpub" }),
+            }),
+            Err(FirmwareFrameError::BootRequired)
+        ));
+
+        board.boot().unwrap();
+        let report = board
+            .tick(Esp32s3BoardTick {
+                rx_buffer: &mut rx,
+                qr_buffer: Some(&mut qr),
+                display_status: Some(DisplayStatus::Busy("tick")),
+                confirmation: Some(UserConfirmation::Export { label: "xpub" }),
+            })
+            .unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32s3V1PollReport {
+                serial: true,
+                usb: true,
+                ble: true
+            }
+        );
+        assert_eq!(report.qr_payload, Some(&b"ur:bytes/s3-tick"[..]));
+        assert_eq!(report.touch, Some(TouchEvent::Release));
+        assert_eq!(
+            report.confirmation,
+            Some(UserConfirmationDecision::Approved)
+        );
+        assert_eq!(report.monotonic_millis, 55);
+        assert_eq!(report.rollback_secure_version, 4);
+        assert_eq!(board.platform().display_status_count, 1);
+        assert_eq!(board.platform().confirmation_count, 1);
     }
 
     #[test]
