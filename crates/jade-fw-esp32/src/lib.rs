@@ -186,6 +186,17 @@ where
             confirmation,
         })
     }
+
+    pub fn begin_ota_update<W>(
+        &mut self,
+        writer: W,
+        request: OtaRequest,
+    ) -> Result<Esp32OtaSession<W>, Esp32OtaStartError<W::Error>>
+    where
+        W: OtaImageWriter,
+    {
+        self.runtime.begin_ota_update(writer, request)
+    }
 }
 
 impl<'a, P, B> Esp32BoardApp<'a, P, Esp32NvsStorage<B>>
@@ -271,6 +282,17 @@ where
             display_status,
             confirmation,
         )
+    }
+
+    pub fn begin_ota_update<W>(
+        &mut self,
+        writer: W,
+        request: OtaRequest,
+    ) -> Result<Esp32OtaSession<W>, Esp32OtaStartError<W::Error>>
+    where
+        W: OtaImageWriter,
+    {
+        self.runtime.begin_ota_update(writer, request)
     }
 }
 
@@ -1240,6 +1262,65 @@ mod tests {
             .begin_ota_update(TestOtaWriter::new(), request)
             .unwrap();
         assert!(session.writer().unwrap().begun);
+    }
+
+    #[test]
+    fn esp32_board_apps_start_ota_after_boot() {
+        let request = OtaRequest::full(
+            1_000,
+            600,
+            Some([0x11; jade_core::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut rx = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32BoardApp::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut rx,
+            &mut qr,
+        )
+        .unwrap();
+        assert!(matches!(
+            app.begin_ota_update(TestOtaWriter::new(), request),
+            Err(Esp32OtaStartError::BootRequired)
+        ));
+        app.boot().unwrap();
+        assert!(
+            app.begin_ota_update(TestOtaWriter::new(), request)
+                .unwrap()
+                .writer()
+                .unwrap()
+                .begun
+        );
+
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        let mut stream_app = Esp32BoardStreamApp::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut ble_frames,
+            &mut stream_qr,
+        )
+        .unwrap();
+        assert!(matches!(
+            stream_app.begin_ota_update(TestOtaWriter::new(), request),
+            Err(Esp32OtaStartError::BootRequired)
+        ));
+        stream_app.boot().unwrap();
+        assert!(
+            stream_app
+                .begin_ota_update(TestOtaWriter::new(), request)
+                .unwrap()
+                .writer()
+                .unwrap()
+                .begun
+        );
     }
 
     #[test]
