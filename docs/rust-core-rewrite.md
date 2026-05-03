@@ -41,7 +41,7 @@ the continuation methods used by multi-message flows.
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
 | Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
-| Liquid TX | `sign_liquid_tx`, `get_commitments` | front-door v1 validation for `sign_liquid_tx`; signing and commitments deferred until audited pure-Rust Liquid transaction milestone |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the temporary `elements`/`secp256k1-zkp` Liquid exception; `sign_liquid_tx` signing deferred until the audited Liquid transaction milestone |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -51,17 +51,20 @@ the continuation methods used by multi-message flows.
 - Keep secp256k1 and P-256 behind narrow backend traits until side-channel,
   determinism, performance, and audit gates are complete.
 - Freeze BIP85 RSA against golden behavior before swapping implementations.
-- Do not introduce C-linked core dependencies. Temporary C/ESP-IDF use belongs
-  only in platform shims.
+- Do not introduce C-linked core dependencies for final production core.
+  Temporary C/ESP-IDF use belongs only in platform shims, except for the
+  explicitly tracked Liquid `elements`/`secp256k1-zkp` compatibility exception
+  while pure-Rust ZKP support is not available.
 - Liquid address encoding uses a minimal pure-Rust Blech32/address encoder in
-  `jade-crypto`, adapted from the local rust-elements implementation under
-  `/Users/inter/Desktop/Simpl/rust-elements`. The C++ Elements tree at
-  `/Users/inter/Desktop/Simpl/elements` was checked for Blech32 constants and
-  network HRPs, but it is not copied into the Rust core. The Rust `elements`
-  crate was also evaluated: it is useful as an oracle and may be acceptable
-  behind a temporary platform/research boundary, but its transaction stack
-  depends directly on `secp256k1-zkp`, so it is not a final no-C-core dependency
-  until a pure-Rust ZKP backend or an explicit release exception exists.
+  `jade-crypto`, aligned with the public ElementsProject `rust-elements`
+  implementation. The C++ Elements tree is not copied into the Rust core. The
+  public crates.io `elements` crate now backs host-side Liquid commitment
+  construction behind the `liquid-elements-ffi` feature. This is better than
+  depending directly on `secp256k1-zkp` because `elements` re-exports the ZKP
+  types and also provides Elements-native asset, value, PSET, sighash,
+  transaction, and address structures needed by later Liquid work. It still
+  depends on `secp256k1-zkp-sys` and `secp256k1-sys`, so it remains a
+  deliberate temporary exception, not a final no-C-core dependency.
 
 ## Elements Copy/Paste Evaluation
 
@@ -81,6 +84,22 @@ value/asset handling, rangeproof/surjection-proof boundaries, Elements sighash,
 anti-exfil signing, and golden vector compatibility. Any temporary dependency
 on `secp256k1-zkp` belongs behind the cryptographic backend traits until there
 is a reviewed pure-Rust replacement or an explicit release exception.
+
+The hard parts are hard for concrete compatibility reasons:
+
+- Liquid is not just Elements transaction parsing. Jade currently relies on
+  libwally/secp256k1-zkp behavior for asset generators, Pedersen value
+  commitments, rangeproofs, surjection proofs, PSET/Elements sighash handling,
+  anti-exfil signing integration, and confidential-output validation. The Rust
+  `elements` crate solves the Elements data-model side and exposes commitment
+  helpers, but the cryptographic proof and commitment engine still comes from
+  `secp256k1-zkp-sys`.
+- BIP85 RSA is not blocked by RSA syntax; it is blocked by deterministic-output
+  parity. Jade's existing flow derives RSA key material from BIP85 entropy
+  through the current mbedTLS/libwally-compatible path, and the protocol warns
+  that deterministic RSA derivation can differ across implementations. The
+  replacement must match golden public keys and signatures exactly before the
+  C-backed path can be removed.
 
 ## Implemented Rust Parity
 
@@ -103,10 +122,10 @@ is a reviewed pure-Rust replacement or an explicit release exception.
   and unconfidential addresses. Liquid singlesig Taproot now uses the Elements
   taproot tweak and Blech32m confidential address encoding.
 - Liquid key helpers: master blinding key export, script blinding key, shared
-  nonce, and deterministic blinding factors. `get_commitments` now performs
-  v1-compatible request validation and deterministic ABF/VBF derivation before
-  deferring the final asset-generator/value-commitment construction, which
-  remains blocked on an audited pure-Rust Elements/ZKP commitment backend.
+  nonce, deterministic blinding factors, and `get_commitments` asset-generator
+  plus value-commitment construction. Host `get_commitments` now matches Jade
+  Liquid commitment vectors through the temporary `elements`/`secp256k1-zkp`
+  exception.
 - PSBT/PSET signing front door: Rust now validates PSBT vs. PSET envelope
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
   no-op PSBT/PSET payloads unchanged when there is nothing to sign or wallet

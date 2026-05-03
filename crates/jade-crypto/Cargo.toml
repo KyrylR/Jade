@@ -17,12 +17,14 @@ pure-rust-curves = [
     "dep:p256",
     "dep:ripemd",
 ]
+liquid-elements-ffi = ["dep:elements"]
 
 [dependencies]
 aes = { workspace = true, optional = true }
 base58ck = { workspace = true, optional = true }
 bech32 = { workspace = true, optional = true }
 bip32 = { workspace = true, optional = true }
+elements = { workspace = true, optional = true }
 hmac.workspace = true
 k256 = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }

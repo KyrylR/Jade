@@ -10,6 +10,7 @@ pub const SHA256_LEN: usize = 32;
 pub const SHA512_LEN: usize = 64;
 pub const EC_PRIVATE_KEY_LEN: usize = 32;
 pub const EC_PUBLIC_KEY_COMPRESSED_LEN: usize = 33;
+pub const LIQUID_COMMITMENT_LEN: usize = 33;
 pub const OTP_MAX_NAME_LEN: usize = 16;
 pub const OTP_MAX_URI_LEN: usize = 256;
 pub const OTP_MAX_TOKEN_LEN: usize = 12;
@@ -88,6 +89,16 @@ impl BlindingFactorBytes {
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiquidCommitmentData {
+    pub abf: [u8; SHA256_LEN],
+    pub vbf: [u8; SHA256_LEN],
+    pub asset_generator: [u8; LIQUID_COMMITMENT_LEN],
+    pub value_commitment: [u8; LIQUID_COMMITMENT_LEN],
+    pub asset_id: [u8; SHA256_LEN],
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,9 +748,9 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
-        IdentityKeyType, LiquidNetwork, MultisigScriptVariant, PsbtEnvelope, PsbtSignError,
-        SinglesigScriptVariant, TxSignError, XpubPrefix, EC_PRIVATE_KEY_LEN,
-        EC_PUBLIC_KEY_COMPRESSED_LEN, SHA256_LEN, SHA512_LEN,
+        IdentityKeyType, LiquidCommitmentData, LiquidNetwork, MultisigScriptVariant, PsbtEnvelope,
+        PsbtSignError, SinglesigScriptVariant, TxSignError, XpubPrefix, EC_PRIVATE_KEY_LEN,
+        EC_PUBLIC_KEY_COMPRESSED_LEN, LIQUID_COMMITMENT_LEN, SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
@@ -2384,7 +2395,7 @@ pub mod pure_rust {
         }
 
         let private_key = bip32::XPrv::derive_from_path(seed, &derivation_path).ok()?;
-        private_key.to_bytes().as_ref().try_into().ok()
+        Some(private_key.to_bytes())
     }
 
     pub fn public_key_from_serialized_xpub_path(
@@ -3227,6 +3238,48 @@ pub mod pure_rust {
         }
 
         Some(output)
+    }
+
+    #[cfg(feature = "liquid-elements-ffi")]
+    pub fn liquid_commitments_from_factors(
+        asset_id: &[u8; SHA256_LEN],
+        value: u64,
+        abf: &[u8; SHA256_LEN],
+        vbf: &[u8; SHA256_LEN],
+    ) -> Option<LiquidCommitmentData> {
+        use elements::confidential::{
+            Asset, AssetBlindingFactor, Value as ConfidentialValue, ValueBlindingFactor,
+        };
+        use elements::secp256k1_zkp::Secp256k1;
+        use elements::AssetId;
+
+        let secp = Secp256k1::new();
+        let mut wally_asset_id_order = *asset_id;
+        wally_asset_id_order.reverse();
+        let asset = AssetId::from_slice(&wally_asset_id_order).ok()?;
+        let abf_bytes = *abf;
+        let vbf_bytes = *vbf;
+        let abf = AssetBlindingFactor::from_slice(abf).ok()?;
+        let vbf = ValueBlindingFactor::from_slice(vbf).ok()?;
+        let Asset::Confidential(generator) = Asset::new_confidential(&secp, asset, abf) else {
+            return None;
+        };
+        let ConfidentialValue::Confidential(commitment) =
+            ConfidentialValue::new_confidential(&secp, value, generator, vbf)
+        else {
+            return None;
+        };
+
+        let asset_generator: [u8; LIQUID_COMMITMENT_LEN] = generator.serialize();
+        let value_commitment: [u8; LIQUID_COMMITMENT_LEN] = commitment.serialize();
+        Some(LiquidCommitmentData {
+            abf: abf_bytes,
+            vbf: vbf_bytes,
+            asset_generator,
+            value_commitment,
+            asset_id: *asset_id,
+            value,
+        })
     }
 
     fn hash160(bytes: &[u8]) -> [u8; 20] {

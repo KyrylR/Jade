@@ -2814,7 +2814,7 @@ impl Emulator {
                 message: "Expecting parameters map".to_string(),
             };
         };
-        let _asset_id = match params.bytes("asset_id") {
+        let asset_id = match params.bytes("asset_id") {
             Ok(Some(asset_id)) if asset_id.len() == jade_crypto::SHA256_LEN => {
                 let mut bytes = [0u8; jade_crypto::SHA256_LEN];
                 bytes.copy_from_slice(asset_id);
@@ -2822,7 +2822,7 @@ impl Emulator {
             }
             Ok(_) | Err(_) => return bad_parameters("Failed to extract asset_id from parameters"),
         };
-        let _value = match params.u64("value") {
+        let value = match params.u64("value") {
             Ok(Some(value)) => value,
             Ok(None) | Err(_) => return bad_parameters("Failed to extract value from parameters"),
         };
@@ -2862,7 +2862,7 @@ impl Emulator {
         } else {
             jade_crypto::BlindingFactorKind::AssetAndValue
         };
-        let Some(_blinding_factor) = jade_crypto::pure_rust::deterministic_blinding_factor(
+        let Some(blinding_factor) = jade_crypto::pure_rust::deterministic_blinding_factor(
             &master_unblinding_key,
             &hash_prevouts,
             output_index,
@@ -2870,9 +2870,51 @@ impl Emulator {
         ) else {
             return bad_parameters("Failed to compute abf/vbf from the parameters");
         };
+        let (abf, vbf) = if let Some(vbf) = vbf {
+            let mut abf = [0u8; jade_crypto::SHA256_LEN];
+            abf.copy_from_slice(blinding_factor.as_slice());
+            (abf, vbf)
+        } else {
+            let factors = blinding_factor.as_slice();
+            let mut abf = [0u8; jade_crypto::SHA256_LEN];
+            let mut vbf = [0u8; jade_crypto::SHA256_LEN];
+            abf.copy_from_slice(&factors[..jade_crypto::SHA256_LEN]);
+            vbf.copy_from_slice(&factors[jade_crypto::SHA256_LEN..]);
+            (abf, vbf)
+        };
+        let Some(commitments) =
+            jade_crypto::pure_rust::liquid_commitments_from_factors(&asset_id, value, &abf, &vbf)
+        else {
+            return bad_parameters("Failed to build commitments from the parameters");
+        };
 
-        V1Outcome::DeferredToCore {
-            method: "get_commitments commitments".to_string(),
+        V1Outcome::OwnedMapResult {
+            entries: vec![
+                OwnedResultMapEntry {
+                    key: "abf".to_string(),
+                    value: OwnedV1Value::Bytes(commitments.abf.to_vec()),
+                },
+                OwnedResultMapEntry {
+                    key: "vbf".to_string(),
+                    value: OwnedV1Value::Bytes(commitments.vbf.to_vec()),
+                },
+                OwnedResultMapEntry {
+                    key: "asset_generator".to_string(),
+                    value: OwnedV1Value::Bytes(commitments.asset_generator.to_vec()),
+                },
+                OwnedResultMapEntry {
+                    key: "value_commitment".to_string(),
+                    value: OwnedV1Value::Bytes(commitments.value_commitment.to_vec()),
+                },
+                OwnedResultMapEntry {
+                    key: "asset_id".to_string(),
+                    value: OwnedV1Value::Bytes(commitments.asset_id.to_vec()),
+                },
+                OwnedResultMapEntry {
+                    key: "value".to_string(),
+                    value: OwnedV1Value::U64(commitments.value),
+                },
+            ],
         }
     }
 
@@ -12019,16 +12061,125 @@ mod tests {
     }
 
     #[test]
-    fn get_commitments_validates_inputs_before_zkp_defer() {
+    fn get_commitments_returns_liquid_commitment_vectors() {
         let mut emulator = Emulator::new();
+        let mut master_unblinding_key = [0u8; jade_crypto::SHA512_LEN];
+        master_unblinding_key[jade_crypto::SHA256_LEN..].copy_from_slice(&decode_hex::<32>(
+            "afacc503637e85da661ca1706c4ea147f1407868c48d8f92dd339ac272293cdc",
+        ));
         emulator
             .platform_mut()
-            .set_master_unblinding_key([0x99; 64]);
-        let asset_id = [0x11; jade_crypto::SHA256_LEN];
-        let hash_prevouts = [0x22; jade_crypto::SHA256_LEN];
-        let vbf = [0x33; jade_crypto::SHA256_LEN];
+            .set_master_unblinding_key(master_unblinding_key);
+        let asset_id =
+            decode_hex::<32>("5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225");
+        let hash_prevouts =
+            decode_hex::<32>("95f17695f6329dbcce2aa0b7f1eaff823b19d64d8737d642d6e6147f5ec88342");
+        let expected_without_vbf = vec![
+            OwnedResultMapEntry {
+                key: "abf".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<32>(
+                        "42bc9c7025f3df490a208cb362ff220547910da1d3e81c63a6e7c28c3a33a993",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "vbf".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<32>(
+                        "7a6693fde7b88efb8375db618670fb5ccb9b2f7e8743b7d772924f0426c5efe6",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "asset_generator".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<33>(
+                        "0a5cf0a43ad404163946c28b8a36d0e5cb4895b0ee386da4cd1008ffc8cb464501",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "value_commitment".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<33>(
+                        "082d8de9b7f66994abf789b2591738331f88a7ddbef4e553bbf123e47677d60099",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "asset_id".to_string(),
+                value: OwnedV1Value::Bytes(asset_id.to_vec()),
+            },
+            OwnedResultMapEntry {
+                key: "value".to_string(),
+                value: OwnedV1Value::U64(9_000_000),
+            },
+        ];
+        let expected_with_vbf = vec![
+            OwnedResultMapEntry {
+                key: "abf".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<32>(
+                        "a3510210bbab6ed67429af9beaf42f09382e12146a3db466971b58a45516bba0",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "vbf".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<32>(
+                        "6ec064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "asset_generator".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<33>(
+                        "0abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "value_commitment".to_string(),
+                value: OwnedV1Value::Bytes(
+                    decode_hex::<33>(
+                        "094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43",
+                    )
+                    .to_vec(),
+                ),
+            },
+            OwnedResultMapEntry {
+                key: "asset_id".to_string(),
+                value: OwnedV1Value::Bytes(asset_id.to_vec()),
+            },
+            OwnedResultMapEntry {
+                key: "value".to_string(),
+                value: OwnedV1Value::U64(9_000_000),
+            },
+        ];
 
-        for maybe_vbf in [None, Some(&vbf[..])] {
+        for (output_index, maybe_vbf, expected) in [
+            (3u8, None, expected_without_vbf),
+            (
+                0u8,
+                Some(
+                    decode_hex::<32>(
+                        "6ec064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53",
+                    )
+                    .to_vec(),
+                ),
+                expected_with_vbf,
+            ),
+        ] {
             let mut params = Vec::new();
             let field_count = if maybe_vbf.is_some() { 5 } else { 4 };
             let mut encoder = minicbor::Encoder::new(&mut params);
@@ -12049,9 +12200,9 @@ mod tests {
                 .unwrap()
                 .str("output_index")
                 .unwrap()
-                .u8(1)
+                .u8(output_index)
                 .unwrap();
-            if let Some(vbf) = maybe_vbf {
+            if let Some(ref vbf) = maybe_vbf {
                 encoder.str("vbf").unwrap().bytes(vbf).unwrap();
             }
             let request = Request {
@@ -12062,15 +12213,13 @@ mod tests {
 
             assert_eq!(
                 emulator.handle_v1_request(&request),
-                V1Outcome::DeferredToCore {
-                    method: "get_commitments commitments".to_string()
-                }
+                V1Outcome::OwnedMapResult { entries: expected }
             );
         }
     }
 
     #[test]
-    fn get_commitments_rejects_bad_parameters_before_zkp_defer() {
+    fn get_commitments_rejects_bad_parameters_before_commitment_construction() {
         let mut emulator = Emulator::new();
         let asset_id = [0x11; jade_crypto::SHA256_LEN];
         let hash_prevouts = [0x22; jade_crypto::SHA256_LEN];

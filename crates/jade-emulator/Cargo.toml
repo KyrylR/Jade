@@ -10,7 +10,7 @@ rust-version.workspace = true
 base58ck.workspace = true
 bip39 = { workspace = true, features = ["alloc"] }
 jade-core.workspace = true
-jade-crypto = { workspace = true, features = ["pure-rust-curves"] }
+jade-crypto = { workspace = true, features = ["pure-rust-curves", "liquid-elements-ffi"] }
 jade-protocol-v1.workspace = true
 jade-protocol-v2.workspace = true
 jade-storage.workspace = true

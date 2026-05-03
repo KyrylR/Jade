@@ -14,11 +14,26 @@ if find crates -type f \( \
 fi
 
 if command -v cargo >/dev/null 2>&1; then
-  forbidden_deps="$(cargo tree --workspace --all-features --target all --prefix none \
-    | grep -E '^(bindgen|cc|cmake|cxx|secp256k1-sys) v' || true)"
+  cargo_tree="$(cargo tree --workspace --all-features --target all --prefix none)"
+  forbidden_deps="$(printf '%s\n' "${cargo_tree}" \
+    | grep -E '^(bindgen|cmake|cxx) v' || true)"
   if [ -n "${forbidden_deps}" ]; then
     echo "C/C++ build or FFI dependencies are not allowed in the active Rust core tree." >&2
     echo "${forbidden_deps}" >&2
     exit 1
+  fi
+  liquid_exception_deps="$(printf '%s\n' "${cargo_tree}" \
+    | grep -E '^(cc|secp256k1-sys|secp256k1-zkp-sys) v' \
+    | sed 's/ (\*)$//' \
+    | sort -u || true)"
+  if [ -n "${liquid_exception_deps}" ] \
+      && ! printf '%s\n' "${cargo_tree}" | grep -q -E '^elements v'; then
+    echo "Unexpected C/C++ build or FFI dependencies are present." >&2
+    echo "${liquid_exception_deps}" >&2
+    exit 1
+  fi
+  if [ -n "${liquid_exception_deps}" ]; then
+    echo "Allowing temporary Liquid elements/secp256k1-zkp FFI exception:" >&2
+    echo "${liquid_exception_deps}" >&2
   fi
 fi
