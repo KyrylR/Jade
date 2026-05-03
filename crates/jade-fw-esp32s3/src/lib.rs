@@ -6,11 +6,13 @@ extern crate alloc;
 extern crate std;
 
 use jade_core::{
-    AllocationBudget, CborFrameBuffer, DeviceBootFailure, DeviceFeatureSet, DeviceManifest,
-    DeviceMemoryBudget, DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError,
-    DeviceTarget, DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
-    OtaWriteError, OtaWriteSession, UserConfirmation, UserConfirmationDecision,
+    AllocationBudget, CborFrameBuffer, CoreResult, CoreState, DeviceBootFailure, DeviceBootReport,
+    DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget, DevicePartitionLayout, DevicePlatform,
+    DeviceRuntime, DeviceRuntimeError, DeviceTarget, DisplayStatus, FirmwareFrameError,
+    FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError, OtaWriteSession, Platform,
+    UserConfirmation, UserConfirmationDecision, VersionInfo,
 };
+use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
 
 pub const TARGET_SOC: &str = "esp32s3";
 pub const OFFICIAL_TARGETS: &[DeviceTarget] = &[DeviceTarget::JadeV2, DeviceTarget::JadeV2c];
@@ -73,6 +75,217 @@ pub trait Esp32s3PlatformShim: DevicePlatform {
         challenge: &[u8],
         out: &mut [u8],
     ) -> Result<usize, DeviceBootFailure>;
+}
+
+pub trait Esp32s3Hardware {
+    fn manifest(&self) -> DeviceManifest;
+    fn boot_report(&mut self) -> DeviceBootReport;
+    fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure>;
+    fn monotonic_millis(&self) -> u64;
+    fn rollback_secure_version(&self) -> u32;
+    fn idf_version(&self) -> &'static str {
+        "rust"
+    }
+    fn efusemac(&self) -> &'static str {
+        ""
+    }
+    fn add_entropy(&mut self, _entropy: &[u8]) -> CoreResult<()> {
+        Ok(())
+    }
+    fn set_epoch(&mut self, _epoch: u64) -> CoreResult<()> {
+        Ok(())
+    }
+    fn current_epoch(&self) -> Option<u64> {
+        None
+    }
+    fn serial_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure>;
+    fn serial_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
+    fn usb_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure>;
+    fn usb_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
+    fn ble_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure>;
+    fn ble_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
+    fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
+    fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure>;
+    fn display_status(&mut self, status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure>;
+    fn confirm_user(
+        &mut self,
+        request: UserConfirmation<'_>,
+    ) -> Result<UserConfirmationDecision, DeviceBootFailure>;
+    fn hardware_attestation_available(&self) -> bool;
+    fn hardware_attestation_public_key_pem(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure>;
+    fn hardware_attestation_ext_signature(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure>;
+    fn hardware_attestation_sign(
+        &mut self,
+        challenge: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure>;
+}
+
+#[derive(Debug)]
+pub struct Esp32s3DevicePlatform<H> {
+    runtime_state: RuntimePlatformState,
+    hardware: H,
+}
+
+impl<H> Esp32s3DevicePlatform<H> {
+    pub fn new(hardware: H) -> Self {
+        Self {
+            runtime_state: RuntimePlatformState::default(),
+            hardware,
+        }
+    }
+
+    pub fn with_runtime_state(hardware: H, runtime_state: RuntimePlatformState) -> Self {
+        Self {
+            runtime_state,
+            hardware,
+        }
+    }
+
+    pub fn hardware(&self) -> &H {
+        &self.hardware
+    }
+
+    pub fn hardware_mut(&mut self) -> &mut H {
+        &mut self.hardware
+    }
+
+    pub fn into_inner(self) -> (H, RuntimePlatformState) {
+        (self.hardware, self.runtime_state)
+    }
+}
+
+impl<H: Esp32s3Hardware> Platform for Esp32s3DevicePlatform<H> {
+    fn version_info<'a>(&'a self, state: &CoreState) -> VersionInfo<'a> {
+        jade_core::static_version_info(
+            self.hardware.manifest(),
+            state,
+            self.hardware.idf_version(),
+            self.hardware.efusemac(),
+            self.runtime_state.jade_has_pin(),
+        )
+    }
+
+    fn add_entropy(&mut self, entropy: &[u8]) -> CoreResult<()> {
+        self.hardware.add_entropy(entropy)
+    }
+
+    fn set_epoch(&mut self, epoch: u64) -> CoreResult<()> {
+        self.hardware.set_epoch(epoch)
+    }
+}
+
+impl<H: Esp32s3Hardware> RuntimePlatformStateAccess for Esp32s3DevicePlatform<H> {
+    fn runtime_state(&self) -> &RuntimePlatformState {
+        &self.runtime_state
+    }
+
+    fn runtime_state_mut(&mut self) -> &mut RuntimePlatformState {
+        &mut self.runtime_state
+    }
+
+    fn runtime_current_epoch(&self) -> Option<u64> {
+        self.hardware.current_epoch()
+    }
+}
+
+impl<H: Esp32s3Hardware> DevicePlatform for Esp32s3DevicePlatform<H> {
+    fn manifest(&self) -> DeviceManifest {
+        self.hardware.manifest()
+    }
+
+    fn boot_report(&mut self) -> DeviceBootReport {
+        self.hardware.boot_report()
+    }
+
+    fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
+        self.hardware.fill_random(out)
+    }
+
+    fn monotonic_millis(&self) -> u64 {
+        self.hardware.monotonic_millis()
+    }
+
+    fn rollback_secure_version(&self) -> u32 {
+        self.hardware.rollback_secure_version()
+    }
+}
+
+impl<H: Esp32s3Hardware> Esp32s3PlatformShim for Esp32s3DevicePlatform<H> {
+    fn serial_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+        self.hardware.serial_send(bytes)
+    }
+
+    fn serial_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+        self.hardware.serial_recv(out)
+    }
+
+    fn usb_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+        self.hardware.usb_send(bytes)
+    }
+
+    fn usb_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+        self.hardware.usb_recv(out)
+    }
+
+    fn ble_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+        self.hardware.ble_send(bytes)
+    }
+
+    fn ble_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+        self.hardware.ble_recv(out)
+    }
+
+    fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+        self.hardware.camera_qr_scan(out)
+    }
+
+    fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure> {
+        self.hardware.touch_poll()
+    }
+
+    fn display_status(&mut self, status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure> {
+        self.hardware.display_status(status)
+    }
+
+    fn confirm_user(
+        &mut self,
+        request: UserConfirmation<'_>,
+    ) -> Result<UserConfirmationDecision, DeviceBootFailure> {
+        self.hardware.confirm_user(request)
+    }
+
+    fn hardware_attestation_available(&self) -> bool {
+        self.hardware.hardware_attestation_available()
+    }
+
+    fn hardware_attestation_public_key_pem(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure> {
+        self.hardware.hardware_attestation_public_key_pem(out)
+    }
+
+    fn hardware_attestation_ext_signature(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure> {
+        self.hardware.hardware_attestation_ext_signature(out)
+    }
+
+    fn hardware_attestation_sign(
+        &mut self,
+        challenge: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure> {
+        self.hardware.hardware_attestation_sign(challenge, out)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1594,7 +1807,7 @@ mod tests {
         vec::Vec,
     };
     use jade_core::{CoreResult, CoreState, Platform, VersionInfo};
-    use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
+    use jade_emulator::{RuntimePlatform, RuntimePlatformState, RuntimePlatformStateAccess};
     use jade_protocol_v2::{RequestBody, RequestKind, ResponseBody};
     use minicbor::{Decoder, Encoder};
 
@@ -1943,6 +2156,121 @@ mod tests {
         }
     }
 
+    impl Esp32s3Hardware for TestPlatform {
+        fn manifest(&self) -> DeviceManifest {
+            self.manifest
+        }
+
+        fn boot_report(&mut self) -> jade_core::DeviceBootReport {
+            self.boot_report
+        }
+
+        fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
+            out.fill(0x5a);
+            Ok(())
+        }
+
+        fn monotonic_millis(&self) -> u64 {
+            self.monotonic_millis
+        }
+
+        fn rollback_secure_version(&self) -> u32 {
+            self.rollback_secure_version
+        }
+
+        fn idf_version(&self) -> &'static str {
+            "esp-idf-rust"
+        }
+
+        fn efusemac(&self) -> &'static str {
+            "001122334455"
+        }
+
+        fn set_epoch(&mut self, epoch: u64) -> CoreResult<()> {
+            self.epoch = Some(epoch);
+            Ok(())
+        }
+
+        fn current_epoch(&self) -> Option<u64> {
+            self.epoch
+        }
+
+        fn serial_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            self.serial_tx.push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn serial_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Self::recv_frame(&mut self.serial_rx, out)
+        }
+
+        fn usb_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            self.usb_tx.push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn usb_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Self::recv_frame(&mut self.usb_rx, out)
+        }
+
+        fn ble_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            self.ble_tx.push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn ble_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Self::recv_frame(&mut self.ble_rx, out)
+        }
+
+        fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Self::recv_frame(&mut self.camera_rx, out)
+        }
+
+        fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure> {
+            Ok(self.touch_rx.take())
+        }
+
+        fn display_status(&mut self, _status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure> {
+            self.display_status_count += 1;
+            Ok(())
+        }
+
+        fn confirm_user(
+            &mut self,
+            _request: UserConfirmation<'_>,
+        ) -> Result<UserConfirmationDecision, DeviceBootFailure> {
+            self.confirmation_count += 1;
+            Ok(self.confirmation_decision)
+        }
+
+        fn hardware_attestation_available(&self) -> bool {
+            self.attestation_available
+        }
+
+        fn hardware_attestation_public_key_pem(
+            &mut self,
+            out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Self::copy_frame(&self.attestation_pubkey_pem, out)
+        }
+
+        fn hardware_attestation_ext_signature(
+            &mut self,
+            out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Self::copy_frame(&self.attestation_ext_signature, out)
+        }
+
+        fn hardware_attestation_sign(
+            &mut self,
+            challenge: &[u8],
+            out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            self.attestation_challenge = Some(challenge.to_vec());
+            Self::copy_frame(&self.attestation_signature, out)
+        }
+    }
+
     #[test]
     fn s3_manifests_match_shipping_targets() {
         assert_eq!(
@@ -1956,6 +2284,144 @@ mod tests {
         assert_eq!(manifest_for_target(DeviceTarget::Jade), None);
         assert_manifest_matches_real_device(JADE_V2_MANIFEST).unwrap();
         assert_manifest_matches_real_device(JADE_V2C_MANIFEST).unwrap();
+    }
+
+    #[test]
+    fn s3_device_platform_adapter_delegates_hardware_and_runtime_state() {
+        let mut platform = Esp32s3DevicePlatform::new(TestPlatform::new(JADE_V2_MANIFEST));
+        platform.set_wallet_seed(vec![1, 2, 3, 4]);
+        platform.set_jade_has_pin(true);
+        assert_eq!(platform.wallet_seed(), Some(&[1, 2, 3, 4][..]));
+
+        let info = platform.version_info(&CoreState::default());
+        assert_eq!(info.board_type, Cow::Borrowed("jade_v2"));
+        assert!(info.jade_has_pin);
+        assert_eq!(info.idf_version, Cow::Borrowed("esp-idf-rust"));
+        assert_eq!(info.efusemac, Cow::Borrowed("001122334455"));
+
+        platform.set_epoch(42).unwrap();
+        assert_eq!(platform.runtime_current_epoch(), Some(42));
+
+        let mut random = [0u8; 4];
+        platform.fill_random(&mut random).unwrap();
+        assert_eq!(random, [0x5a; 4]);
+        assert_eq!(platform.monotonic_millis(), 1);
+        assert_eq!(platform.rollback_secure_version(), 1);
+
+        platform.hardware_mut().serial_rx = Some(vec![1, 2, 3]);
+        platform.hardware_mut().usb_rx = Some(vec![4, 5]);
+        platform.hardware_mut().ble_rx = Some(vec![6, 7]);
+        platform.hardware_mut().camera_rx = Some(b"qr".to_vec());
+        platform.hardware_mut().touch_rx = Some(TouchEvent::Press { x: 10, y: 20 });
+        let mut out = [0u8; 8];
+        assert_eq!(
+            Esp32s3PlatformShim::serial_recv(&mut platform, &mut out).unwrap(),
+            3
+        );
+        assert_eq!(&out[..3], &[1, 2, 3]);
+        assert_eq!(
+            Esp32s3PlatformShim::usb_recv(&mut platform, &mut out).unwrap(),
+            2
+        );
+        assert_eq!(&out[..2], &[4, 5]);
+        assert_eq!(
+            Esp32s3PlatformShim::ble_recv(&mut platform, &mut out).unwrap(),
+            2
+        );
+        assert_eq!(&out[..2], &[6, 7]);
+        assert_eq!(
+            Esp32s3PlatformShim::camera_qr_scan(&mut platform, &mut out).unwrap(),
+            2
+        );
+        assert_eq!(&out[..2], b"qr");
+        assert_eq!(
+            Esp32s3PlatformShim::touch_poll(&mut platform).unwrap(),
+            Some(TouchEvent::Press { x: 10, y: 20 })
+        );
+
+        Esp32s3PlatformShim::serial_send(&mut platform, b"serial").unwrap();
+        Esp32s3PlatformShim::usb_send(&mut platform, b"usb").unwrap();
+        Esp32s3PlatformShim::ble_send(&mut platform, b"ble").unwrap();
+        assert_eq!(platform.hardware().serial_tx, vec![b"serial".to_vec()]);
+        assert_eq!(platform.hardware().usb_tx, vec![b"usb".to_vec()]);
+        assert_eq!(platform.hardware().ble_tx, vec![b"ble".to_vec()]);
+
+        Esp32s3PlatformShim::display_status(&mut platform, DisplayStatus::Busy("busy")).unwrap();
+        assert_eq!(
+            Esp32s3PlatformShim::confirm_user(
+                &mut platform,
+                UserConfirmation::Export { label: "xpub" }
+            )
+            .unwrap(),
+            UserConfirmationDecision::Approved
+        );
+        assert_eq!(platform.hardware().display_status_count, 1);
+        assert_eq!(platform.hardware().confirmation_count, 1);
+
+        platform.hardware_mut().attestation_pubkey_pem = Some(b"pem".to_vec());
+        platform.hardware_mut().attestation_ext_signature = Some(b"ext".to_vec());
+        platform.hardware_mut().attestation_signature = Some(b"sig".to_vec());
+        assert!(Esp32s3PlatformShim::hardware_attestation_available(
+            &platform
+        ));
+        assert_eq!(
+            Esp32s3PlatformShim::hardware_attestation_public_key_pem(&mut platform, &mut out)
+                .unwrap(),
+            3
+        );
+        assert_eq!(&out[..3], b"pem");
+        assert_eq!(
+            Esp32s3PlatformShim::hardware_attestation_ext_signature(&mut platform, &mut out)
+                .unwrap(),
+            3
+        );
+        assert_eq!(&out[..3], b"ext");
+        assert_eq!(
+            Esp32s3PlatformShim::hardware_attestation_sign(&mut platform, b"challenge", &mut out)
+                .unwrap(),
+            3
+        );
+        assert_eq!(&out[..3], b"sig");
+        assert_eq!(
+            platform.hardware().attestation_challenge,
+            Some(b"challenge".to_vec())
+        );
+
+        let (hardware, runtime_state) = platform.into_inner();
+        assert_eq!(hardware.epoch, Some(42));
+        assert!(runtime_state.jade_has_pin());
+    }
+
+    #[test]
+    fn s3_device_platform_adapter_runs_board_stream_loop() {
+        let mut platform = Esp32s3DevicePlatform::new(TestPlatform::new(JADE_V2_MANIFEST));
+        platform.hardware_mut().usb_rx = Some(v1_request("u", "ping"));
+
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut usb_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let mut app = Esp32s3BoardStreamApp::new(
+            platform,
+            jade_storage::MemoryStorage::new(),
+            &mut serial_frames,
+            &mut usb_frames,
+            &mut ble_frames,
+            &mut qr,
+        )
+        .unwrap();
+
+        app.boot().unwrap();
+        let report = app.tick(None, None).unwrap();
+        assert_eq!(
+            report.transports,
+            Esp32s3V1PollReport {
+                serial: false,
+                usb: true,
+                ble: false
+            }
+        );
+        assert_eq!(app.runtime().platform().hardware().usb_tx.len(), 1);
     }
 
     #[test]

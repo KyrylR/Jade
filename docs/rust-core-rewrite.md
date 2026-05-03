@@ -57,6 +57,19 @@ through `DeviceRuntime`; the full-v1 pollers dispatch through
 wallet/signing/auth/management v1 engine directly to serial/BLE/USB shims and
 write replies back through the same link.
 
+Both firmware crates now also provide reusable device platform adapters for
+production bring-up: `Esp32DevicePlatform<H>` over `Esp32Hardware`, and
+`Esp32s3DevicePlatform<H>` over `Esp32s3Hardware`. These adapters own the
+shared `RuntimePlatformState` exported by `jade-emulator`, implement
+`Platform`, `DevicePlatform`, `RuntimePlatform`, and the target-specific board
+shim traits, and leave the concrete backend responsible only for raw hardware
+operations: manifest/boot report, RNG, clock, rollback counter, serial/BLE/USB
+I/O, camera QR input, display/user confirmation, touch, and ESP32-S3 hardware
+attestation. This is the intended real-device contract for replacing C/C++
+application code: board support code implements the small hardware trait, then
+the Rust firmware crate supplies the runtime state glue, version metadata,
+boot-gated board runtime, and stream-loop dispatch.
+
 Both firmware crates also expose constructors for the full generic v1 runtime:
 `jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
 Those constructors instantiate `JadeRuntime<P, B>` with `jade-emulator`
