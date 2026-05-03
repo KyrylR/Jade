@@ -153,8 +153,7 @@ pub enum DeviceBootFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceBootReport {
-    pub target: DeviceTarget,
+pub struct DeviceBootReadiness {
     pub entropy_ready: bool,
     pub storage_ready: bool,
     pub ota_ready: bool,
@@ -163,10 +162,9 @@ pub struct DeviceBootReport {
     pub rollback_ready: bool,
 }
 
-impl DeviceBootReport {
-    pub const fn ok(target: DeviceTarget) -> Self {
+impl DeviceBootReadiness {
+    pub const fn ready() -> Self {
         Self {
-            target,
             entropy_ready: true,
             storage_ready: true,
             ota_ready: true,
@@ -192,6 +190,56 @@ impl DeviceBootReport {
         } else {
             None
         }
+    }
+}
+
+impl Default for DeviceBootReadiness {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceBootReport {
+    pub target: DeviceTarget,
+    pub entropy_ready: bool,
+    pub storage_ready: bool,
+    pub ota_ready: bool,
+    pub transport_ready: bool,
+    pub display_ready: bool,
+    pub rollback_ready: bool,
+}
+
+impl DeviceBootReport {
+    pub const fn ok(target: DeviceTarget) -> Self {
+        Self::from_readiness(target, DeviceBootReadiness::ready())
+    }
+
+    pub const fn from_readiness(target: DeviceTarget, readiness: DeviceBootReadiness) -> Self {
+        Self {
+            target,
+            entropy_ready: readiness.entropy_ready,
+            storage_ready: readiness.storage_ready,
+            ota_ready: readiness.ota_ready,
+            transport_ready: readiness.transport_ready,
+            display_ready: readiness.display_ready,
+            rollback_ready: readiness.rollback_ready,
+        }
+    }
+
+    pub const fn readiness(self) -> DeviceBootReadiness {
+        DeviceBootReadiness {
+            entropy_ready: self.entropy_ready,
+            storage_ready: self.storage_ready,
+            ota_ready: self.ota_ready,
+            transport_ready: self.transport_ready,
+            display_ready: self.display_ready,
+            rollback_ready: self.rollback_ready,
+        }
+    }
+
+    pub const fn first_failure(self) -> Option<DeviceBootFailure> {
+        self.readiness().first_failure()
     }
 }
 
@@ -448,6 +496,27 @@ mod tests {
             ))
         );
         assert!(!runtime.is_booted());
+    }
+
+    #[test]
+    fn boot_readiness_builds_target_report_and_preserves_failure_order() {
+        let readiness = DeviceBootReadiness {
+            transport_ready: false,
+            display_ready: false,
+            ..DeviceBootReadiness::ready()
+        };
+        let report = DeviceBootReport::from_readiness(DeviceTarget::JadeV1_1, readiness);
+
+        assert_eq!(report.target, DeviceTarget::JadeV1_1);
+        assert_eq!(report.readiness(), readiness);
+        assert_eq!(
+            readiness.first_failure(),
+            Some(DeviceBootFailure::TransportUnavailable)
+        );
+        assert_eq!(
+            report.first_failure(),
+            Some(DeviceBootFailure::TransportUnavailable)
+        );
     }
 
     #[test]

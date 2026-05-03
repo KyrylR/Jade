@@ -4,11 +4,11 @@
 extern crate alloc;
 
 use jade_core::{
-    AllocationBudget, CborFrameBuffer, CoreResult, CoreState, DeviceBootFailure, DeviceBootReport,
-    DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget, DevicePartitionLayout, DevicePlatform,
-    DeviceRuntime, DeviceRuntimeError, DeviceTarget, DisplayStatus, FirmwareFrameError,
-    FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError, OtaWriteSession, Platform,
-    UserConfirmation, UserConfirmationDecision, VersionInfo,
+    AllocationBudget, CborFrameBuffer, CoreResult, CoreState, DeviceBootFailure,
+    DeviceBootReadiness, DeviceBootReport, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
+    DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
+    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
+    OtaWriteSession, Platform, UserConfirmation, UserConfirmationDecision, VersionInfo,
 };
 use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
 
@@ -60,7 +60,12 @@ pub trait Esp32PlatformShim: DevicePlatform {
 
 pub trait Esp32Hardware {
     fn manifest(&self) -> DeviceManifest;
-    fn boot_report(&mut self) -> DeviceBootReport;
+    fn boot_readiness(&mut self) -> DeviceBootReadiness {
+        DeviceBootReadiness::ready()
+    }
+    fn boot_report(&mut self) -> DeviceBootReport {
+        DeviceBootReport::from_readiness(self.manifest().target, self.boot_readiness())
+    }
     fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure>;
     fn monotonic_millis(&self) -> u64;
     fn rollback_secure_version(&self) -> u32;
@@ -1872,6 +1877,66 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ReadinessHardware {
+        manifest: DeviceManifest,
+        readiness: DeviceBootReadiness,
+    }
+
+    impl Esp32Hardware for ReadinessHardware {
+        fn manifest(&self) -> DeviceManifest {
+            self.manifest
+        }
+
+        fn boot_readiness(&mut self) -> DeviceBootReadiness {
+            self.readiness
+        }
+
+        fn fill_random(&mut self, out: &mut [u8]) -> Result<(), DeviceBootFailure> {
+            out.fill(0x5a);
+            Ok(())
+        }
+
+        fn monotonic_millis(&self) -> u64 {
+            1
+        }
+
+        fn rollback_secure_version(&self) -> u32 {
+            1
+        }
+
+        fn serial_send(&mut self, _bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn serial_recv(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn ble_send(&mut self, _bytes: &[u8]) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn ble_recv(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn camera_qr_scan(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Ok(0)
+        }
+
+        fn display_status(&mut self, _status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure> {
+            Ok(())
+        }
+
+        fn confirm_user(
+            &mut self,
+            _request: UserConfirmation<'_>,
+        ) -> Result<UserConfirmationDecision, DeviceBootFailure> {
+            Ok(UserConfirmationDecision::Rejected)
+        }
+    }
+
     #[test]
     fn esp32_manifests_match_shipping_targets() {
         assert_eq!(manifest_for_target(DeviceTarget::Jade), Some(JADE_MANIFEST));
@@ -1882,6 +1947,29 @@ mod tests {
         assert_eq!(manifest_for_target(DeviceTarget::JadeV2), None);
         assert_manifest_matches_real_device(JADE_MANIFEST).unwrap();
         assert_manifest_matches_real_device(JADE_V1_1_MANIFEST).unwrap();
+    }
+
+    #[test]
+    fn esp32_device_platform_can_derive_boot_report_from_readiness() {
+        let readiness = DeviceBootReadiness {
+            storage_ready: false,
+            ..DeviceBootReadiness::ready()
+        };
+        let mut runtime = runtime_for_v1(Esp32DevicePlatform::new(ReadinessHardware {
+            manifest: JADE_MANIFEST,
+            readiness,
+        }));
+
+        assert_eq!(
+            runtime.boot(),
+            Err(DeviceRuntimeError::Boot(
+                DeviceBootFailure::StorageUnavailable
+            ))
+        );
+        assert_eq!(
+            runtime.platform_mut().boot_report(),
+            DeviceBootReport::from_readiness(DeviceTarget::Jade, readiness)
+        );
     }
 
     #[test]

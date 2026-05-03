@@ -20,9 +20,9 @@ pub mod ui;
 pub use allocation::{AllocationBudget, AllocationFailure};
 pub use bip32_path::{JadeDerivationPath, PathError};
 pub use device::{
-    static_version_info, DeviceBootFailure, DeviceBootReport, DeviceFeatureSet, DeviceManifest,
-    DeviceMemoryBudget, DeviceOtaError, DevicePartitionLayout, DevicePlatform, DeviceRuntime,
-    DeviceRuntimeError, DeviceSoc, DeviceTarget,
+    static_version_info, DeviceBootFailure, DeviceBootReadiness, DeviceBootReport,
+    DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget, DeviceOtaError, DevicePartitionLayout,
+    DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceSoc, DeviceTarget,
 };
 pub use firmware::{
     complete_cbor_frame_len, handle_v1_cbor, CborFrameBuffer, CborFrameBufferError,

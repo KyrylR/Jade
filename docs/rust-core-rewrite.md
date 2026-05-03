@@ -69,6 +69,12 @@ attestation. This is the intended real-device contract for replacing C/C++
 application code: board support code implements the small hardware trait, then
 the Rust firmware crate supplies the runtime state glue, version metadata,
 boot-gated board runtime, and stream-loop dispatch.
+`jade-core::DeviceBootReadiness` now gives those hardware backends a shared
+boot-readiness shape for entropy, storage, OTA state, transport, display, and
+rollback checks. The ESP32/ESP32-S3 hardware traits can derive the public
+`DeviceBootReport` from those booleans by default, so real board code does not
+need to hand-assemble the report or duplicate the first-failure ordering used
+by the boot gate.
 
 Both firmware crates also expose constructors for the full generic v1 runtime:
 `jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
