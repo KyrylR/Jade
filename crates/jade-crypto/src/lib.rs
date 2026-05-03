@@ -1854,7 +1854,7 @@ pub mod pure_rust {
 
         if let Some(witness_script) = &input.witness_script {
             let script = witness_script.as_bytes();
-            if script_contains_pubkey(script, pubkey) {
+            if script_matches_supported_multisig_policy(script, pubkey) {
                 let witness_script_hash = Sha256::digest(script);
                 let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
                 if witness_program == prevout.script_pubkey.as_bytes()
@@ -1872,7 +1872,7 @@ pub mod pure_rust {
 
         if let Some(redeem_script) = &input.redeem_script {
             let script = redeem_script.as_bytes();
-            if script_contains_pubkey(script, pubkey)
+            if script_matches_supported_multisig_policy(script, pubkey)
                 && p2sh_script_pubkey(&hash160(script)) == prevout.script_pubkey.as_bytes()
             {
                 return Ok((elements::Script::from(script.to_vec()), false));
@@ -2472,7 +2472,7 @@ pub mod pure_rust {
         }
 
         if let Some(witness_script) = input.single_value(0x05) {
-            if script_contains_pubkey(witness_script, pubkey) {
+            if script_matches_supported_multisig_policy(witness_script, pubkey) {
                 let witness_script_hash = Sha256::digest(witness_script);
                 let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
                 if witness_program == prev_output.script
@@ -2493,7 +2493,7 @@ pub mod pure_rust {
         }
 
         if let Some(redeem_script) = input.single_value(0x04) {
-            if script_contains_pubkey(redeem_script, pubkey)
+            if script_matches_supported_multisig_policy(redeem_script, pubkey)
                 && p2sh_script_pubkey(&hash160(redeem_script)) == prev_output.script
             {
                 return Ok(legacy_sighash_all(
@@ -2510,13 +2510,136 @@ pub mod pure_rust {
         Err(PsbtSignError::Unsupported)
     }
 
-    fn script_contains_pubkey(script: &[u8], pubkey: &[u8]) -> bool {
+    pub(crate) fn script_matches_supported_multisig_policy(script: &[u8], pubkey: &[u8]) -> bool {
         pubkey.len() == EC_PUBLIC_KEY_COMPRESSED_LEN
-            && script
-                .windows(1 + EC_PUBLIC_KEY_COMPRESSED_LEN)
-                .any(|window| {
-                    window[0] == EC_PUBLIC_KEY_COMPRESSED_LEN as u8 && &window[1..] == pubkey
-                })
+            && (standard_multisig_script_contains_pubkey(script, pubkey)
+                || bitcoin_green_csv_script_contains_pubkey(script, pubkey)
+                || liquid_green_csv_script_contains_pubkey(script, pubkey))
+    }
+
+    fn standard_multisig_script_contains_pubkey(script: &[u8], pubkey: &[u8]) -> bool {
+        const OP_CHECKMULTISIG: u8 = 0xae;
+
+        let Some(threshold) = script.first().and_then(|op| script_small_int(*op)) else {
+            return false;
+        };
+        let mut pos = 1usize;
+        let mut key_count = 0u8;
+        let mut matched = false;
+        while script.get(pos) == Some(&(EC_PUBLIC_KEY_COMPRESSED_LEN as u8)) {
+            let Some(key) = script.get(pos + 1..pos + 1 + EC_PUBLIC_KEY_COMPRESSED_LEN) else {
+                return false;
+            };
+            if !matches!(key.first(), Some(0x02 | 0x03)) {
+                return false;
+            }
+            matched |= key == pubkey;
+            key_count = match key_count.checked_add(1) {
+                Some(count) if count <= 16 => count,
+                _ => return false,
+            };
+            pos += 1 + EC_PUBLIC_KEY_COMPRESSED_LEN;
+        }
+
+        let Some(declared_count) = script.get(pos).and_then(|op| script_small_int(*op)) else {
+            return false;
+        };
+        matched
+            && key_count > 0
+            && threshold > 0
+            && threshold <= key_count
+            && declared_count == key_count
+            && script.get(pos + 1) == Some(&OP_CHECKMULTISIG)
+            && pos + 2 == script.len()
+    }
+
+    fn bitcoin_green_csv_script_contains_pubkey(script: &[u8], pubkey: &[u8]) -> bool {
+        const OP_CHECKSIG: u8 = 0xac;
+        const OP_CHECKSIGVERIFY: u8 = 0xad;
+        const OP_IFDUP: u8 = 0x73;
+        const OP_NOTIF: u8 = 0x64;
+        const OP_CSV: u8 = 0xb2;
+        const OP_ENDIF: u8 = 0x68;
+
+        if script.len() < 76
+            || script[0] != EC_PUBLIC_KEY_COMPRESSED_LEN as u8
+            || script[34] != OP_CHECKSIGVERIFY
+            || script[35] != EC_PUBLIC_KEY_COMPRESSED_LEN as u8
+            || script[69] != OP_CHECKSIG
+            || script[70] != OP_IFDUP
+            || script[71] != OP_NOTIF
+        {
+            return false;
+        }
+
+        let csv_len = script[72] as usize;
+        let Some(csv_end) = 73usize.checked_add(csv_len) else {
+            return false;
+        };
+        let Some(script_len) = csv_end.checked_add(2) else {
+            return false;
+        };
+
+        script_len == script.len()
+            && script.get(csv_end) == Some(&OP_CSV)
+            && script.get(csv_end + 1) == Some(&OP_ENDIF)
+            && (&script[1..34] == pubkey || &script[36..69] == pubkey)
+    }
+
+    fn liquid_green_csv_script_contains_pubkey(script: &[u8], pubkey: &[u8]) -> bool {
+        const OP_DEPTH: u8 = 0x74;
+        const OP_1SUB: u8 = 0x8c;
+        const OP_IF: u8 = 0x63;
+        const OP_ELSE: u8 = 0x67;
+        const OP_ENDIF: u8 = 0x68;
+        const OP_DROP: u8 = 0x75;
+        const OP_CHECKSIG: u8 = 0xac;
+        const OP_CHECKSIGVERIFY: u8 = 0xad;
+        const OP_CSV: u8 = 0xb2;
+
+        if script.len() < 79
+            || script[0] != OP_DEPTH
+            || script[1] != OP_1SUB
+            || script[2] != OP_IF
+            || script[3] != EC_PUBLIC_KEY_COMPRESSED_LEN as u8
+            || script[37] != OP_CHECKSIGVERIFY
+            || script[38] != OP_ELSE
+        {
+            return false;
+        }
+
+        let csv_len = script[39] as usize;
+        let Some(csv_end) = 40usize.checked_add(csv_len) else {
+            return false;
+        };
+        let Some(user_push) = csv_end.checked_add(3) else {
+            return false;
+        };
+        let Some(user_key_start) = user_push.checked_add(1) else {
+            return false;
+        };
+        let Some(user_key_end) = user_key_start.checked_add(EC_PUBLIC_KEY_COMPRESSED_LEN) else {
+            return false;
+        };
+        let Some(script_len) = user_key_end.checked_add(1) else {
+            return false;
+        };
+
+        script_len == script.len()
+            && script.get(csv_end) == Some(&OP_CSV)
+            && script.get(csv_end + 1) == Some(&OP_DROP)
+            && script.get(csv_end + 2) == Some(&OP_ENDIF)
+            && script.get(user_push) == Some(&(EC_PUBLIC_KEY_COMPRESSED_LEN as u8))
+            && script.get(user_key_end) == Some(&OP_CHECKSIG)
+            && (&script[4..37] == pubkey
+                || script.get(user_key_start..user_key_end) == Some(pubkey))
+    }
+
+    fn script_small_int(op: u8) -> Option<u8> {
+        match op {
+            0x51..=0x60 => Some(op - 0x50),
+            _ => None,
+        }
     }
 
     fn p2tr_script_pubkey(output_key: &[u8; SHA256_LEN]) -> Vec<u8> {
@@ -4819,6 +4942,7 @@ mod otp_tests {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+    use alloc::vec::Vec;
     use rsa::pkcs8::DecodePublicKey;
 
     #[test]
@@ -4849,6 +4973,69 @@ mod tests {
                 0x5b, 0x16, 0xf8, 0x17, 0x98,
             ]
         );
+    }
+
+    #[test]
+    fn multisig_policy_matcher_rejects_arbitrary_pubkey_scripts() {
+        let mut private_key = [0u8; EC_PRIVATE_KEY_LEN];
+        private_key[EC_PRIVATE_KEY_LEN - 1] = 1;
+        let pubkey = pure_rust::public_key_from_private_key(&private_key).unwrap();
+
+        let mut standard_multisig = Vec::new();
+        standard_multisig.push(0x51);
+        standard_multisig.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+        standard_multisig.extend_from_slice(&pubkey);
+        standard_multisig.push(0x51);
+        standard_multisig.push(0xae);
+        assert!(pure_rust::script_matches_supported_multisig_policy(
+            &standard_multisig,
+            &pubkey
+        ));
+
+        let mut arbitrary_pubkey_script = Vec::new();
+        arbitrary_pubkey_script.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+        arbitrary_pubkey_script.extend_from_slice(&pubkey);
+        arbitrary_pubkey_script.push(0x75);
+        assert!(!pure_rust::script_matches_supported_multisig_policy(
+            &arbitrary_pubkey_script,
+            &pubkey
+        ));
+
+        let mut bitcoin_green_csv = Vec::new();
+        bitcoin_green_csv.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+        bitcoin_green_csv.extend_from_slice(&pubkey);
+        bitcoin_green_csv.push(0xad);
+        bitcoin_green_csv.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+        bitcoin_green_csv.extend_from_slice(&pubkey);
+        bitcoin_green_csv.extend_from_slice(&[0xac, 0x73, 0x64, 0x02, 0x80, 0xca, 0xb2, 0x68]);
+        assert!(pure_rust::script_matches_supported_multisig_policy(
+            &bitcoin_green_csv,
+            &pubkey
+        ));
+        let mut malformed_bitcoin_green_csv = bitcoin_green_csv.clone();
+        malformed_bitcoin_green_csv[72] = 0xff;
+        assert!(!pure_rust::script_matches_supported_multisig_policy(
+            &malformed_bitcoin_green_csv,
+            &pubkey
+        ));
+
+        let mut liquid_green_csv = Vec::new();
+        liquid_green_csv.extend_from_slice(&[0x74, 0x8c, 0x63, EC_PUBLIC_KEY_COMPRESSED_LEN as u8]);
+        liquid_green_csv.extend_from_slice(&pubkey);
+        liquid_green_csv.extend_from_slice(&[0xad, 0x67, 0x02, 0x80, 0xca, 0xb2, 0x75, 0x68]);
+        liquid_green_csv.push(EC_PUBLIC_KEY_COMPRESSED_LEN as u8);
+        liquid_green_csv.extend_from_slice(&pubkey);
+        liquid_green_csv.push(0xac);
+        assert!(pure_rust::script_matches_supported_multisig_policy(
+            &liquid_green_csv,
+            &pubkey
+        ));
+        let mut malformed_liquid_green_csv = liquid_green_csv.clone();
+        malformed_liquid_green_csv[39] = 0xff;
+        assert!(!pure_rust::script_matches_supported_multisig_policy(
+            &malformed_liquid_green_csv,
+            &pubkey
+        ));
     }
 
     #[test]

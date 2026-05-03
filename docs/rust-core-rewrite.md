@@ -167,14 +167,18 @@ The hard parts are hard for concrete compatibility reasons:
   `SIGHASH_SINGLE|ANYONECANPAY`, Taproot key-path, and Green witness-script
   CSV/no-recovery P2WSH fixtures byte-for-byte against Jade `test_data`,
   preserving raw map ordering and inserting only the new partial signatures.
+  Bitcoin PSBT and Liquid PSET multisig script-code selection now accepts only
+  recognized standard multisig scripts or Jade Green CSV script forms, so
+  arbitrary scripts that merely contain the wallet public key are rejected
+  before sighash construction.
   Unsupported Liquid PSET policy/finalization cases still defer explicitly to
   the legacy core boundary until their parity is implemented.
   `sign_psbt` itself has no staged anti-exfil subprotocol in the current Jade
   client or C handler; anti-exfil parity belongs to `sign_tx`,
-  `sign_liquid_tx`, and message signing. Script-path Taproot, generic multisig
-  policy validation beyond registered change-output checks, and generic Liquid
-  PSET policy/finalization remain active transaction-signing implementation
-  work.
+  `sign_liquid_tx`, and message signing. Script-path Taproot, broader multisig
+  policy/finalization beyond recognized standard and Green script forms, and
+  generic Liquid PSET policy/finalization remain active transaction-signing
+  implementation work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -230,12 +234,14 @@ The hard parts are hard for concrete compatibility reasons:
   the Jade fixture. Liquid PSET signing now covers p2pkh, p2wpkh,
   p2sh-p2wpkh, the Liquidex partial-swap maker PSET, Taproot key-path, Green
   CSV witness-script, Green no-recovery P2WSH, and no-wallet-input Liquid PSET
-  fixtures through `sign_psbt`, with unsupported Liquid PSET
-  policy/finalization cases returning the explicit core-defer outcome.
+  fixtures through `sign_psbt`, with PSBT/PSET multisig script-code selection
+  restricted to recognized standard multisig or Jade Green CSV script forms
+  rather than arbitrary pubkey-containing scripts. Unsupported Liquid PSET
+  policy/finalization cases return the explicit core-defer outcome.
   `sign_psbt` has no staged anti-exfil continuation in current Jade; Liquid
-  script-path Taproot, generic multisig policy validation beyond registered
-  change-output checks, and generic Liquid PSET policy/finalization remain
-  active implementation work.
+  script-path Taproot, broader multisig policy/finalization beyond recognized
+  standard and Green script forms, and generic Liquid PSET policy/finalization
+  remain active implementation work.
 
 ## First Parity Gates
 
