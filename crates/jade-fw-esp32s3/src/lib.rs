@@ -154,6 +154,16 @@ where
         }
         poll_ble_full_v1(&mut self.runtime, rx_buffer)
     }
+
+    pub fn poll_camera_qr<'a>(
+        &mut self,
+        out: &'a mut [u8],
+    ) -> Result<Option<&'a [u8]>, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_camera_qr(self.platform_mut(), out).map_err(FirmwareFrameError::Io)
+    }
 }
 
 pub fn runtime_for_v2<P>(platform: P) -> Esp32s3Runtime<P>
@@ -209,6 +219,22 @@ pub fn assert_manifest_matches_real_device(manifest: DeviceManifest) -> Result<(
         return Err("esp32s3 target is missing release security gates");
     }
     Ok(())
+}
+
+pub fn poll_camera_qr<'a, P>(
+    platform: &mut P,
+    out: &'a mut [u8],
+) -> Result<Option<&'a [u8]>, DeviceBootFailure>
+where
+    P: Esp32s3PlatformShim,
+{
+    let len = platform.camera_qr_scan(out)?;
+    if len == 0 {
+        return Ok(None);
+    }
+    out.get(..len)
+        .ok_or(DeviceBootFailure::TransportUnavailable)
+        .map(Some)
 }
 
 pub fn poll_serial_v1<P>(
@@ -441,6 +467,7 @@ mod tests {
         usb_tx: Vec<Vec<u8>>,
         ble_rx: Option<Vec<u8>>,
         ble_tx: Vec<Vec<u8>>,
+        camera_rx: Option<Vec<u8>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +528,7 @@ mod tests {
                 usb_tx: Vec::new(),
                 ble_rx: None,
                 ble_tx: Vec::new(),
+                camera_rx: None,
             }
         }
 
@@ -605,8 +633,8 @@ mod tests {
             Self::recv_frame(&mut self.ble_rx, out)
         }
 
-        fn camera_qr_scan(&mut self, _out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
-            Ok(0)
+        fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            Self::recv_frame(&mut self.camera_rx, out)
         }
 
         fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure> {
@@ -708,6 +736,39 @@ mod tests {
         assert_eq!(decoder.str().unwrap(), "p");
         assert_eq!(decoder.str().unwrap(), "result");
         assert_eq!(decoder.u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn s3_board_runtime_polls_camera_qr_after_boot() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().camera_rx = Some(b"ur:bytes/s3-test".to_vec());
+
+        let mut qr = [0u8; 64];
+        assert_eq!(
+            board.poll_camera_qr(&mut qr),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        board.boot().unwrap();
+        assert_eq!(
+            board.poll_camera_qr(&mut qr).unwrap(),
+            Some(&b"ur:bytes/s3-test"[..])
+        );
+        assert_eq!(board.poll_camera_qr(&mut qr), Ok(None));
+    }
+
+    #[test]
+    fn s3_camera_qr_rejects_oversized_platform_payloads() {
+        let mut platform = TestPlatform::new(JADE_V2_MANIFEST);
+        platform.camera_rx = Some(b"too-large".to_vec());
+
+        let mut qr = [0u8; 4];
+        assert_eq!(
+            poll_camera_qr(&mut platform, &mut qr),
+            Err(DeviceBootFailure::TransportUnavailable)
+        );
     }
 
     #[test]

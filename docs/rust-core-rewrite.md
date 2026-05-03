@@ -69,8 +69,11 @@ Both firmware crates now also expose bootable full-v1 board runtimes:
 `Esp32s3V1BoardRuntime<P, B>` for Jade v2/v2c. These wrappers own the generic
 Rust v1 runtime, call the platform boot report before accepting traffic, return
 `BootRequired` until the hardware readiness checks pass, and then dispatch
-serial/BLE/USB traffic through the full Rust v1 behavior engine. This is the
-entrypoint shape expected by a real board event loop.
+serial/BLE/USB traffic through the full Rust v1 behavior engine. They also
+expose boot-gated camera QR polling over caller-owned buffers, returning
+`Ok(None)` when no QR payload is ready and surfacing platform buffer/transport
+failures without panicking. This is the entrypoint shape expected by a real
+board event loop.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
@@ -250,7 +253,10 @@ The hard parts are hard for concrete compatibility reasons:
   capture, and QR scan calls now route through Rust host platform byte hooks
   instead of the C debug handlers. The Rust QR adapter now references every
   original QVGA JSON/DAT fixture pair and validates the expected text/hex
-  payload shape through the host scanner hook. ESP32-S3 eFuse/DS burning and
+  payload shape through the host scanner hook. The ESP32 and ESP32-S3 board
+  runtimes now expose the same QR byte boundary through boot-gated firmware
+  polling helpers, so a real camera decoder can feed the Rust v1/debug scan
+  paths without adding C-owned request handling. ESP32-S3 eFuse/DS burning and
   real camera/QR decoder backends remain target firmware platform shims, but
   the v1 core response shapes and request validation no longer require
   Jade-owned C application code.
@@ -409,8 +415,8 @@ The hard parts are hard for concrete compatibility reasons:
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
    Rust fixture gate now directly references all 210 original `test_data`
    files. QR image recognition remains a platform-backend responsibility, but
-   the Rust v1 debug adapter and all non-image fixture payloads are covered by
-   host tests.
+   the Rust v1 debug adapter, firmware QR polling boundary, and all non-image
+   fixture payloads are covered by host tests.
 
 ## C/C++ Removal Rule
 
