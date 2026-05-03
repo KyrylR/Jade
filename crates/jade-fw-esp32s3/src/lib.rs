@@ -128,6 +128,41 @@ pub enum Esp32s3BoardAppError {
     QrBufferTooSmall { required: usize, actual: usize },
 }
 
+#[derive(Debug)]
+pub struct Esp32s3BoardStreamBuffers<'a> {
+    pub serial_frame_buffer: &'a mut [u8],
+    pub usb_frame_buffer: &'a mut [u8],
+    pub ble_frame_buffer: &'a mut [u8],
+    pub qr_buffer: &'a mut [u8],
+}
+
+impl<'a> Esp32s3BoardStreamBuffers<'a> {
+    pub fn validate(&self) -> Result<(), Esp32s3BoardAppError> {
+        validate_board_stream_buffers(
+            self.serial_frame_buffer,
+            self.usb_frame_buffer,
+            self.ble_frame_buffer,
+            self.qr_buffer,
+        )
+    }
+
+    pub fn serial_capacity(&self) -> usize {
+        self.serial_frame_buffer.len()
+    }
+
+    pub fn usb_capacity(&self) -> usize {
+        self.usb_frame_buffer.len()
+    }
+
+    pub fn ble_capacity(&self) -> usize {
+        self.ble_frame_buffer.len()
+    }
+
+    pub fn qr_capacity(&self) -> usize {
+        self.qr_buffer.len()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Esp32s3BoardLoopInputs {
     pub display_status: Option<DisplayStatus<'static>>,
@@ -231,6 +266,18 @@ where
         Self { app, ticks: 0 }
     }
 
+    pub fn new_from_parts(
+        platform: P,
+        storage_backend: B,
+        buffers: Esp32s3BoardStreamBuffers<'a>,
+    ) -> Result<Self, Esp32s3BoardAppError> {
+        Ok(Self::new(Esp32s3BoardStreamApp::new_with_buffers(
+            platform,
+            storage_backend,
+            buffers,
+        )?))
+    }
+
     pub fn app(&self) -> &Esp32s3BoardStreamApp<'a, P, B> {
         &self.app
     }
@@ -304,6 +351,24 @@ where
             ticks: self.ticks,
             stop_reason: Esp32s3BoardLoopStopReason::TickLimit,
         })
+    }
+}
+
+impl<'a, P, B> Esp32s3BoardStreamLoop<'a, P, Esp32s3NvsStorage<B>>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+{
+    pub fn new_with_nvs(
+        platform: P,
+        nvs_backend: B,
+        buffers: Esp32s3BoardStreamBuffers<'a>,
+    ) -> Result<Self, Esp32s3BoardAppError> {
+        Self::new_from_parts(
+            platform,
+            jade_storage::NvsStorage::new(nvs_backend),
+            buffers,
+        )
     }
 }
 
@@ -405,18 +470,30 @@ where
         ble_frame_buffer: &'a mut [u8],
         qr_buffer: &'a mut [u8],
     ) -> Result<Self, Esp32s3BoardAppError> {
-        validate_board_stream_buffers(
-            serial_frame_buffer,
-            usb_frame_buffer,
-            ble_frame_buffer,
-            qr_buffer,
-        )?;
+        Self::new_with_buffers(
+            platform,
+            storage_backend,
+            Esp32s3BoardStreamBuffers {
+                serial_frame_buffer,
+                usb_frame_buffer,
+                ble_frame_buffer,
+                qr_buffer,
+            },
+        )
+    }
+
+    pub fn new_with_buffers(
+        platform: P,
+        storage_backend: B,
+        buffers: Esp32s3BoardStreamBuffers<'a>,
+    ) -> Result<Self, Esp32s3BoardAppError> {
+        buffers.validate()?;
         Ok(Self {
             runtime: Esp32s3V1BoardRuntime::new(platform, storage_backend),
-            serial_frames: CborFrameBuffer::new(serial_frame_buffer),
-            usb_frames: CborFrameBuffer::new(usb_frame_buffer),
-            ble_frames: CborFrameBuffer::new(ble_frame_buffer),
-            qr_buffer,
+            serial_frames: CborFrameBuffer::new(buffers.serial_frame_buffer),
+            usb_frames: CborFrameBuffer::new(buffers.usb_frame_buffer),
+            ble_frames: CborFrameBuffer::new(buffers.ble_frame_buffer),
+            qr_buffer: buffers.qr_buffer,
         })
     }
 
@@ -2218,6 +2295,40 @@ mod tests {
         );
 
         assert_eq!(validate_board_buffers(&rx, &qr), Ok(()));
+
+        let mut short_usb = vec![0; RX_BUFFER_BYTES - 1];
+        let mut serial = vec![0; RX_BUFFER_BYTES];
+        let mut ble = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        assert_eq!(
+            Esp32s3BoardStreamBuffers {
+                serial_frame_buffer: &mut serial,
+                usb_frame_buffer: &mut short_usb,
+                ble_frame_buffer: &mut ble,
+                qr_buffer: &mut stream_qr,
+            }
+            .validate(),
+            Err(Esp32s3BoardAppError::RxBufferTooSmall {
+                required: RX_BUFFER_BYTES,
+                actual: RX_BUFFER_BYTES - 1,
+            })
+        );
+
+        let mut serial = vec![0; RX_BUFFER_BYTES];
+        let mut usb = vec![0; RX_BUFFER_BYTES];
+        let mut ble = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        let buffers = Esp32s3BoardStreamBuffers {
+            serial_frame_buffer: &mut serial,
+            usb_frame_buffer: &mut usb,
+            ble_frame_buffer: &mut ble,
+            qr_buffer: &mut stream_qr,
+        };
+        assert_eq!(buffers.validate(), Ok(()));
+        assert_eq!(buffers.serial_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(buffers.usb_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(buffers.ble_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(buffers.qr_capacity(), QR_BUFFER_BYTES);
     }
 
     #[test]
@@ -2427,6 +2538,34 @@ mod tests {
             1
         );
         assert_eq!(event_loop.app().runtime().platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn s3_board_stream_loop_builds_from_startup_buffers_and_nvs() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut usb_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let buffers = Esp32s3BoardStreamBuffers {
+            serial_frame_buffer: &mut serial_frames,
+            usb_frame_buffer: &mut usb_frames,
+            ble_frame_buffer: &mut ble_frames,
+            qr_buffer: &mut qr,
+        };
+        let mut event_loop = Esp32s3BoardStreamLoop::new_with_nvs(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            TestNvs::new(),
+            buffers,
+        )
+        .unwrap();
+        event_loop.app_mut().runtime_mut().platform_mut().usb_rx = Some(v1_request("u", "ping"));
+
+        let mut hooks = S3LoopTestHooks::new(1);
+        let run = event_loop.run_until_stop(&mut hooks, 1).unwrap();
+
+        assert_eq!(run.stop_reason, Esp32s3BoardLoopStopReason::Hook);
+        assert_eq!(run.ticks, 1);
+        assert_eq!(event_loop.app().runtime().platform().usb_tx.len(), 1);
     }
 
     #[test]

@@ -131,6 +131,11 @@ stream app owners with a boot-once/tick-many loop, hook-supplied UI inputs,
 per-tick reports, and explicit tick-error surfacing. A real `app_main` can now
 own platform drivers, static buffers, NVS, and a small hook object while
 delegating the repeated boot/tick/stop policy to the Rust firmware crate.
+Those runners also have startup constructors over named buffer bundles,
+`Esp32BoardStreamBuffers` and `Esp32s3BoardStreamBuffers`, plus NVS-backed
+`new_with_nvs` constructors. This gives board startup code one typed object
+for the static serial/BLE/USB/QR buffers and keeps the positional buffer
+ordering out of the final hardware entrypoint.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or

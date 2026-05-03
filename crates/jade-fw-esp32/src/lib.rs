@@ -96,6 +96,35 @@ pub enum Esp32BoardAppError {
     QrBufferTooSmall { required: usize, actual: usize },
 }
 
+#[derive(Debug)]
+pub struct Esp32BoardStreamBuffers<'a> {
+    pub serial_frame_buffer: &'a mut [u8],
+    pub ble_frame_buffer: &'a mut [u8],
+    pub qr_buffer: &'a mut [u8],
+}
+
+impl<'a> Esp32BoardStreamBuffers<'a> {
+    pub fn validate(&self) -> Result<(), Esp32BoardAppError> {
+        validate_board_stream_buffers(
+            self.serial_frame_buffer,
+            self.ble_frame_buffer,
+            self.qr_buffer,
+        )
+    }
+
+    pub fn serial_capacity(&self) -> usize {
+        self.serial_frame_buffer.len()
+    }
+
+    pub fn ble_capacity(&self) -> usize {
+        self.ble_frame_buffer.len()
+    }
+
+    pub fn qr_capacity(&self) -> usize {
+        self.qr_buffer.len()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Esp32BoardLoopInputs {
     pub display_status: Option<DisplayStatus<'static>>,
@@ -198,6 +227,18 @@ where
         Self { app, ticks: 0 }
     }
 
+    pub fn new_from_parts(
+        platform: P,
+        storage_backend: B,
+        buffers: Esp32BoardStreamBuffers<'a>,
+    ) -> Result<Self, Esp32BoardAppError> {
+        Ok(Self::new(Esp32BoardStreamApp::new_with_buffers(
+            platform,
+            storage_backend,
+            buffers,
+        )?))
+    }
+
     pub fn app(&self) -> &Esp32BoardStreamApp<'a, P, B> {
         &self.app
     }
@@ -271,6 +312,24 @@ where
             ticks: self.ticks,
             stop_reason: Esp32BoardLoopStopReason::TickLimit,
         })
+    }
+}
+
+impl<'a, P, B> Esp32BoardStreamLoop<'a, P, Esp32NvsStorage<B>>
+where
+    P: Esp32PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::NvsKeyValueBackend,
+{
+    pub fn new_with_nvs(
+        platform: P,
+        nvs_backend: B,
+        buffers: Esp32BoardStreamBuffers<'a>,
+    ) -> Result<Self, Esp32BoardAppError> {
+        Self::new_from_parts(
+            platform,
+            jade_storage::NvsStorage::new(nvs_backend),
+            buffers,
+        )
     }
 }
 
@@ -371,12 +430,28 @@ where
         ble_frame_buffer: &'a mut [u8],
         qr_buffer: &'a mut [u8],
     ) -> Result<Self, Esp32BoardAppError> {
-        validate_board_stream_buffers(serial_frame_buffer, ble_frame_buffer, qr_buffer)?;
+        Self::new_with_buffers(
+            platform,
+            storage_backend,
+            Esp32BoardStreamBuffers {
+                serial_frame_buffer,
+                ble_frame_buffer,
+                qr_buffer,
+            },
+        )
+    }
+
+    pub fn new_with_buffers(
+        platform: P,
+        storage_backend: B,
+        buffers: Esp32BoardStreamBuffers<'a>,
+    ) -> Result<Self, Esp32BoardAppError> {
+        buffers.validate()?;
         Ok(Self {
             runtime: Esp32V1BoardRuntime::new(platform, storage_backend),
-            serial_frames: CborFrameBuffer::new(serial_frame_buffer),
-            ble_frames: CborFrameBuffer::new(ble_frame_buffer),
-            qr_buffer,
+            serial_frames: CborFrameBuffer::new(buffers.serial_frame_buffer),
+            ble_frames: CborFrameBuffer::new(buffers.ble_frame_buffer),
+            qr_buffer: buffers.qr_buffer,
         })
     }
 
@@ -1870,6 +1945,35 @@ mod tests {
         );
 
         assert_eq!(validate_board_buffers(&rx, &qr), Ok(()));
+
+        let mut short_serial = vec![0; RX_BUFFER_BYTES - 1];
+        let mut ble = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        assert_eq!(
+            Esp32BoardStreamBuffers {
+                serial_frame_buffer: &mut short_serial,
+                ble_frame_buffer: &mut ble,
+                qr_buffer: &mut stream_qr,
+            }
+            .validate(),
+            Err(Esp32BoardAppError::RxBufferTooSmall {
+                required: RX_BUFFER_BYTES,
+                actual: RX_BUFFER_BYTES - 1,
+            })
+        );
+
+        let mut serial = vec![0; RX_BUFFER_BYTES];
+        let mut ble = vec![0; RX_BUFFER_BYTES];
+        let mut stream_qr = vec![0; QR_BUFFER_BYTES];
+        let buffers = Esp32BoardStreamBuffers {
+            serial_frame_buffer: &mut serial,
+            ble_frame_buffer: &mut ble,
+            qr_buffer: &mut stream_qr,
+        };
+        assert_eq!(buffers.validate(), Ok(()));
+        assert_eq!(buffers.serial_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(buffers.ble_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(buffers.qr_capacity(), QR_BUFFER_BYTES);
     }
 
     #[test]
@@ -2060,6 +2164,32 @@ mod tests {
             1
         );
         assert_eq!(event_loop.app().runtime().platform().confirmation_count, 1);
+    }
+
+    #[test]
+    fn esp32_board_stream_loop_builds_from_startup_buffers_and_nvs() {
+        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
+        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
+        let mut qr = vec![0; QR_BUFFER_BYTES];
+        let buffers = Esp32BoardStreamBuffers {
+            serial_frame_buffer: &mut serial_frames,
+            ble_frame_buffer: &mut ble_frames,
+            qr_buffer: &mut qr,
+        };
+        let mut event_loop = Esp32BoardStreamLoop::new_with_nvs(
+            TestPlatform::new(JADE_MANIFEST),
+            TestNvs::new(),
+            buffers,
+        )
+        .unwrap();
+        event_loop.app_mut().runtime_mut().platform_mut().serial_rx = Some(v1_request("s", "ping"));
+
+        let mut hooks = Esp32LoopTestHooks::new(1);
+        let run = event_loop.run_until_stop(&mut hooks, 1).unwrap();
+
+        assert_eq!(run.stop_reason, Esp32BoardLoopStopReason::Hook);
+        assert_eq!(run.ticks, 1);
+        assert_eq!(event_loop.app().runtime().platform().serial_tx.len(), 1);
     }
 
     #[test]
