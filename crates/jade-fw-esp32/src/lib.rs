@@ -6,8 +6,8 @@ extern crate alloc;
 use jade_core::{
     AllocationBudget, DeviceBootFailure, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
     DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
-    FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
-    OtaWriteSession,
+    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
+    OtaWriteSession, UserConfirmation, UserConfirmationDecision,
 };
 
 pub const TARGET_SOC: &str = "esp32";
@@ -47,6 +47,11 @@ pub trait Esp32PlatformShim: DevicePlatform {
     fn ble_send(&mut self, bytes: &[u8]) -> Result<(), DeviceBootFailure>;
     fn ble_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
     fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
+    fn display_status(&mut self, status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure>;
+    fn confirm_user(
+        &mut self,
+        request: UserConfirmation<'_>,
+    ) -> Result<UserConfirmationDecision, DeviceBootFailure>;
 }
 
 pub type Esp32Runtime<P> = DeviceRuntime<P>;
@@ -173,6 +178,23 @@ where
         }
         poll_camera_qr(self.platform_mut(), out).map_err(FirmwareFrameError::Io)
     }
+
+    pub fn display_status(&mut self, status: DisplayStatus<'_>) -> Result<(), FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        display_status(self.platform_mut(), status).map_err(FirmwareFrameError::Io)
+    }
+
+    pub fn confirm_user(
+        &mut self,
+        request: UserConfirmation<'_>,
+    ) -> Result<UserConfirmationDecision, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        confirm_user(self.platform_mut(), request).map_err(FirmwareFrameError::Io)
+    }
 }
 
 pub fn runtime_for_v1<P>(platform: P) -> Esp32Runtime<P>
@@ -241,6 +263,26 @@ where
     out.get(..len)
         .ok_or(DeviceBootFailure::TransportUnavailable)
         .map(Some)
+}
+
+pub fn display_status<P>(
+    platform: &mut P,
+    status: DisplayStatus<'_>,
+) -> Result<(), DeviceBootFailure>
+where
+    P: Esp32PlatformShim,
+{
+    platform.display_status(status)
+}
+
+pub fn confirm_user<P>(
+    platform: &mut P,
+    request: UserConfirmation<'_>,
+) -> Result<UserConfirmationDecision, DeviceBootFailure>
+where
+    P: Esp32PlatformShim,
+{
+    platform.confirm_user(request)
 }
 
 pub fn poll_serial_v1<P>(
@@ -402,6 +444,9 @@ mod tests {
         ble_rx: Option<Vec<u8>>,
         ble_tx: Vec<Vec<u8>>,
         camera_rx: Option<Vec<u8>>,
+        display_status_count: usize,
+        confirmation_count: usize,
+        confirmation_decision: UserConfirmationDecision,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +506,9 @@ mod tests {
                 ble_rx: None,
                 ble_tx: Vec::new(),
                 camera_rx: None,
+                display_status_count: 0,
+                confirmation_count: 0,
+                confirmation_decision: UserConfirmationDecision::Approved,
             }
         }
 
@@ -558,6 +606,19 @@ mod tests {
 
         fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
             Self::recv_frame(&mut self.camera_rx, out)
+        }
+
+        fn display_status(&mut self, _status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure> {
+            self.display_status_count += 1;
+            Ok(())
+        }
+
+        fn confirm_user(
+            &mut self,
+            _request: UserConfirmation<'_>,
+        ) -> Result<UserConfirmationDecision, DeviceBootFailure> {
+            self.confirmation_count += 1;
+            Ok(self.confirmation_decision)
         }
     }
 
@@ -700,6 +761,41 @@ mod tests {
             board.poll_v1_transports(&mut rx).unwrap(),
             Esp32V1PollReport::default()
         );
+    }
+
+    #[test]
+    fn esp32_board_runtime_gates_display_and_confirmation() {
+        let mut board = Esp32V1BoardRuntime::new(
+            TestPlatform::new(JADE_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+
+        assert_eq!(
+            board.display_status(DisplayStatus::Ready),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        assert_eq!(
+            board.confirm_user(UserConfirmation::Export {
+                label: "master blinding key"
+            }),
+            Err(FirmwareFrameError::BootRequired)
+        );
+
+        board.boot().unwrap();
+        board.display_status(DisplayStatus::Ready).unwrap();
+        assert_eq!(board.platform().display_status_count, 1);
+
+        board.platform_mut().confirmation_decision = UserConfirmationDecision::Rejected;
+        assert_eq!(
+            board
+                .confirm_user(UserConfirmation::Address {
+                    network: "mainnet",
+                    address: "bc1qexample"
+                })
+                .unwrap(),
+            UserConfirmationDecision::Rejected
+        );
+        assert_eq!(board.platform().confirmation_count, 1);
     }
 
     #[test]

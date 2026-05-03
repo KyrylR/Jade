@@ -74,10 +74,11 @@ offer a single boot-gated `poll_v1_transports` helper per target, returning a
 small report of which links handled frames in that board-loop tick. They also
 expose boot-gated camera QR polling over caller-owned buffers, returning
 `Ok(None)` when no QR payload is ready and surfacing platform buffer/transport
-failures without panicking, and the ESP32-S3 board runtime exposes the same
-boot-gated boundary for touch press/release events and hardware attestation
-challenge signing. This is the entrypoint shape expected by a real board event
-loop.
+failures without panicking. Both target families now expose boot-gated display
+status and user-confirmation hooks for address, message, transaction, and
+export prompts, and the ESP32-S3 board runtime exposes the same boot-gated
+boundary for touch press/release events and hardware attestation challenge
+signing. This is the entrypoint shape expected by a real board event loop.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
@@ -103,8 +104,9 @@ full-v1 runtimes with platform types that implement both the real-device
 transport shims and `RuntimePlatformStateAccess`, proving that the same type
 boundary can serve board I/O and the Rust v1 behavior engine. The remaining
 extraction work is to implement production ESP32/ESP32-S3 hardware hook methods
-for entropy, clock, display, camera, confirmation, OTA, and attestation, plus
-the concrete ESP NVS driver behind the storage shim.
+for entropy, clock, display driver rendering, camera decoding, confirmation
+input policy, OTA, and attestation, plus the concrete ESP NVS driver behind the
+storage shim.
 
 The storage crate now includes an `NvsKeyValueBackend` + `NvsStorage<B>`
 adapter. It maps Jade's typed `StorageNamespace` values to fixed NVS namespace
@@ -270,10 +272,11 @@ The hard parts are hard for concrete compatibility reasons:
   runtimes now expose the same QR byte boundary through boot-gated firmware
   polling helpers, so a real camera decoder can feed the Rust v1/debug scan
   paths without adding C-owned request handling. The ESP32-S3 board runtime
-  also exposes boot-gated touch events for the UI event loop and a
+  also exposes boot-gated touch events for the UI event loop, both target
+  families expose boot-gated display/confirmation calls, and v2/v2c has a
   device-attestation signing hook for the eFuse/DS-backed key path. ESP32-S3
-  eFuse/DS burning and real camera/QR decoder backends remain target firmware
-  platform shims, but
+  eFuse/DS burning and real camera/QR/display/input backends remain target
+  firmware platform shims, but
   the v1 core response shapes and request validation no longer require
   Jade-owned C application code.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
@@ -431,8 +434,8 @@ The hard parts are hard for concrete compatibility reasons:
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
    Rust fixture gate now directly references all 210 original `test_data`
    files. QR image recognition remains a platform-backend responsibility, but
-   the Rust v1 debug adapter, firmware QR/touch polling boundaries, and all
-   non-image fixture payloads are covered by host tests.
+   the Rust v1 debug adapter, firmware QR/touch/display/confirmation polling
+   boundaries, and all non-image fixture payloads are covered by host tests.
 
 ## C/C++ Removal Rule
 

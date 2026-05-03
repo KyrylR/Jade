@@ -15,6 +15,7 @@ pub mod firmware;
 pub mod ota;
 pub mod platform;
 pub mod state;
+pub mod ui;
 
 pub use allocation::{AllocationBudget, AllocationFailure};
 pub use bip32_path::{JadeDerivationPath, PathError};
@@ -30,6 +31,7 @@ pub use ota::{
 };
 pub use platform::Platform;
 pub use state::{InterfaceKind, InterfaceSession, OperationState, WalletLifecycle};
+pub use ui::{DisplayStatus, UserConfirmation, UserConfirmationDecision};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreError {

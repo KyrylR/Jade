@@ -6,8 +6,8 @@ extern crate alloc;
 use jade_core::{
     AllocationBudget, DeviceBootFailure, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
     DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
-    FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
-    OtaWriteSession,
+    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
+    OtaWriteSession, UserConfirmation, UserConfirmationDecision,
 };
 
 pub const TARGET_SOC: &str = "esp32s3";
@@ -50,6 +50,11 @@ pub trait Esp32s3PlatformShim: DevicePlatform {
     fn ble_recv(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
     fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
     fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure>;
+    fn display_status(&mut self, status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure>;
+    fn confirm_user(
+        &mut self,
+        request: UserConfirmation<'_>,
+    ) -> Result<UserConfirmationDecision, DeviceBootFailure>;
     fn hardware_attestation_available(&self) -> bool;
     fn hardware_attestation_public_key_pem(
         &mut self,
@@ -220,6 +225,23 @@ where
         poll_touch(self.platform_mut()).map_err(FirmwareFrameError::Io)
     }
 
+    pub fn display_status(&mut self, status: DisplayStatus<'_>) -> Result<(), FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        display_status(self.platform_mut(), status).map_err(FirmwareFrameError::Io)
+    }
+
+    pub fn confirm_user(
+        &mut self,
+        request: UserConfirmation<'_>,
+    ) -> Result<UserConfirmationDecision, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        confirm_user(self.platform_mut(), request).map_err(FirmwareFrameError::Io)
+    }
+
     pub fn sign_hardware_attestation<'a>(
         &mut self,
         challenge: &[u8],
@@ -317,6 +339,26 @@ where
     P: Esp32s3PlatformShim,
 {
     platform.touch_poll()
+}
+
+pub fn display_status<P>(
+    platform: &mut P,
+    status: DisplayStatus<'_>,
+) -> Result<(), DeviceBootFailure>
+where
+    P: Esp32s3PlatformShim,
+{
+    platform.display_status(status)
+}
+
+pub fn confirm_user<P>(
+    platform: &mut P,
+    request: UserConfirmation<'_>,
+) -> Result<UserConfirmationDecision, DeviceBootFailure>
+where
+    P: Esp32s3PlatformShim,
+{
+    platform.confirm_user(request)
 }
 
 pub fn sign_hardware_attestation<'a, P>(
@@ -589,6 +631,9 @@ mod tests {
         ble_tx: Vec<Vec<u8>>,
         camera_rx: Option<Vec<u8>>,
         touch_rx: Option<TouchEvent>,
+        display_status_count: usize,
+        confirmation_count: usize,
+        confirmation_decision: UserConfirmationDecision,
         attestation_available: bool,
         attestation_pubkey_pem: Option<Vec<u8>>,
         attestation_ext_signature: Option<Vec<u8>>,
@@ -656,6 +701,9 @@ mod tests {
                 ble_tx: Vec::new(),
                 camera_rx: None,
                 touch_rx: None,
+                display_status_count: 0,
+                confirmation_count: 0,
+                confirmation_decision: UserConfirmationDecision::Approved,
                 attestation_available: true,
                 attestation_pubkey_pem: None,
                 attestation_ext_signature: None,
@@ -782,6 +830,19 @@ mod tests {
 
         fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure> {
             Ok(self.touch_rx.take())
+        }
+
+        fn display_status(&mut self, _status: DisplayStatus<'_>) -> Result<(), DeviceBootFailure> {
+            self.display_status_count += 1;
+            Ok(())
+        }
+
+        fn confirm_user(
+            &mut self,
+            _request: UserConfirmation<'_>,
+        ) -> Result<UserConfirmationDecision, DeviceBootFailure> {
+            self.confirmation_count += 1;
+            Ok(self.confirmation_decision)
         }
 
         fn hardware_attestation_available(&self) -> bool {
@@ -987,6 +1048,44 @@ mod tests {
             Some(TouchEvent::Press { x: 123, y: 45 })
         );
         assert_eq!(board.poll_touch(), Ok(None));
+    }
+
+    #[test]
+    fn s3_board_runtime_gates_display_and_confirmation() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+
+        assert_eq!(
+            board.display_status(DisplayStatus::Ready),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        assert_eq!(
+            board.confirm_user(UserConfirmation::Transaction {
+                network: "liquid",
+                summary: "send 1 sats"
+            }),
+            Err(FirmwareFrameError::BootRequired)
+        );
+
+        board.boot().unwrap();
+        board
+            .display_status(DisplayStatus::Busy("signing"))
+            .unwrap();
+        assert_eq!(board.platform().display_status_count, 1);
+
+        board.platform_mut().confirmation_decision = UserConfirmationDecision::TimedOut;
+        assert_eq!(
+            board
+                .confirm_user(UserConfirmation::Message {
+                    title: "Sign message",
+                    body: "hello"
+                })
+                .unwrap(),
+            UserConfirmationDecision::TimedOut
+        );
+        assert_eq!(board.platform().confirmation_count, 1);
     }
 
     #[test]
