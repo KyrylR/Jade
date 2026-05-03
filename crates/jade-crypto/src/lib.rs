@@ -1128,6 +1128,160 @@ pub mod pure_rust {
         )?))
     }
 
+    pub fn sign_liquid_pset_singlesig_from_seed(
+        pset_bytes: &[u8],
+        seed: &[u8],
+        wallet_fingerprint: &[u8; 4],
+        network: LiquidNetwork,
+    ) -> Result<Option<Vec<u8>>, PsbtSignError> {
+        use elements::encode;
+        use elements::hashes::Hash as _;
+        use elements::pset::PartiallySignedTransaction;
+        use elements::sighash::{Prevouts, SighashCache};
+
+        if super::psbt_envelope(pset_bytes) != Some(PsbtEnvelope::Liquid) {
+            return Err(PsbtSignError::Invalid);
+        }
+
+        let mut pos = 5;
+        let global = parsed_psbt_map(pset_bytes, &mut pos)?;
+        let input_count = global
+            .single_value(0x04)
+            .and_then(compact_size_value)
+            .ok_or(PsbtSignError::Unsupported)?;
+        let output_count = global
+            .single_value(0x05)
+            .and_then(compact_size_value)
+            .ok_or(PsbtSignError::Unsupported)?;
+        let mut raw_inputs = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            raw_inputs.push(parsed_psbt_map(pset_bytes, &mut pos)?);
+        }
+        for _ in 0..output_count {
+            parsed_psbt_map(pset_bytes, &mut pos)?;
+        }
+        if pos != pset_bytes.len() {
+            return Err(PsbtSignError::Invalid);
+        }
+
+        let pset: PartiallySignedTransaction =
+            encode::deserialize(pset_bytes).map_err(|_| PsbtSignError::Invalid)?;
+        let tx = pset.extract_tx().map_err(|_| PsbtSignError::Invalid)?;
+        let prevouts = liquid_pset_prevouts(&pset)?;
+        if prevouts.len() != tx.input.len() || pset.inputs().len() != tx.input.len() {
+            return Err(PsbtSignError::Invalid);
+        }
+
+        let mut signatures = Vec::new();
+        for index in 0..pset.inputs().len() {
+            let input = &pset.inputs()[index];
+            if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
+                continue;
+            }
+
+            let prevout = &prevouts[index];
+            let candidates = liquid_pset_bip32_candidates(input);
+            for candidate in &candidates {
+                if input.partial_sigs.contains_key(&candidate.public_key) {
+                    continue;
+                }
+                let Some(path) = liquid_pset_seed_path_for_candidate(
+                    seed,
+                    wallet_fingerprint,
+                    candidate,
+                    &candidates,
+                ) else {
+                    continue;
+                };
+                let derived_pubkey =
+                    public_key_from_seed_path(seed, &path).ok_or(PsbtSignError::Unsupported)?;
+                if derived_pubkey.as_slice() != candidate.pubkey.as_slice() {
+                    continue;
+                }
+
+                let sighash = input.ecdsa_hash_ty().ok_or(PsbtSignError::Unsupported)?;
+                let (script_code, is_witness) =
+                    liquid_pset_ecdsa_script_code(input, &candidate.pubkey, prevout)?;
+                let mut sighash_cache = SighashCache::new(&tx);
+                let digest = if is_witness {
+                    sighash_cache.segwitv0_sighash(index, &script_code, prevout.value, sighash)
+                } else {
+                    sighash_cache.legacy_sighash(index, &script_code, sighash)
+                };
+                let signature = sign_digest_der_from_seed(
+                    seed,
+                    &path,
+                    digest.as_byte_array(),
+                    sighash.as_u32() as u8,
+                )
+                .ok_or(PsbtSignError::Unsupported)?;
+                signatures.push(PsbtSignature {
+                    input_index: index,
+                    key: psbt_key_with_data(0x02, &candidate.pubkey),
+                    signature,
+                });
+            }
+
+            if input.tap_key_sig.is_some() {
+                continue;
+            }
+            for candidate in liquid_pset_tap_candidates(input) {
+                if &candidate.fingerprint != wallet_fingerprint {
+                    continue;
+                }
+                let derived_pubkey = public_key_from_seed_path(seed, &candidate.path)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                if derived_pubkey[1..] != candidate.xonly_pubkey {
+                    continue;
+                }
+                let output_key = elements_taproot_keyspend_output_key(&derived_pubkey)
+                    .ok_or(PsbtSignError::Unsupported)?;
+                if p2tr_script_pubkey(&output_key) != prevout.script_pubkey.as_bytes() {
+                    return Err(PsbtSignError::Unsupported);
+                }
+                let sighash = input.schnorr_hash_ty().ok_or(PsbtSignError::Unsupported)?;
+                if !matches!(
+                    sighash,
+                    elements::SchnorrSighashType::Default | elements::SchnorrSighashType::All
+                ) {
+                    return Err(PsbtSignError::Unsupported);
+                }
+                let mut sighash_cache = SighashCache::new(&tx);
+                let digest = sighash_cache
+                    .taproot_key_spend_signature_hash(
+                        index,
+                        &Prevouts::All(&prevouts),
+                        sighash,
+                        liquid_genesis_hash(network),
+                    )
+                    .map_err(|_| PsbtSignError::Invalid)?
+                    .to_byte_array();
+                let signature = sign_elements_taproot_key_spend_from_seed(
+                    seed,
+                    &candidate.path,
+                    &digest,
+                    sighash as u8,
+                )
+                .ok_or(PsbtSignError::Unsupported)?;
+                signatures.push(PsbtSignature {
+                    input_index: index,
+                    key: alloc::vec![0x13],
+                    signature,
+                });
+            }
+        }
+
+        if signatures.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(insert_psbt_partial_signatures(
+                pset_bytes,
+                &raw_inputs,
+                &signatures,
+            )?))
+        }
+    }
+
     pub fn bitcoin_tx_input_count(txn: &[u8]) -> Result<usize, TxSignError> {
         bitcoin_transaction_view(txn)
             .map(|tx| tx.inputs.len())
@@ -1520,6 +1674,148 @@ pub mod pure_rust {
         elements::BlockHash::from_byte_array(bytes)
     }
 
+    fn liquid_pset_prevouts(
+        pset: &elements::pset::PartiallySignedTransaction,
+    ) -> Result<Vec<elements::TxOut>, PsbtSignError> {
+        let mut prevouts = Vec::with_capacity(pset.inputs().len());
+        for input in pset.inputs() {
+            if let Some(prevout) = input.witness_utxo.clone() {
+                prevouts.push(prevout);
+                continue;
+            }
+
+            let prev_tx = input
+                .non_witness_utxo
+                .as_ref()
+                .ok_or(PsbtSignError::Unsupported)?;
+            if prev_tx.txid() != input.previous_txid {
+                return Err(PsbtSignError::Invalid);
+            }
+            let prevout = prev_tx
+                .output
+                .get(input.previous_output_index as usize)
+                .cloned()
+                .ok_or(PsbtSignError::Invalid)?;
+            prevouts.push(prevout);
+        }
+        Ok(prevouts)
+    }
+
+    fn liquid_pset_bip32_candidates(
+        input: &elements::pset::Input,
+    ) -> Vec<LiquidPsbtBip32Candidate> {
+        input
+            .bip32_derivation
+            .iter()
+            .filter_map(|(public_key, key_source)| {
+                let pubkey = public_key.to_bytes();
+                if !compressed_pubkey_len(&pubkey) {
+                    return None;
+                }
+                let (fingerprint, path) = liquid_pset_key_source_parts(key_source);
+                Some(LiquidPsbtBip32Candidate {
+                    public_key: *public_key,
+                    pubkey,
+                    fingerprint,
+                    path,
+                })
+            })
+            .collect()
+    }
+
+    fn liquid_pset_tap_candidates(input: &elements::pset::Input) -> Vec<LiquidPsbtTapCandidate> {
+        input
+            .tap_key_origins
+            .iter()
+            .map(|(xonly_pubkey, (_, key_source))| {
+                let (fingerprint, path) = liquid_pset_key_source_parts(key_source);
+                LiquidPsbtTapCandidate {
+                    xonly_pubkey: xonly_pubkey.serialize(),
+                    fingerprint,
+                    path,
+                }
+            })
+            .collect()
+    }
+
+    fn liquid_pset_key_source_parts(
+        key_source: &elements::bitcoin::bip32::KeySource,
+    ) -> ([u8; 4], Vec<u32>) {
+        let (fingerprint, path) = key_source;
+        let fingerprint =
+            *<elements::bitcoin::bip32::Fingerprint as AsRef<[u8; 4]>>::as_ref(fingerprint);
+        let path = path
+            .into_iter()
+            .map(|child| u32::from(*child))
+            .collect::<Vec<_>>();
+        (fingerprint, path)
+    }
+
+    fn liquid_pset_seed_path_for_candidate(
+        seed: &[u8],
+        wallet_fingerprint: &[u8; 4],
+        candidate: &LiquidPsbtBip32Candidate,
+        candidates: &[LiquidPsbtBip32Candidate],
+    ) -> Option<Vec<u32>> {
+        if &candidate.fingerprint == wallet_fingerprint {
+            return Some(candidate.path.clone());
+        }
+
+        if public_key_from_seed_path(seed, &candidate.path)
+            .is_some_and(|pubkey| pubkey.as_slice() == candidate.pubkey.as_slice())
+        {
+            return Some(candidate.path.clone());
+        }
+
+        if !green_recovery_short_path(&candidate.path) {
+            return None;
+        }
+
+        for other in candidates {
+            let Some(parent) = green_user_parent_path(&other.path) else {
+                continue;
+            };
+            if !other.path.ends_with(&candidate.path) {
+                continue;
+            }
+            if fingerprint_from_seed_path(seed, &parent) == Some(candidate.fingerprint) {
+                let mut full_path = parent;
+                full_path.extend_from_slice(&candidate.path);
+                return Some(full_path);
+            }
+        }
+
+        None
+    }
+
+    fn liquid_pset_ecdsa_script_code(
+        input: &elements::pset::Input,
+        pubkey: &[u8],
+        prevout: &elements::TxOut,
+    ) -> Result<(elements::Script, bool), PsbtSignError> {
+        let pubkey_hash = hash160(pubkey);
+        let p2pkh_script = p2pkh_script_pubkey(&pubkey_hash);
+        if p2pkh_script == prevout.script_pubkey.as_bytes() {
+            return Ok((elements::Script::from(p2pkh_script), false));
+        }
+
+        let witness_program = witness_v0_script_pubkey(&pubkey_hash);
+        if witness_program == prevout.script_pubkey.as_bytes() {
+            return Ok((elements::Script::from(p2pkh_script), true));
+        }
+
+        if input
+            .redeem_script
+            .as_ref()
+            .is_some_and(|script| script.as_bytes() == witness_program.as_slice())
+            && p2sh_script_pubkey(&hash160(&witness_program)) == prevout.script_pubkey.as_bytes()
+        {
+            return Ok((elements::Script::from(p2pkh_script), true));
+        }
+
+        Err(PsbtSignError::Unsupported)
+    }
+
     fn bitcoin_tx_ecdsa_sighash(
         txn: &[u8],
         signing_input: &BitcoinTxSignInput<'_>,
@@ -1637,6 +1933,19 @@ pub mod pure_rust {
 
     struct PsbtBip32Candidate<'a> {
         pubkey: &'a [u8],
+        fingerprint: [u8; 4],
+        path: Vec<u32>,
+    }
+
+    struct LiquidPsbtBip32Candidate {
+        public_key: elements::bitcoin::PublicKey,
+        pubkey: Vec<u8>,
+        fingerprint: [u8; 4],
+        path: Vec<u32>,
+    }
+
+    struct LiquidPsbtTapCandidate {
+        xonly_pubkey: [u8; SHA256_LEN],
         fingerprint: [u8; 4],
         path: Vec<u32>,
     }

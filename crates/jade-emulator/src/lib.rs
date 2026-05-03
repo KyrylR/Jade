@@ -2935,6 +2935,31 @@ impl Emulator {
                 }
                 Err(jade_crypto::PsbtSignError::Unsupported) => {}
             }
+        } else {
+            let Some(liquid_network) = liquid_network_for_name(network_name) else {
+                return bad_parameters("Failed to extract valid network from parameters");
+            };
+            match jade_crypto::pure_rust::sign_liquid_pset_singlesig_from_seed(
+                &psbt,
+                seed,
+                &fingerprint,
+                liquid_network,
+            ) {
+                Ok(Some(result)) => return V1Outcome::BytesResult { result },
+                Ok(None) => {
+                    return V1Outcome::DeferredToCore {
+                        method: "sign_psbt signing".to_string(),
+                    };
+                }
+                Err(jade_crypto::PsbtSignError::Invalid) => {
+                    return bad_parameters("Failed to extract psbt from parameters");
+                }
+                Err(jade_crypto::PsbtSignError::Unsupported) => {
+                    return V1Outcome::DeferredToCore {
+                        method: "sign_psbt signing".to_string(),
+                    };
+                }
+            }
         }
         match jade_crypto::psbt_needs_wallet_signature(&psbt, &fingerprint) {
             Ok(false) => V1Outcome::BytesResult { result: psbt },
@@ -8877,12 +8902,53 @@ mod tests {
     }
 
     #[test]
-    fn sign_psbt_defers_for_unsupported_wallet_signature() {
+    fn sign_psbt_signs_liquid_singlesig_pset_wallet_inputs() {
+        for fixture in [
+            include_str!("../../../test_data/pset_ss_p2pkh.json"),
+            include_str!("../../../test_data/pset_ss_p2wpkh.json"),
+            include_str!("../../../test_data/pset_ss_p2sh_p2wpkh.json"),
+            include_str!("../../../test_data/pset_ss_p2tr.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+            let psbt = fixture_psbt_base64(fixture);
+            let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
+
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(2)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(fixture_network(fixture))
+                .unwrap()
+                .str("psbt")
+                .unwrap()
+                .str(psbt)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("psbt"),
+                method: Cow::Borrowed("sign_psbt"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult { result: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn sign_psbt_defers_for_liquid_multisig_pset_wallet_signature() {
         let mut emulator = Emulator::new();
         emulator
             .platform_mut()
-            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
-        let psbt = fixture_psbt_base64(include_str!("../../../test_data/pset_ss_p2wpkh.json"));
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/pset_tm_green_multisig_2of2csv.json");
+        let psbt = fixture_psbt_base64(fixture);
 
         let mut params = Vec::new();
         minicbor::Encoder::new(&mut params)
@@ -8890,7 +8956,7 @@ mod tests {
             .unwrap()
             .str("network")
             .unwrap()
-            .str("localtest-liquid")
+            .str(fixture_network(fixture))
             .unwrap()
             .str("psbt")
             .unwrap()

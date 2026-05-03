@@ -94,9 +94,10 @@ full prevout set from `tx_input`, using the Jade-compatible Liquid
 main/testnet/regtest genesis hashes for ELIP-0101 Taproot sighashes, verifying
 Elements Taproot tweaked output keys against the supplied script pubkeys, and
 producing DEFAULT/ALL Schnorr signatures. Remaining Liquid work is now narrower:
-script-path Taproot, PSET mutation, and full confidential transaction proof
-validation. Direct `secp256k1-zkp` usage should still stay behind narrow Liquid
-helper APIs unless there is a reason to expose the lower-level backend.
+script-path Taproot, broader PSET policy/finalization beyond singlesig, and
+full confidential transaction proof validation. Direct `secp256k1-zkp` usage
+should still stay behind narrow Liquid helper APIs unless there is a reason to
+expose the lower-level backend.
 
 The hard parts are hard for concrete compatibility reasons:
 
@@ -137,7 +138,7 @@ The hard parts are hard for concrete compatibility reasons:
   Liquid commitment vectors through the permanent public `elements` backend.
 - PSBT/PSET signing front door: Rust now validates PSBT vs. PSET envelope
   compatibility, scans BIP32 derivations for wallet-owned inputs, returns
-  no-op PSBT/PSET payloads unchanged when there is nothing to sign or wallet
+  no-op Bitcoin PSBT payloads unchanged when there is nothing to sign or wallet
   inputs are already signed, and produces pure-Rust ECDSA signatures for the
   first Bitcoin signing paths: single-sig legacy P2PKH, native P2WPKH,
   P2SH-wrapped P2WPKH, Taproot key-path DEFAULT/ALL, and one-device multisig
@@ -146,10 +147,16 @@ The hard parts are hard for concrete compatibility reasons:
   parity plus Green 2-of-3 recovery signing with both short parent-fingerprint
   and full-path derivations. Raw v1 CBOR responses now chunk large signed PSBT
   byte results with `seqnum`/`seqlen` and validate `get_extended_data`
-  continuation requests against the originating id and method. PSBT
-  anti-exfil, script-path Taproot, full multisig finalization, Liquid PSET
-  signing/mutation, and full Liquid proof validation remain active
-  transaction-signing implementation work.
+  continuation requests against the originating id and method. Liquid PSET
+  signing now uses the permanent public `elements` PSET and sighash APIs to
+  mutate singlesig P2PKH, P2WPKH, P2SH-P2WPKH, and Taproot key-path fixtures
+  byte-for-byte against Jade `test_data`, preserving raw map ordering and
+  inserting only the new partial signatures. Broader Liquid PSET cases, such as
+  Green multisig, defer explicitly to the legacy core boundary until policy and
+  finalization parity are implemented. PSBT anti-exfil, script-path Taproot,
+  full multisig finalization, Liquid PSET multisig/policy/finalization, and
+  full Liquid proof validation remain active transaction-signing implementation
+  work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -183,10 +190,13 @@ The hard parts are hard for concrete compatibility reasons:
   `get_signature` returns the final DER+sighash signature. Staged Liquid
   Taproot key-path inputs now collect all prevouts, compute genesis-aware
   Elements Taproot sighashes, reject non-matching output keys, and return
-  DEFAULT/ALL Schnorr signatures matching the Jade fixture. PSBT anti-exfil,
-  Liquid script-path Taproot, registered/generic multisig policy validation,
-  PSET mutation, and full confidential transaction proof validation remain
-  active implementation work.
+  DEFAULT/ALL Schnorr signatures matching the Jade fixture. Liquid PSET
+  singlesig signing now covers p2pkh, p2wpkh, p2sh-p2wpkh, and Taproot key-path
+  fixtures through `sign_psbt`, with unsupported Liquid PSET policy cases
+  returning the explicit core-defer outcome. PSBT anti-exfil, Liquid script-path
+  Taproot, registered/generic multisig policy validation, Liquid PSET
+  multisig/finalization, and full confidential transaction proof validation
+  remain active implementation work.
 
 ## First Parity Gates
 
