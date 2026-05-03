@@ -164,7 +164,11 @@ The hard parts are hard for concrete compatibility reasons:
   `sh(wsh(...))`, Taproot `tr(...)`, Jade's `/**` branch/pointer wildcard
   form, and the Miniscript `or_i(...)`, `thresh(...)`, and `a:` wrappers used
   by the long Liana/P2SH fixtures through the v1 `register_descriptor` and
-  `get_receive_address` APIs.
+  `get_receive_address` APIs. Multisig setup-file import now references every
+  original accepted and rejected JSON/DAT fixture pair, including Jade,
+  BlueWallet, Nunchuk, Sparrow, Specter, P2SH, P2WSH, wrapped P2WSH, bad
+  derivation, duplicate-field, missing-field, format, policy, signer-count,
+  signer-membership, and sorted-flag cases.
 - Receive addresses: default Green 2-of-2, Green 2-of-3 recovery-xpub, and
   Green CSV p2sh-p2wsh addresses for Bitcoin and Liquid, plus Bitcoin
   singlesig, Bitcoin multisig, Bitcoin descriptors, Liquid singlesig
@@ -281,7 +285,7 @@ The hard parts are hard for concrete compatibility reasons:
    where parity is implemented and tracks remaining signing and Liquid
    transaction flows as active implementation work.
 4. Existing Python/libjade tests remain the oracle for subsequent ports. The
-   Rust fixture gate now directly references 115 of 210 original `test_data`
+   Rust fixture gate now directly references 155 of 210 original `test_data`
    files; unreferenced fixtures remain active parity work rather than retired
    coverage.
 

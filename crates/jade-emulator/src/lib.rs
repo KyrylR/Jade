@@ -8729,6 +8729,15 @@ mod tests {
         parse_multisig_details(&record, &HostRecordAuthenticator).unwrap()
     }
 
+    fn fixture_multisig_variant(fixture: &str) -> MultisigVariant {
+        match fixture_object_string_value(fixture, "variant").unwrap() {
+            "wsh(multi(k))" => MultisigVariant::P2wsh,
+            "sh(multi(k))" => MultisigVariant::P2sh,
+            "sh(wsh(multi(k)))" => MultisigVariant::P2wshP2sh,
+            variant => panic!("unexpected fixture multisig variant: {variant}"),
+        }
+    }
+
     #[test]
     fn ping_is_immediate() {
         let mut emulator = Emulator::new();
@@ -15107,47 +15116,74 @@ mod tests {
     fn register_multisig_file_persists_fixture_records() {
         let fixtures = [
             (
-                include_str!("../../../test_data/multisig_file_jade.dat"),
-                "Jade_File_Test",
-                MultisigVariant::P2wsh,
-                false,
-                1,
-                2,
-                Some(decode_hex::<32>(
-                    "3172ae4169b206645a52df2ef79dff7a8c23412e6c0f129ef92e3ec570c5e2d1",
-                )),
-            ),
-            (
+                include_str!("../../../test_data/multisig_file_bw.json"),
                 include_str!("../../../test_data/multisig_file_bw.dat"),
-                "Jade_File_Test",
-                MultisigVariant::P2wsh,
-                true,
-                1,
-                3,
-                None,
+                "multisig_file_bw.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_file_jade.json"),
+                include_str!("../../../test_data/multisig_file_jade.dat"),
+                "multisig_file_jade.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_nunchuk.json"),
+                include_str!("../../../test_data/multisig_file_nunchuk.dat"),
+                "multisig_file_nunchuk.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_p2sh-p2wsh.json"),
                 include_str!("../../../test_data/multisig_file_p2sh-p2wsh.dat"),
-                "Test_17characte",
-                MultisigVariant::P2wshP2sh,
-                false,
-                2,
-                2,
-                None,
+                "multisig_file_p2sh-p2wsh.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_p2sh.json"),
+                include_str!("../../../test_data/multisig_file_p2sh.dat"),
+                "multisig_file_p2sh.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_p2wsh-p2sh.json"),
+                include_str!("../../../test_data/multisig_file_p2wsh-p2sh.dat"),
+                "multisig_file_p2wsh-p2sh.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_p2wsh.json"),
+                include_str!("../../../test_data/multisig_file_p2wsh.dat"),
+                "multisig_file_p2wsh.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_sparrow.json"),
+                include_str!("../../../test_data/multisig_file_sparrow.dat"),
+                "multisig_file_sparrow.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_file_specter.json"),
+                include_str!("../../../test_data/multisig_file_specter.dat"),
+                "multisig_file_specter.dat",
             ),
         ];
 
-        for (file, name, variant, sorted, threshold, num_signers, master_blinding_key) in fixtures {
+        for (fixture, file, file_name) in fixtures {
             let mut emulator = Emulator::new();
             emulator
                 .platform_mut()
                 .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
 
             assert_eq!(
+                fixture_object_string_value(fixture, "multisig_file"),
+                Some(file_name)
+            );
+            assert_eq!(
                 register_multisig_file(&mut emulator, file),
                 V1Outcome::BoolResult { result: true }
             );
 
+            let name = fixture_object_string_value(fixture, "multisig_name").unwrap();
+            let variant = fixture_multisig_variant(fixture);
+            let sorted = fixture_object_bool_value(fixture, "sorted");
+            let threshold = fixture_object_u64_value(fixture, "threshold").unwrap() as u8;
+            let num_signers = fixture_object_u64_value(fixture, "num_signers").unwrap() as u8;
+            let master_blinding_key =
+                fixture_object_hex_value(fixture, "master_blinding_key").map(decode_hex::<32>);
             let details = stored_multisig_details(&emulator, name);
             assert_eq!(details.summary.variant, variant);
             assert_eq!(details.summary.sorted, sorted);
@@ -15194,50 +15230,107 @@ mod tests {
     fn register_multisig_file_rejects_fixture_errors() {
         let fixtures = [
             (
+                include_str!("../../../test_data/multisig_bad_file_derivation.json"),
                 include_str!("../../../test_data/multisig_bad_file_derivation.dat"),
-                "Invalid derivation path",
+                "multisig_bad_file_derivation.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_derivation2.json"),
+                include_str!("../../../test_data/multisig_bad_file_derivation2.dat"),
+                "multisig_bad_file_derivation2.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_duplicate_field1.json"),
                 include_str!("../../../test_data/multisig_bad_file_duplicate_field1.dat"),
-                "Invalid multisig file",
+                "multisig_bad_file_duplicate_field1.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_duplicate_field2.json"),
+                include_str!("../../../test_data/multisig_bad_file_duplicate_field2.dat"),
+                "multisig_bad_file_duplicate_field2.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_duplicate_field3.json"),
+                include_str!("../../../test_data/multisig_bad_file_duplicate_field3.dat"),
+                "multisig_bad_file_duplicate_field3.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_field_missing1.json"),
                 include_str!("../../../test_data/multisig_bad_file_field_missing1.dat"),
-                "Insufficient information records",
+                "multisig_bad_file_field_missing1.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_field_missing2.json"),
+                include_str!("../../../test_data/multisig_bad_file_field_missing2.dat"),
+                "multisig_bad_file_field_missing2.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_field_missing3.json"),
+                include_str!("../../../test_data/multisig_bad_file_field_missing3.dat"),
+                "multisig_bad_file_field_missing3.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_field_missing4.json"),
+                include_str!("../../../test_data/multisig_bad_file_field_missing4.dat"),
+                "multisig_bad_file_field_missing4.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_format.json"),
                 include_str!("../../../test_data/multisig_bad_file_format.dat"),
-                "Invalid multisig format",
+                "multisig_bad_file_format.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_not_in.json"),
                 include_str!("../../../test_data/multisig_bad_file_not_in.dat"),
-                "Failed to validate co-signers",
+                "multisig_bad_file_not_in.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_policy.json"),
                 include_str!("../../../test_data/multisig_bad_file_policy.dat"),
-                "Invalid multisig policy",
+                "multisig_bad_file_policy.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_policy2.json"),
+                include_str!("../../../test_data/multisig_bad_file_policy2.dat"),
+                "multisig_bad_file_policy2.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_policy3.json"),
+                include_str!("../../../test_data/multisig_bad_file_policy3.dat"),
+                "multisig_bad_file_policy3.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_signers1.json"),
                 include_str!("../../../test_data/multisig_bad_file_signers1.dat"),
-                "Invalid number of signers",
+                "multisig_bad_file_signers1.dat",
             ),
             (
+                include_str!("../../../test_data/multisig_bad_file_signers2.json"),
+                include_str!("../../../test_data/multisig_bad_file_signers2.dat"),
+                "multisig_bad_file_signers2.dat",
+            ),
+            (
+                include_str!("../../../test_data/multisig_bad_file_sorted.json"),
                 include_str!("../../../test_data/multisig_bad_file_sorted.dat"),
-                "Invalid sorted flag",
+                "multisig_bad_file_sorted.dat",
             ),
         ];
 
-        for (file, expected_error) in fixtures {
+        for (fixture, file, file_name) in fixtures {
             let mut emulator = Emulator::new();
             emulator
                 .platform_mut()
                 .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
 
             assert_eq!(
+                fixture_object_string_value(fixture, "multisig_file"),
+                Some(file_name)
+            );
+            assert_eq!(
                 register_multisig_file(&mut emulator, file),
                 V1Outcome::Reject {
                     code: ErrorCode::BadParameters,
-                    message: expected_error.to_string(),
+                    message: fixture_expected_error(fixture).to_string(),
                 }
             );
         }
