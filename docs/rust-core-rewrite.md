@@ -64,11 +64,19 @@ compiled as `no_std + alloc` and default features disabled, so board code can
 wire the full Rust v1 behavior engine to ESP platform hooks and NVS storage
 without pulling in host `std`.
 
+Both firmware crates now also expose bootable full-v1 board runtimes:
+`Esp32V1BoardRuntime<P, B>` for Jade v1/v1.1 and
+`Esp32s3V1BoardRuntime<P, B>` for Jade v2/v2c. These wrappers own the generic
+Rust v1 runtime, call the platform boot report before accepting traffic, return
+`BootRequired` until the hardware readiness checks pass, and then dispatch
+serial/BLE/USB traffic through the full Rust v1 behavior engine. This is the
+entrypoint shape expected by a real board event loop.
+
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
 conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, create
-the full `JadeRuntime<P, B>` over the same hardware-facing state and NVS
-backend, and call the v1/v2 transport pollers from the board event loop.
+the full board runtime over the same hardware-facing state and NVS backend, and
+call the v1/v2 transport pollers from the board event loop.
 
 The large v1 wallet/signing implementation is also no longer intrinsically
 host-only: `cargo check -p jade-emulator --no-default-features --lib` passes,

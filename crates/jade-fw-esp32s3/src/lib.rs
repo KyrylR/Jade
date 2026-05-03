@@ -5,8 +5,8 @@ extern crate alloc;
 
 use jade_core::{
     AllocationBudget, DeviceBootFailure, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
-    DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceTarget, FirmwareFrameError,
-    FirmwareProtocol,
+    DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
+    FirmwareFrameError, FirmwareProtocol,
 };
 
 pub const TARGET_SOC: &str = "esp32s3";
@@ -60,6 +60,77 @@ pub enum TouchEvent {
 
 pub type Esp32s3Runtime<P> = DeviceRuntime<P>;
 pub type Esp32s3V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
+
+#[derive(Debug)]
+pub struct Esp32s3V1BoardRuntime<P, B> {
+    runtime: Esp32s3V1Runtime<P, B>,
+    booted: bool,
+}
+
+impl<P, B> Esp32s3V1BoardRuntime<P, B>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    pub fn new(platform: P, storage_backend: B) -> Self {
+        Self {
+            runtime: v1_runtime_for_v2(platform, storage_backend),
+            booted: false,
+        }
+    }
+
+    pub fn boot(&mut self) -> Result<jade_core::DeviceBootReport, DeviceRuntimeError> {
+        let report = self.runtime.runtime_platform_mut().boot_report();
+        if let Some(failure) = report.first_failure() {
+            self.booted = false;
+            Err(DeviceRuntimeError::Boot(failure))
+        } else {
+            self.booted = true;
+            Ok(report)
+        }
+    }
+
+    pub fn is_booted(&self) -> bool {
+        self.booted
+    }
+
+    pub fn runtime(&self) -> &Esp32s3V1Runtime<P, B> {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut Esp32s3V1Runtime<P, B> {
+        &mut self.runtime
+    }
+
+    pub fn platform(&self) -> &P {
+        self.runtime.runtime_platform()
+    }
+
+    pub fn platform_mut(&mut self) -> &mut P {
+        self.runtime.runtime_platform_mut()
+    }
+
+    pub fn poll_serial_v1(&mut self, rx_buffer: &mut [u8]) -> Result<bool, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_serial_full_v1(&mut self.runtime, rx_buffer)
+    }
+
+    pub fn poll_usb_v1(&mut self, rx_buffer: &mut [u8]) -> Result<bool, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_usb_full_v1(&mut self.runtime, rx_buffer)
+    }
+
+    pub fn poll_ble_v1(&mut self, rx_buffer: &mut [u8]) -> Result<bool, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        poll_ble_full_v1(&mut self.runtime, rx_buffer)
+    }
+}
 
 pub fn runtime_for_v2<P>(platform: P) -> Esp32s3Runtime<P>
 where
@@ -508,6 +579,32 @@ mod tests {
         );
 
         assert_eq!(runtime.state().wallet, jade_core::WalletLifecycle::Uninit);
+    }
+
+    #[test]
+    fn s3_board_runtime_boots_before_polling_full_v1() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().usb_rx = Some(v1_request("p", "ping"));
+
+        let mut rx = [0u8; 128];
+        assert_eq!(
+            board.poll_usb_v1(&mut rx),
+            Err(FirmwareFrameError::BootRequired)
+        );
+        assert_eq!(board.boot().unwrap().target, DeviceTarget::JadeV2);
+        assert!(board.is_booted());
+        assert_eq!(board.poll_usb_v1(&mut rx), Ok(true));
+        assert_eq!(board.platform().usb_tx.len(), 1);
+
+        let mut decoder = Decoder::new(&board.platform().usb_tx[0]);
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "id");
+        assert_eq!(decoder.str().unwrap(), "p");
+        assert_eq!(decoder.str().unwrap(), "result");
+        assert_eq!(decoder.u64().unwrap(), 0);
     }
 
     #[test]
