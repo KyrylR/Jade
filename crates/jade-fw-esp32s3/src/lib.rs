@@ -104,6 +104,7 @@ impl Esp32s3V1PollReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Esp32s3OtaStartError<E> {
+    BootRequired,
     Manifest(&'static str),
     Partition(jade_core::DeviceOtaError),
     Writer(OtaWriteError<E>),
@@ -284,6 +285,20 @@ where
             ext_signature_out,
         )
         .map_err(FirmwareFrameError::Io)
+    }
+
+    pub fn begin_ota_update<W>(
+        &mut self,
+        writer: W,
+        request: OtaRequest,
+    ) -> Result<Esp32s3OtaSession<W>, Esp32s3OtaStartError<W::Error>>
+    where
+        W: OtaImageWriter,
+    {
+        if !self.booted {
+            return Err(Esp32s3OtaStartError::BootRequired);
+        }
+        begin_ota_update(self.platform().manifest(), writer, request)
     }
 }
 
@@ -1051,6 +1066,32 @@ mod tests {
                 jade_core::DeviceOtaError::FirmwareTooLarge
             ))
         ));
+    }
+
+    #[test]
+    fn s3_board_runtime_starts_ota_after_boot() {
+        let request = OtaRequest::full(
+            1_000,
+            600,
+            Some([0x11; jade_core::OTA_HASH_LEN]),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+
+        assert!(matches!(
+            board.begin_ota_update(TestOtaWriter::new(), request.clone()),
+            Err(Esp32s3OtaStartError::BootRequired)
+        ));
+        board.boot().unwrap();
+        let session = board
+            .begin_ota_update(TestOtaWriter::new(), request)
+            .unwrap();
+        assert!(session.writer().begun);
     }
 
     #[test]

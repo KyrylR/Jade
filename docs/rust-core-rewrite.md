@@ -84,7 +84,10 @@ failures without panicking. Both target families now expose boot-gated display
 status and user-confirmation hooks for address, message, transaction, and
 export prompts, and the ESP32-S3 board runtime exposes the same boot-gated
 boundary for touch press/release events and hardware attestation challenge
-signing. This is the entrypoint shape expected by a real board event loop.
+signing. OTA start is also exposed on the board runtimes, so firmware event
+loops now begin OTA through the boot-gated runtime wrapper before streaming
+chunks through `OtaWriteSession<W>`. This is the entrypoint shape expected by a
+real board event loop.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
@@ -130,6 +133,7 @@ offset and byte-count checks, finalize only after the declared compressed size
 has arrived, and abort unfinished uploads. The ESP32 and ESP32-S3 firmware
 crates expose `begin_ota_update` helpers that first assert the official target
 manifest and OTA partition fit, then start the platform writer. The remaining
+board runtimes now expose that same path as a boot-gated method. The remaining
 board work is the concrete ESP OTA writer that maps this trait to the device
 OTA slot APIs and signed-image verification path.
 
