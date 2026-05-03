@@ -107,10 +107,15 @@ Elements Taproot tweaked output keys against the supplied script pubkeys, and
 producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now covers
 singlesig, the Liquidex partial-swap maker PSET, and the current Green
 witness-script fixtures, and returns Liquid PSET payloads unchanged when the
-wallet has no matching signing input. Remaining Liquid work is now narrower:
-script-path Taproot and generic PSET policy/finalization beyond the covered
-cases. Direct `secp256k1-zkp` usage should still stay behind narrow Liquid
-helper APIs unless there is a reason to expose the lower-level backend.
+wallet has no matching signing input. The PSBT/PSET Taproot signer and
+fallback scanner now match Jade's current Taproot policy boundary: single-key
+key-path Taproot is eligible for Rust signing, while script-path Taproot
+markers, merkle roots, multiple Taproot derivations, and already-signed
+key-path inputs do not keep a request on the legacy C-core boundary. Remaining
+Liquid work is now narrower: generic PSET policy validation beyond the covered
+send, swap, singlesig, and Green cases. Direct `secp256k1-zkp` usage should
+still stay behind narrow Liquid helper APIs unless there is a reason to expose
+the lower-level backend.
 
 The hard parts are hard for concrete compatibility reasons:
 
@@ -216,10 +221,12 @@ The hard parts are hard for concrete compatibility reasons:
   the legacy core boundary until their parity is implemented.
   `sign_psbt` itself has no staged anti-exfil subprotocol in the current Jade
   client or C handler; anti-exfil parity belongs to `sign_tx`,
-  `sign_liquid_tx`, and message signing. Script-path Taproot, broader multisig
-  policy/finalization beyond recognized standard and Green script forms, and
-  generic Liquid PSET policy/finalization remain active transaction-signing
-  implementation work.
+  `sign_liquid_tx`, and message signing. Script-path Taproot is not a pending
+  C-removal dependency because current Jade signing is key-path-only; Rust now
+  treats script-path Taproot signing/fallback scans as unsupported-by-policy
+  rather than deferred-to-C. Broader multisig policy validation beyond
+  recognized standard and Green script forms, plus generic Liquid PSET policy
+  validation, remain active transaction-signing implementation work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -283,10 +290,13 @@ The hard parts are hard for concrete compatibility reasons:
   restricted to recognized standard multisig or Jade Green CSV script forms
   rather than arbitrary pubkey-containing scripts. Unsupported Liquid PSET
   policy/finalization cases return the explicit core-defer outcome.
-  `sign_psbt` has no staged anti-exfil continuation in current Jade; Liquid
-  script-path Taproot, broader multisig policy/finalization beyond recognized
-  standard and Green script forms, and generic Liquid PSET policy/finalization
-  remain active implementation work.
+  `sign_psbt` has no staged anti-exfil continuation in current Jade. The
+  PSBT/PSET Taproot signer and fallback scanner now mirror Jade's
+  key-path-only Taproot signer: script-path Taproot markers, merkle roots,
+  multiple Taproot derivations, and already-signed key-path inputs do not
+  create a legacy C-core defer. Broader multisig policy validation beyond
+  recognized standard and Green script forms, plus generic Liquid PSET policy
+  validation, remain active implementation work.
 
 ## First Parity Gates
 

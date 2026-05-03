@@ -317,27 +317,50 @@ fn scan_psbt_input_map(
 ) -> Result<bool, PsbtScanError> {
     let mut signed_pubkeys: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
     let mut wallet_pubkeys: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    let mut tap_key_signed = false;
+    let mut tap_derivations = 0usize;
+    let mut tap_wallet_derivations = 0usize;
+    let mut tap_script_path_present = false;
 
     loop {
         let key = read_psbt_key(bytes, pos)?;
         if key.is_empty() {
-            return Ok(wallet_pubkeys
+            let needs_ecdsa_signature = wallet_pubkeys
                 .iter()
-                .any(|pubkey| !signed_pubkeys.iter().any(|signed| signed == pubkey)));
+                .any(|pubkey| !signed_pubkeys.iter().any(|signed| signed == pubkey));
+            let needs_taproot_key_signature = !tap_key_signed
+                && tap_derivations == 1
+                && tap_wallet_derivations == 1
+                && !tap_script_path_present;
+            return Ok(needs_ecdsa_signature || needs_taproot_key_signature);
         }
         let value = read_psbt_value(bytes, pos)?;
         match key[0] {
             // PSBT_IN_PARTIAL_SIG. Key data is the signed public key.
             0x02 => signed_pubkeys.push(&key[1..]),
+            // PSBT_IN_TAP_KEY_SIG. Key-path Taproot signature already present.
+            0x13 if key.len() == 1 => tap_key_signed = true,
+            // PSBT_IN_TAP_SCRIPT_SIG and PSBT_IN_TAP_LEAF_SCRIPT are script-path only.
+            0x14 | 0x15 => tap_script_path_present = true,
             // PSBT_IN_BIP32_DERIVATION. Value starts with the 4-byte master fingerprint.
             0x06 if value.get(..4) == Some(wallet_fingerprint) => {
                 wallet_pubkeys.push(&key[1..]);
             }
-            // PSBT_IN_TAP_BIP32_DERIVATION. Taproot signing is a separate milestone,
-            // so any matching taproot derivation must stay on the explicit signing path.
-            0x16 if tap_derivation_matches_fingerprint(value, wallet_fingerprint) => {
-                return Ok(true);
+            // PSBT_IN_TAP_BIP32_DERIVATION. Jade's current signer supports
+            // single-key key-path Taproot only; script-path leaves, merkle roots,
+            // and multiple tap derivations are intentionally not treated as C-core
+            // defers because the legacy signer does not sign them either.
+            0x16 => {
+                if let Some(leaf_hashes) = tap_derivation_leaf_hashes(value) {
+                    tap_derivations = tap_derivations.saturating_add(1);
+                    tap_script_path_present |= leaf_hashes != 0 || tap_derivations > 1;
+                    if tap_derivation_matches_fingerprint(value, wallet_fingerprint) {
+                        tap_wallet_derivations = tap_wallet_derivations.saturating_add(1);
+                    }
+                }
             }
+            // PSBT_IN_TAP_MERKLE_ROOT signals script-path Taproot state.
+            0x18 if key.len() == 1 => tap_script_path_present = true,
             _ => {}
         }
     }
@@ -434,17 +457,22 @@ fn read_exact_opt<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Option<&'
 }
 
 fn tap_derivation_matches_fingerprint(value: &[u8], wallet_fingerprint: &[u8; 4]) -> bool {
-    let mut pos = 0;
-    let Some(leaf_hashes) = read_compact_size_opt(value, &mut pos) else {
+    let Some((pos, _)) = tap_derivation_parts(value) else {
         return false;
     };
-    let Some(skip_len) = leaf_hashes.checked_mul(SHA256_LEN) else {
-        return false;
-    };
-    if read_exact_opt(value, &mut pos, skip_len).is_none() {
-        return false;
-    }
     value.get(pos..pos + 4) == Some(wallet_fingerprint)
+}
+
+fn tap_derivation_leaf_hashes(value: &[u8]) -> Option<usize> {
+    tap_derivation_parts(value).map(|(_, leaf_hashes)| leaf_hashes)
+}
+
+fn tap_derivation_parts(value: &[u8]) -> Option<(usize, usize)> {
+    let mut pos = 0;
+    let leaf_hashes = read_compact_size_opt(value, &mut pos)?;
+    let skip_len = leaf_hashes.checked_mul(SHA256_LEN)?;
+    read_exact_opt(value, &mut pos, skip_len)?;
+    Some((pos, leaf_hashes))
 }
 
 impl<'a> OtpUri<'a> {
@@ -1070,10 +1098,13 @@ pub mod pure_rust {
             let mut signed_pubkeys = Vec::new();
             let mut bip32_candidates = Vec::new();
             let mut tap_key_signed = false;
+            let mut tap_derivation_count = 0usize;
+            let mut tap_script_path_present = false;
             let mut tap_candidates = Vec::new();
             for entry in &input.entries {
                 match entry.key.first().copied() {
                     Some(0x13) if entry.key.len() == 1 => tap_key_signed = true,
+                    Some(0x14) | Some(0x15) => tap_script_path_present = true,
                     Some(0x02) => signed_pubkeys.push(&entry.key[1..]),
                     Some(0x06)
                         if entry.value.len() >= 4 && compressed_pubkey_len(&entry.key[1..]) =>
@@ -1088,15 +1119,19 @@ pub mod pure_rust {
                             path,
                         });
                     }
-                    Some(0x16)
-                        if entry.key.len() == 1 + SHA256_LEN
-                            && super::tap_derivation_matches_fingerprint(
-                                entry.value,
-                                wallet_fingerprint,
-                            ) =>
-                    {
-                        tap_candidates.push((&entry.key[1..], entry.value));
+                    Some(0x16) if entry.key.len() == 1 + SHA256_LEN => {
+                        let leaf_hash_count = super::tap_derivation_leaf_hashes(entry.value)
+                            .ok_or(PsbtSignError::Invalid)?;
+                        tap_derivation_count = tap_derivation_count.saturating_add(1);
+                        tap_script_path_present |= leaf_hash_count != 0 || tap_derivation_count > 1;
+                        if super::tap_derivation_matches_fingerprint(
+                            entry.value,
+                            wallet_fingerprint,
+                        ) {
+                            tap_candidates.push((&entry.key[1..], entry.value));
+                        }
                     }
+                    Some(0x18) if entry.key.len() == 1 => tap_script_path_present = true,
                     _ => {}
                 }
             }
@@ -1133,7 +1168,7 @@ pub mod pure_rust {
                 });
             }
 
-            if !tap_key_signed {
+            if !tap_key_signed && tap_derivation_count == 1 && !tap_script_path_present {
                 for (xonly_pubkey, derivation_value) in tap_candidates {
                     let path = parse_tap_derivation_path(derivation_value, wallet_fingerprint)?;
                     let derived_pubkey =
@@ -1284,7 +1319,7 @@ pub mod pure_rust {
                 });
             }
 
-            if input.tap_key_sig.is_some() {
+            if input.tap_key_sig.is_some() || !liquid_pset_keypath_taproot_supported(input) {
                 continue;
             }
             for candidate in liquid_pset_tap_candidates(input) {
@@ -1819,6 +1854,17 @@ pub mod pure_rust {
                 }
             })
             .collect()
+    }
+
+    fn liquid_pset_keypath_taproot_supported(input: &elements::pset::Input) -> bool {
+        input.tap_key_origins.len() == 1
+            && input.tap_script_sigs.is_empty()
+            && input.tap_scripts.is_empty()
+            && input.tap_merkle_root.is_none()
+            && input
+                .tap_key_origins
+                .values()
+                .all(|(leaf_hashes, _)| leaf_hashes.is_empty())
     }
 
     fn liquid_pset_key_source_parts(
@@ -5423,6 +5469,7 @@ mod otp_tests {
 mod tests {
     use super::*;
     use alloc::string::{String, ToString};
+    use alloc::vec;
     use alloc::vec::Vec;
     use rand_core::{CryptoRng, Error as RandError, RngCore};
     use rsa::pkcs8::{
@@ -6421,6 +6468,103 @@ mod tests {
             )
             .unwrap(),
             "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+        );
+    }
+
+    fn push_test_compact_size(output: &mut Vec<u8>, value: usize) {
+        assert!(value < 0xfd);
+        output.push(value as u8);
+    }
+
+    fn push_test_psbt_entry(output: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+        push_test_compact_size(output, key.len());
+        output.extend_from_slice(key);
+        push_test_compact_size(output, value.len());
+        output.extend_from_slice(value);
+    }
+
+    fn test_psbt_v2_with_single_input(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+        let mut psbt = b"psbt\xff".to_vec();
+        push_test_psbt_entry(&mut psbt, &[0x04], &[1]);
+        push_test_psbt_entry(&mut psbt, &[0x05], &[0]);
+        psbt.push(0);
+        for (key, value) in entries {
+            push_test_psbt_entry(&mut psbt, &key, &value);
+        }
+        psbt.push(0);
+        psbt
+    }
+
+    fn test_tap_derivation_entry(
+        xonly_byte: u8,
+        wallet_fingerprint: &[u8; 4],
+        leaf_hash_count: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut key = Vec::with_capacity(1 + SHA256_LEN);
+        key.push(0x16);
+        key.extend_from_slice(&[xonly_byte; SHA256_LEN]);
+
+        let mut value = Vec::new();
+        push_test_compact_size(&mut value, leaf_hash_count);
+        for leaf_index in 0..leaf_hash_count {
+            value.extend_from_slice(&[leaf_index as u8; SHA256_LEN]);
+        }
+        value.extend_from_slice(wallet_fingerprint);
+        value.extend_from_slice(&0u32.to_le_bytes());
+        (key, value)
+    }
+
+    #[test]
+    fn psbt_wallet_signature_scan_tracks_only_supported_taproot_keypath_inputs() {
+        let fingerprint = [1, 2, 3, 4];
+        let keypath =
+            test_psbt_v2_with_single_input(vec![test_tap_derivation_entry(0x02, &fingerprint, 0)]);
+        assert_eq!(
+            psbt_needs_wallet_signature(&keypath, &fingerprint),
+            Ok(true)
+        );
+
+        let already_signed = test_psbt_v2_with_single_input(vec![
+            (vec![0x13], vec![0x55; 64]),
+            test_tap_derivation_entry(0x02, &fingerprint, 0),
+        ]);
+        assert_eq!(
+            psbt_needs_wallet_signature(&already_signed, &fingerprint),
+            Ok(false)
+        );
+
+        let leaf_hash =
+            test_psbt_v2_with_single_input(vec![test_tap_derivation_entry(0x02, &fingerprint, 1)]);
+        assert_eq!(
+            psbt_needs_wallet_signature(&leaf_hash, &fingerprint),
+            Ok(false)
+        );
+
+        let leaf_script = test_psbt_v2_with_single_input(vec![
+            test_tap_derivation_entry(0x02, &fingerprint, 0),
+            (vec![0x15], vec![0x51]),
+        ]);
+        assert_eq!(
+            psbt_needs_wallet_signature(&leaf_script, &fingerprint),
+            Ok(false)
+        );
+
+        let merkle_root = test_psbt_v2_with_single_input(vec![
+            test_tap_derivation_entry(0x02, &fingerprint, 0),
+            (vec![0x18], vec![0x99; SHA256_LEN]),
+        ]);
+        assert_eq!(
+            psbt_needs_wallet_signature(&merkle_root, &fingerprint),
+            Ok(false)
+        );
+
+        let multiple_tap_keys = test_psbt_v2_with_single_input(vec![
+            test_tap_derivation_entry(0x02, &fingerprint, 0),
+            test_tap_derivation_entry(0x03, &fingerprint, 0),
+        ]);
+        assert_eq!(
+            psbt_needs_wallet_signature(&multiple_tap_keys, &fingerprint),
+            Ok(false)
         );
     }
 
