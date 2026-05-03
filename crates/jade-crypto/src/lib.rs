@@ -102,6 +102,18 @@ pub struct LiquidCommitmentData {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiquidOutputCommitment {
+    pub asset_generator: Option<[u8; LIQUID_COMMITMENT_LEN]>,
+    pub value_commitment: Option<[u8; LIQUID_COMMITMENT_LEN]>,
+}
+
+impl LiquidOutputCommitment {
+    pub fn is_confidential(&self) -> bool {
+        self.asset_generator.is_some() || self.value_commitment.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XpubPrefix {
     Main,
     Test,
@@ -748,9 +760,10 @@ pub fn slip77_master_unblinding_key_from_seed(seed: &[u8]) -> Option<[u8; SHA512
 pub mod pure_rust {
     use super::{
         Bip85EncryptedEntropy, BitcoinNetwork, BlindingFactorBytes, BlindingFactorKind,
-        IdentityKeyType, LiquidCommitmentData, LiquidNetwork, MultisigScriptVariant, PsbtEnvelope,
-        PsbtSignError, SinglesigScriptVariant, TxSignError, XpubPrefix, EC_PRIVATE_KEY_LEN,
-        EC_PUBLIC_KEY_COMPRESSED_LEN, LIQUID_COMMITMENT_LEN, SHA256_LEN, SHA512_LEN,
+        IdentityKeyType, LiquidCommitmentData, LiquidNetwork, LiquidOutputCommitment,
+        MultisigScriptVariant, PsbtEnvelope, PsbtSignError, SinglesigScriptVariant, TxSignError,
+        XpubPrefix, EC_PRIVATE_KEY_LEN, EC_PUBLIC_KEY_COMPRESSED_LEN, LIQUID_COMMITMENT_LEN,
+        SHA256_LEN, SHA512_LEN,
     };
     use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
     use aes::{Aes256, Block};
@@ -4050,22 +4063,160 @@ pub mod pure_rust {
         })
     }
 
-    pub fn liquid_tx_input_count_and_output_confidentiality(
+    pub fn liquid_commitment_data_matches(
+        asset_id: &[u8; SHA256_LEN],
+        value: u64,
+        abf: &[u8; SHA256_LEN],
+        vbf: &[u8; SHA256_LEN],
+        asset_generator: &[u8; LIQUID_COMMITMENT_LEN],
+        value_commitment: &[u8; LIQUID_COMMITMENT_LEN],
+    ) -> bool {
+        liquid_commitments_from_factors(asset_id, value, abf, vbf).is_some_and(|expected| {
+            expected.asset_generator == *asset_generator
+                && expected.value_commitment == *value_commitment
+        })
+    }
+
+    pub fn liquid_asset_generator_matches(
+        asset_id: &[u8; SHA256_LEN],
+        abf: &[u8; SHA256_LEN],
+        asset_generator: &[u8; LIQUID_COMMITMENT_LEN],
+    ) -> bool {
+        use elements::confidential::{Asset, AssetBlindingFactor};
+        use elements::secp256k1_zkp::Secp256k1;
+        use elements::AssetId;
+
+        let secp = Secp256k1::new();
+        let mut wally_asset_id_order = *asset_id;
+        wally_asset_id_order.reverse();
+        let Some(asset) = AssetId::from_slice(&wally_asset_id_order).ok() else {
+            return false;
+        };
+        let Some(abf) = AssetBlindingFactor::from_slice(abf).ok() else {
+            return false;
+        };
+        let Asset::Confidential(generator) = Asset::new_confidential(&secp, asset, abf) else {
+            return false;
+        };
+
+        generator.serialize() == *asset_generator
+    }
+
+    pub fn liquid_value_commitment_matches(
+        value: u64,
+        asset_generator: &[u8; LIQUID_COMMITMENT_LEN],
+        vbf: &[u8; SHA256_LEN],
+        value_commitment: &[u8; LIQUID_COMMITMENT_LEN],
+    ) -> bool {
+        use elements::confidential::{Value as ConfidentialValue, ValueBlindingFactor};
+        use elements::secp256k1_zkp::{Generator, Secp256k1};
+
+        let secp = Secp256k1::new();
+        let Some(generator) = Generator::from_slice(asset_generator).ok() else {
+            return false;
+        };
+        let Some(vbf) = ValueBlindingFactor::from_slice(vbf).ok() else {
+            return false;
+        };
+        let ConfidentialValue::Confidential(commitment) =
+            ConfidentialValue::new_confidential(&secp, value, generator, vbf)
+        else {
+            return false;
+        };
+
+        commitment.serialize() == *value_commitment
+    }
+
+    pub fn liquid_asset_proof_matches(
+        asset_id: &[u8; SHA256_LEN],
+        asset_generator: &[u8; LIQUID_COMMITMENT_LEN],
+        proof: &[u8],
+    ) -> bool {
+        use elements::secp256k1_zkp::{Generator, Secp256k1, SurjectionProof};
+        use elements::AssetId;
+
+        let secp = Secp256k1::new();
+        let mut wally_asset_id_order = *asset_id;
+        wally_asset_id_order.reverse();
+        let Some(asset) = AssetId::from_slice(&wally_asset_id_order).ok() else {
+            return false;
+        };
+        let Some(codomain) = Generator::from_slice(asset_generator).ok() else {
+            return false;
+        };
+        let Some(proof) = SurjectionProof::from_slice(proof).ok() else {
+            return false;
+        };
+        let domain = Generator::new_unblinded(&secp, asset.into_tag());
+
+        proof.verify(&secp, codomain, &[domain])
+    }
+
+    pub fn liquid_value_proof_matches(
+        value: u64,
+        asset_generator: &[u8; LIQUID_COMMITMENT_LEN],
+        value_commitment: &[u8; LIQUID_COMMITMENT_LEN],
+        proof: &[u8],
+    ) -> bool {
+        use elements::secp256k1_zkp::{Generator, PedersenCommitment, RangeProof, Secp256k1};
+
+        let secp = Secp256k1::new();
+        let Some(generator) = Generator::from_slice(asset_generator).ok() else {
+            return false;
+        };
+        let Some(commitment) = PedersenCommitment::from_slice(value_commitment).ok() else {
+            return false;
+        };
+        let Some(proof) = RangeProof::from_slice(proof).ok() else {
+            return false;
+        };
+
+        proof
+            .verify(&secp, commitment, &[], generator)
+            .is_ok_and(|range| range.start == value && range.end.checked_sub(1) == Some(value))
+    }
+
+    pub fn liquid_tx_input_count_and_output_commitments(
         txn: &[u8],
-    ) -> Option<(usize, Vec<bool>)> {
+    ) -> Option<(usize, Vec<LiquidOutputCommitment>)> {
         use elements::confidential::{Asset, Value};
         use elements::encode;
 
         let tx: elements::Transaction = encode::deserialize(txn).ok()?;
-        let outputs = tx
-            .output
-            .iter()
-            .map(|output| {
-                matches!(output.asset, Asset::Confidential(_))
-                    || matches!(output.value, Value::Confidential(_))
-            })
-            .collect();
+        let mut outputs = Vec::with_capacity(tx.output.len());
+        for output in &tx.output {
+            let asset_generator = match output.asset {
+                Asset::Confidential(generator) => Some(generator.serialize()),
+                Asset::Explicit(_) | Asset::Null => None,
+            };
+            let value_commitment = match output.value {
+                Value::Confidential(commitment) => Some(commitment.serialize()),
+                Value::Explicit(_) | Value::Null => None,
+            };
+            if asset_generator.is_some() != value_commitment.is_some() {
+                return None;
+            }
+            outputs.push(LiquidOutputCommitment {
+                asset_generator,
+                value_commitment,
+            });
+        }
+
         Some((tx.input.len(), outputs))
+    }
+
+    pub fn liquid_tx_input_count_and_output_confidentiality(
+        txn: &[u8],
+    ) -> Option<(usize, Vec<bool>)> {
+        liquid_tx_input_count_and_output_commitments(txn).map(|(inputs, outputs)| {
+            (
+                inputs,
+                outputs
+                    .into_iter()
+                    .map(|output| output.is_confidential())
+                    .collect(),
+            )
+        })
     }
 
     fn hash160(bytes: &[u8]) -> [u8; 20] {
@@ -5353,6 +5504,37 @@ mod tests {
             .len(),
             SHA256_LEN * 2
         );
+    }
+
+    #[test]
+    fn liquid_commitment_data_rejects_tampered_factors() {
+        let asset_id =
+            decode_hex_32("5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225");
+        let abf = decode_hex_32("a3510210bbab6ed67429af9beaf42f09382e12146a3db466971b58a45516bba0");
+        let vbf = decode_hex_32("6ec064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53");
+        let asset_generator =
+            decode_hex_33("0abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713");
+        let value_commitment =
+            decode_hex_33("094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43");
+        assert!(pure_rust::liquid_commitment_data_matches(
+            &asset_id,
+            9_000_000,
+            &abf,
+            &vbf,
+            &asset_generator,
+            &value_commitment,
+        ));
+
+        let mut tampered_vbf = vbf;
+        tampered_vbf[0] ^= 0x01;
+        assert!(!pure_rust::liquid_commitment_data_matches(
+            &asset_id,
+            9_000_000,
+            &abf,
+            &tampered_vbf,
+            &asset_generator,
+            &value_commitment,
+        ));
     }
 
     fn decode_hex_65(input: &str) -> [u8; 65] {

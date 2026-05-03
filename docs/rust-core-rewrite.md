@@ -41,7 +41,7 @@ the continuation methods used by multi-message flows.
 | Pre-auth | `get_version_info`, `add_entropy`, `set_epoch`, `logout`, `register_attestation`, `sign_attestation`, `update_pinserver`, `auth_user`, `cancel`, `ota`, `ota_delta` | must-parity |
 | Authenticated | `register_otp`, `get_otp_code`, `get_xpub`, `get_registered_multisigs`, `get_registered_multisig`, `register_multisig`, `get_registered_descriptors`, `get_registered_descriptor`, `register_descriptor`, `get_receive_address`, `get_identity_pubkey`, `get_identity_shared_key`, `sign_identity`, `sign_message`, `sign_psbt`, `sign_tx`, `get_master_blinding_key`, `get_bip85_pubkey`, `sign_bip85_digests`, `show_bip85_bip39_entropy` | must-parity |
 | Liquid | `get_blinding_factor`, `get_blinding_key`, `get_shared_nonce` | must-parity |
-| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session, validates Liquid `tx_input` continuations, signs non-Taproot legacy/segwit ECDSA inputs, including anti-exfil continuations and standard Elements ECDSA sighash flags, and signs staged Liquid Taproot key-path inputs through the public `elements` sighash API |
+| Liquid TX | `sign_liquid_tx`, `get_commitments` | `get_commitments` commitment construction implemented with the permanent public `elements` Liquid backend; `sign_liquid_tx` now starts a Rust v1 session, verifies supplied factor-backed or explicit-proof trusted commitments against transaction outputs, preserves v1-compatible null trusted-commitment entries, validates Liquid `tx_input` continuations, signs non-Taproot legacy/segwit ECDSA inputs, including anti-exfil continuations and standard Elements ECDSA sighash flags, and signs staged Liquid Taproot key-path inputs through the public `elements` sighash API |
 | Continuation | `ota_data`, `ota_complete`, `tx_input`, `get_extended_data`, `get_signature`, `pin` | must-parity |
 | Debug/CI | `debug_selfcheck`, `debug_clean_reset`, `debug_set_mnemonic`, `debug_handshake`, `debug_scan_qr`, `debug_capture_image_data`, `get_bip85_bip39_entropy`, `get_bip85_rsa_entropy` | adapter-only unless promoted by release policy |
 
@@ -88,12 +88,16 @@ production dependency and the C firmware/libjade behavior as the differential
 reference. The Rust `sign_liquid_tx` signer covers non-Taproot legacy/segwit
 ECDSA inputs by parsing Elements transactions with `elements`, constructing
 Elements legacy/BIP143 sighashes with `SighashCache`, parsing confidential or
-explicit value commitments, and reusing Jade's low-R and anti-exfil ECDSA
-signers. The v1 adapter now accepts the standard Elements ECDSA sighash set,
-including `SIGHASH_SINGLE|ANYONECANPAY`, and matches the Jade single-sig
-Liquid anti-exfil fixtures for P2PKH, P2WPKH, P2SH-P2WPKH, and the Liquidex
-partial-swap maker flow. Fixture coverage now also includes legacy low-R,
-large-amount, ledger-compare, no-signing, explicit-sighash, testnet,
+explicit value commitments, verifying supplied trusted commitments against the
+transaction asset/value commitments when the host provides ABF/VBF material or
+explicit rangeproof/surjection-proof data, and reusing Jade's low-R and
+anti-exfil ECDSA signers. Null or empty trusted-commitment entries remain
+accepted for v1 compatibility and are treated as unverified entries, matching
+current firmware behavior. The v1 adapter now accepts the standard Elements
+ECDSA sighash set, including `SIGHASH_SINGLE|ANYONECANPAY`, and matches the
+Jade single-sig Liquid anti-exfil fixtures for P2PKH, P2WPKH, P2SH-P2WPKH, and
+the Liquidex partial-swap maker flow. Fixture coverage now also includes legacy
+low-R, large-amount, ledger-compare, no-signing, explicit-sighash, testnet,
 non-confidential-input, non-CSV, tx-commitment, random-blinder/proof-shape,
 asset-info, and swap maker/taker flows, including null no-sign input slots. It
 also covers staged Liquid Taproot key-path inputs by collecting the full
@@ -104,10 +108,9 @@ producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now covers
 singlesig, the Liquidex partial-swap maker PSET, and the current Green
 witness-script fixtures, and returns Liquid PSET payloads unchanged when the
 wallet has no matching signing input. Remaining Liquid work is now narrower:
-script-path Taproot, generic PSET policy/finalization beyond the covered
-cases, and full confidential transaction proof validation. Direct
-`secp256k1-zkp` usage should still stay behind narrow Liquid helper APIs unless
-there is a reason to expose the lower-level backend.
+script-path Taproot and generic PSET policy/finalization beyond the covered
+cases. Direct `secp256k1-zkp` usage should still stay behind narrow Liquid
+helper APIs unless there is a reason to expose the lower-level backend.
 
 The hard parts are hard for concrete compatibility reasons:
 
@@ -166,9 +169,11 @@ The hard parts are hard for concrete compatibility reasons:
   preserving raw map ordering and inserting only the new partial signatures.
   Unsupported Liquid PSET policy/finalization cases still defer explicitly to
   the legacy core boundary until their parity is implemented.
-  PSBT anti-exfil, script-path Taproot, registered/generic multisig policy
-  validation, generic Liquid PSET policy/finalization, and full Liquid proof
-  validation remain active transaction-signing implementation work.
+  `sign_psbt` itself has no staged anti-exfil subprotocol in the current Jade
+  client or C handler; anti-exfil parity belongs to `sign_tx`,
+  `sign_liquid_tx`, and message signing. Script-path Taproot,
+  registered/generic multisig policy validation, and generic Liquid PSET
+  policy/finalization remain active transaction-signing implementation work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -190,7 +195,8 @@ The hard parts are hard for concrete compatibility reasons:
   lengths now return the v1-compatible protocol error before the
   commitment/entropy consistency check. Liquid `sign_liquid_tx` now enters the
   Rust v1 adapter for network validation, public `elements` transaction
-  parsing, input-count validation, trusted-commitment array checks, change
+  parsing, input-count validation, trusted-commitment array checks, factor
+  or explicit-proof verification against output asset/value commitments, change
   output metadata checks, and asset-info shape validation, then starts a
   stateful Liquid legacy or anti-exfil signing session. Liquid `tx_input`
   continuations now use Jade-compatible validation for signing paths, scripts,
@@ -205,19 +211,19 @@ The hard parts are hard for concrete compatibility reasons:
   broader Liquid fixture corpus for low-R legacy signing, large amounts,
   no-signing inputs, ledger comparison, testnet anti-exfil, explicit sighashes,
   non-confidential inputs, non-CSV scripts, tx commitments, random blinder
-  proof-shape variants, asset metadata, and swap maker/taker flows with null
-  no-sign input slots. Staged Liquid Taproot key-path inputs now collect all
+  proof-shape variants, including explicit rangeproof/surjection-proof trusted
+  commitments, asset metadata, and swap maker/taker flows with null no-sign
+  input slots. Staged Liquid Taproot key-path inputs now collect all
   prevouts, compute genesis-aware Elements Taproot sighashes, reject
   non-matching output keys, and return DEFAULT/ALL Schnorr signatures matching
   the Jade fixture. Liquid PSET signing now covers p2pkh, p2wpkh,
   p2sh-p2wpkh, the Liquidex partial-swap maker PSET, Taproot key-path, Green
   CSV witness-script, Green no-recovery P2WSH, and no-wallet-input Liquid PSET
   fixtures through `sign_psbt`, with unsupported Liquid PSET
-  policy/finalization cases returning the explicit core-defer outcome. PSBT
-  anti-exfil, Liquid script-path Taproot,
-  registered/generic multisig policy validation, generic Liquid PSET
-  policy/finalization, and full confidential transaction proof validation
-  remain active implementation work.
+  policy/finalization cases returning the explicit core-defer outcome.
+  `sign_psbt` has no staged anti-exfil continuation in current Jade; Liquid
+  script-path Taproot, registered/generic multisig policy validation, and
+  generic Liquid PSET policy/finalization remain active implementation work.
 
 ## First Parity Gates
 

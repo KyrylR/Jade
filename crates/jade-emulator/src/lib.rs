@@ -2264,21 +2264,19 @@ impl Emulator {
                 return bad_parameters("Failed to extract valid number of inputs from parameters")
             }
         };
-        let Some((actual_inputs, output_confidentiality)) =
-            jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(txn)
+        let Some((actual_inputs, output_commitments)) =
+            jade_crypto::pure_rust::liquid_tx_input_count_and_output_commitments(txn)
         else {
             return bad_parameters("Failed to extract tx from parameters");
         };
         if actual_inputs != expected_inputs {
             return bad_parameters("Unexpected number of inputs for transaction");
         }
-        if let Err(message) =
-            validate_liquid_trusted_commitments(params.raw(), &output_confidentiality)
+        if let Err(message) = validate_liquid_trusted_commitments(params.raw(), &output_commitments)
         {
             return bad_parameters(message);
         }
-        if let Err(message) =
-            validate_liquid_change_outputs(params.raw(), output_confidentiality.len())
+        if let Err(message) = validate_liquid_change_outputs(params.raw(), output_commitments.len())
         {
             return bad_parameters(message);
         }
@@ -4515,53 +4513,110 @@ fn cbor_map_bytes_or_null<'a>(raw: &'a [u8], field: &str) -> Result<Option<&'a [
 
 fn validate_liquid_trusted_commitments(
     raw_params: &[u8],
-    output_confidentiality: &[bool],
+    output_commitments: &[jade_crypto::LiquidOutputCommitment],
 ) -> Result<(), &'static str> {
     let raw = cbor_map_field(raw_params, "trusted_commitments")
         .map_err(|_| "Failed to extract trusted commitments from parameters")?
         .ok_or("Failed to extract trusted commitments from parameters")?;
     let items = cbor_array_items(raw)
         .map_err(|_| "Failed to extract trusted commitments from parameters")?;
-    if items.is_empty() || items.len() != output_confidentiality.len() {
+    if items.is_empty() || items.len() != output_commitments.len() {
         return Err("Unexpected number of trusted commitments for transaction");
     }
 
-    for (item, confidential) in items.iter().zip(output_confidentiality) {
+    for (item, output_commitment) in items.iter().zip(output_commitments) {
         if cbor_is_null(item) || cbor_is_empty_map(item) {
-            if *confidential {
-                return Err("Missing trusted commitment data for blinded output");
-            }
             continue;
         }
         if !cbor_is_map(item) {
             return Err("Invalid or missing trusted commitment data");
         }
-        if *confidential {
-            validate_liquid_commitment_map(item)?;
+        if output_commitment.is_confidential() {
+            validate_liquid_commitment_map(item, output_commitment)?;
         }
     }
 
     Ok(())
 }
 
-fn validate_liquid_commitment_map(raw: &[u8]) -> Result<(), &'static str> {
-    for (field, len) in [
-        ("abf", jade_crypto::SHA256_LEN),
-        ("asset_generator", jade_crypto::LIQUID_COMMITMENT_LEN),
-        ("asset_id", jade_crypto::SHA256_LEN),
-        ("value_commitment", jade_crypto::LIQUID_COMMITMENT_LEN),
-        ("vbf", jade_crypto::SHA256_LEN),
-    ] {
-        let value = cbor_map_bytes(raw, field)
-            .map_err(|_| "Invalid or missing trusted commitment data")?
-            .ok_or("Invalid or missing trusted commitment data")?;
-        if value.len() != len {
-            return Err("Invalid or missing trusted commitment data");
-        }
-    }
-    cbor_map_u64(raw, "value")
+fn validate_liquid_commitment_map(
+    raw: &[u8],
+    output_commitment: &jade_crypto::LiquidOutputCommitment,
+) -> Result<(), &'static str> {
+    let abf = optional_cbor_map_bytes_array::<{ jade_crypto::SHA256_LEN }>(raw, "abf")?;
+    let asset_proof = cbor_map_bytes(raw, "asset_blind_proof")
+        .map_err(|_| "Invalid or missing trusted commitment data")?;
+    let asset_id = cbor_map_bytes_array::<{ jade_crypto::SHA256_LEN }>(raw, "asset_id")?;
+    let asset_generator = optional_cbor_map_bytes_array::<{ jade_crypto::LIQUID_COMMITMENT_LEN }>(
+        raw,
+        "asset_generator",
+    )?;
+    let value_commitment = optional_cbor_map_bytes_array::<{ jade_crypto::LIQUID_COMMITMENT_LEN }>(
+        raw,
+        "value_commitment",
+    )?;
+    let vbf = optional_cbor_map_bytes_array::<{ jade_crypto::SHA256_LEN }>(raw, "vbf")?;
+    let value_proof = cbor_map_bytes(raw, "value_blind_proof")
+        .map_err(|_| "Invalid or missing trusted commitment data")?;
+    let value = cbor_map_u64(raw, "value")
         .map_err(|_| "Invalid or missing trusted commitment data")?
         .ok_or("Invalid or missing trusted commitment data")?;
+
+    if asset_generator.is_some() != value_commitment.is_some()
+        || (abf.is_none() && asset_proof.is_none())
+        || (vbf.is_none() && value_proof.is_none())
+    {
+        return Err("Invalid or missing trusted commitment data");
+    }
+
+    let asset_generator = asset_generator
+        .or(output_commitment.asset_generator)
+        .ok_or("Failed to verify trusted commitment data with tx")?;
+    let value_commitment = value_commitment
+        .or(output_commitment.value_commitment)
+        .ok_or("Failed to verify trusted commitment data with tx")?;
+
+    if output_commitment.asset_generator != Some(asset_generator)
+        || output_commitment.value_commitment != Some(value_commitment)
+    {
+        return Err("Failed to verify trusted commitment data with tx");
+    }
+
+    if let Some(abf) = abf {
+        if !jade_crypto::pure_rust::liquid_asset_generator_matches(
+            &asset_id,
+            &abf,
+            &asset_generator,
+        ) {
+            return Err("Failed to verify trusted commitment data with tx");
+        }
+    }
+    if let Some(proof) = asset_proof {
+        if !jade_crypto::pure_rust::liquid_asset_proof_matches(&asset_id, &asset_generator, proof) {
+            return Err("Failed to verify explicit asset/value commitment proofs");
+        }
+    }
+    if let Some(vbf) = vbf {
+        if !jade_crypto::pure_rust::liquid_value_commitment_matches(
+            value,
+            &asset_generator,
+            &vbf,
+            &value_commitment,
+        ) {
+            return Err("Failed to verify trusted commitment data with tx");
+        }
+    }
+    if let Some(proof) = value_proof {
+        if !jade_crypto::pure_rust::liquid_value_proof_matches(
+            value,
+            &asset_generator,
+            &value_commitment,
+            proof,
+        ) {
+            return Err("Failed to verify explicit asset/value commitment proofs");
+        }
+    }
+
     if let Some(blinding_key) = cbor_map_bytes(raw, "blinding_key")
         .map_err(|_| "Invalid or missing trusted commitment data")?
     {
@@ -4570,6 +4625,29 @@ fn validate_liquid_commitment_map(raw: &[u8]) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+fn cbor_map_bytes_array<const N: usize>(raw: &[u8], field: &str) -> Result<[u8; N], &'static str> {
+    let value = cbor_map_bytes(raw, field)
+        .map_err(|_| "Invalid or missing trusted commitment data")?
+        .ok_or("Invalid or missing trusted commitment data")?;
+    value
+        .try_into()
+        .map_err(|_| "Invalid or missing trusted commitment data")
+}
+
+fn optional_cbor_map_bytes_array<const N: usize>(
+    raw: &[u8],
+    field: &str,
+) -> Result<Option<[u8; N]>, &'static str> {
+    cbor_map_bytes(raw, field)
+        .map_err(|_| "Invalid or missing trusted commitment data")?
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|_| "Invalid or missing trusted commitment data")
+        })
+        .transpose()
 }
 
 fn validate_liquid_change_outputs(
@@ -6343,8 +6421,16 @@ mod tests {
     }
 
     fn fixture_input_entries(fixture: &str) -> Vec<Option<&str>> {
-        let marker = "\"inputs\": [";
-        let start = fixture.find(marker).unwrap() + marker.len();
+        fixture_array_entries(fixture, "inputs")
+    }
+
+    fn fixture_trusted_commitment_entries(fixture: &str) -> Vec<Option<&str>> {
+        fixture_array_entries(fixture, "trusted_commitments")
+    }
+
+    fn fixture_array_entries<'a>(fixture: &'a str, field: &str) -> Vec<Option<&'a str>> {
+        let marker = format!("\"{field}\": [");
+        let start = fixture.find(&marker).unwrap() + marker.len();
         let rest = &fixture[start..];
         let bytes = rest.as_bytes();
         let mut entries = Vec::new();
@@ -6630,22 +6716,14 @@ mod tests {
         params
     }
 
-    fn sign_liquid_tx_start_params_with_dummy_trusted_ae(
+    fn sign_liquid_tx_start_params_with_fixture_trusted(
         network: &str,
         txn: &[u8],
-        num_inputs: u64,
-    ) -> Vec<u8> {
-        sign_liquid_tx_start_params_with_dummy_trusted(network, txn, num_inputs, true)
-    }
-
-    fn sign_liquid_tx_start_params_with_dummy_trusted(
-        network: &str,
-        txn: &[u8],
+        fixture: &str,
         num_inputs: u64,
         use_ae_signatures: bool,
     ) -> Vec<u8> {
-        let (_, output_confidentiality) =
-            jade_crypto::pure_rust::liquid_tx_input_count_and_output_confidentiality(txn).unwrap();
+        let entries = fixture_trusted_commitment_entries(fixture);
         let mut params = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut params);
         let field_count = 4 + u64::from(use_ae_signatures);
@@ -6674,13 +6752,14 @@ mod tests {
         encoder
             .str("trusted_commitments")
             .unwrap()
-            .array(output_confidentiality.len() as u64)
+            .array(entries.len() as u64)
             .unwrap();
-        for confidential in output_confidentiality {
-            if confidential {
-                encode_good_liquid_commitment(&mut encoder);
-            } else {
-                encoder.map(0).unwrap();
+        for entry in entries {
+            match entry {
+                Some(entry) => encode_liquid_commitment_from_fixture(&mut encoder, entry),
+                None => {
+                    encoder.null().unwrap();
+                }
             }
         }
         params
@@ -6771,6 +6850,25 @@ mod tests {
         );
     }
 
+    fn encode_tampered_liquid_commitment(encoder: &mut minicbor::Encoder<&mut Vec<u8>>) {
+        encode_liquid_commitment(
+            encoder,
+            LiquidCommitmentFixture {
+                abf: "a3510210bbab6ed67429af9beaf42f09382e12146a3db466971b58a45516bba0",
+                asset_generator:
+                    "0abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713",
+                asset_id: "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225",
+                blinding_key: Some(
+                    "023454c233497be73ed98c07d5e9069e21519e94d0663375ca57c982037546e352",
+                ),
+                value: 9_000_000,
+                value_commitment:
+                    "094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43",
+                vbf: "00c064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53",
+            },
+        );
+    }
+
     struct LiquidCommitmentFixture<'a> {
         abf: &'a str,
         asset_generator: &'a str,
@@ -6818,6 +6916,89 @@ mod tests {
                 .str("blinding_key")
                 .unwrap()
                 .bytes(&decode_hex::<33>(blinding_key))
+                .unwrap();
+        }
+    }
+
+    fn encode_liquid_commitment_from_fixture(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        fixture: &str,
+    ) {
+        let abf = fixture_object_hex_value(fixture, "abf");
+        let vbf = fixture_object_hex_value(fixture, "vbf");
+        let blinding_key = fixture_object_hex_value(fixture, "blinding_key");
+        let asset_proof = fixture_object_hex_value(fixture, "asset_blind_proof");
+        let value_proof = fixture_object_hex_value(fixture, "value_blind_proof");
+        let asset_generator = fixture_object_hex_value(fixture, "asset_generator");
+        let value_commitment = fixture_object_hex_value(fixture, "value_commitment");
+        let field_count = 2
+            + u64::from(abf.is_some())
+            + u64::from(vbf.is_some())
+            + u64::from(blinding_key.is_some())
+            + u64::from(asset_proof.is_some())
+            + u64::from(value_proof.is_some())
+            + u64::from(asset_generator.is_some())
+            + u64::from(value_commitment.is_some());
+        encoder
+            .map(field_count)
+            .unwrap()
+            .str("asset_id")
+            .unwrap()
+            .bytes(&decode_hex::<32>(fixture_object_required_hex_value(
+                fixture, "asset_id",
+            )))
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u64(fixture_object_u64_value(fixture, "value").unwrap())
+            .unwrap();
+        if let Some(asset_generator) = asset_generator {
+            encoder
+                .str("asset_generator")
+                .unwrap()
+                .bytes(&decode_hex::<33>(asset_generator))
+                .unwrap();
+        }
+        if let Some(value_commitment) = value_commitment {
+            encoder
+                .str("value_commitment")
+                .unwrap()
+                .bytes(&decode_hex::<33>(value_commitment))
+                .unwrap();
+        }
+        if let Some(abf) = abf {
+            encoder
+                .str("abf")
+                .unwrap()
+                .bytes(&decode_hex::<32>(abf))
+                .unwrap();
+        }
+        if let Some(vbf) = vbf {
+            encoder
+                .str("vbf")
+                .unwrap()
+                .bytes(&decode_hex::<32>(vbf))
+                .unwrap();
+        }
+        if let Some(blinding_key) = blinding_key {
+            encoder
+                .str("blinding_key")
+                .unwrap()
+                .bytes(&decode_hex::<33>(blinding_key))
+                .unwrap();
+        }
+        if let Some(asset_proof) = asset_proof {
+            encoder
+                .str("asset_blind_proof")
+                .unwrap()
+                .bytes(&decode_hex_vec(asset_proof))
+                .unwrap();
+        }
+        if let Some(value_proof) = value_proof {
+            encoder
+                .str("value_blind_proof")
+                .unwrap()
+                .bytes(&decode_hex_vec(value_proof))
                 .unwrap();
         }
     }
@@ -7573,13 +7754,10 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::Reject {
-                code: ErrorCode::BadParameters,
-                message: "Missing trusted commitment data for blinded output".to_string()
-            }
+            V1Outcome::BoolResult { result: true }
         );
 
-        let mut params = sign_liquid_tx_start_params_with_trusted("localtest-liquid", &good_tx, 1);
+        let params = sign_liquid_tx_start_params_with_trusted("localtest-liquid", &good_tx, 1);
         let request = Request {
             id: Cow::Borrowed("liq"),
             method: Cow::Borrowed("sign_liquid_tx"),
@@ -7588,6 +7766,42 @@ mod tests {
         assert_eq!(
             emulator.handle_v1_request(&request),
             V1Outcome::BoolResult { result: true }
+        );
+
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(4)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str("localtest-liquid")
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(&good_tx)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_tampered_liquid_commitment(&mut encoder);
+        encoder.map(0).unwrap();
+        let request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Failed to verify trusted commitment data with tx".to_string()
+            }
         );
 
         params = Vec::new();
@@ -8046,10 +8260,12 @@ mod tests {
             assert_eq!(paths.len(), host_entropies.len());
             assert_eq!(paths.len() * 2, expected.len());
 
-            let start_params = sign_liquid_tx_start_params_with_dummy_trusted_ae(
+            let start_params = sign_liquid_tx_start_params_with_fixture_trusted(
                 fixture_network(fixture),
                 &txn,
+                fixture,
                 paths.len() as u64,
+                true,
             );
             let start_request = Request {
                 id: Cow::Borrowed("liq"),
@@ -8139,10 +8355,12 @@ mod tests {
                 input_entries.len()
             );
 
-            let start_params = sign_liquid_tx_start_params_with_dummy_trusted_ae(
+            let start_params = sign_liquid_tx_start_params_with_fixture_trusted(
                 fixture_network(fixture),
                 &txn,
+                fixture,
                 input_entries.len() as u64,
+                true,
             );
             let start_request = Request {
                 id: Cow::Borrowed("liq"),
@@ -8227,9 +8445,10 @@ mod tests {
                 input_entries.len()
             );
 
-            let start_params = sign_liquid_tx_start_params_with_dummy_trusted(
+            let start_params = sign_liquid_tx_start_params_with_fixture_trusted(
                 fixture_network(fixture),
                 &txn,
+                fixture,
                 input_entries.len() as u64,
                 false,
             );
