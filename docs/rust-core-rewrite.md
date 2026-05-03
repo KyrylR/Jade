@@ -229,13 +229,17 @@ lifecycle over a platform `OtaImageWriter`: begin, stream compressed chunks with
 offset and byte-count checks, finalize only after the declared compressed size
 has arrived, and abort unfinished uploads. Unfinished sessions now also abort
 the writer when dropped, so early-return error paths cannot leave a real flash
-writer open after a partial upload. The ESP32 and ESP32-S3 firmware crates
-expose `begin_ota_update` helpers that first assert the official target
-manifest and OTA partition fit, then start the platform writer. The remaining
-board runtimes and both one-shot and stream board-app owners now expose that
-same path as a boot-gated method. The remaining board work is the concrete ESP
-OTA writer that maps this trait to the device OTA slot APIs and signed-image
-verification path.
+writer open after a partial upload. It also accepts an optional
+`OtaUploadVerifier` so production OTA code can stream the compressed-image hash
+alongside flash writes and abort before finalization when the uploaded bytes do
+not match the declared compressed hash. The ESP32 and ESP32-S3 firmware crates
+expose `begin_ota_update` and `begin_ota_update_verified` helpers that first
+assert the official target manifest and OTA partition fit, then start the
+platform writer. The remaining board runtimes and both one-shot and stream
+board-app owners now expose that same boot-gated path, including the verified
+variant. The remaining board work is the concrete ESP OTA writer/verifier that
+maps these traits to the device OTA slot APIs and signed-image verification
+path.
 
 `jade-fw-esp32s3` now has a hardware-attestation platform boundary for the real
 device-specific key path: `sign_hardware_attestation` asks the platform shim

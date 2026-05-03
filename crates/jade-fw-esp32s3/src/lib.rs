@@ -9,8 +9,9 @@ use jade_core::{
     AllocationBudget, CborFrameBuffer, CoreResult, CoreState, DeviceBootFailure,
     DeviceBootReadiness, DeviceBootReport, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
     DevicePartitionLayout, DevicePlatform, DeviceRuntime, DeviceRuntimeError, DeviceTarget,
-    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest, OtaWriteError,
-    OtaWriteSession, Platform, UserConfirmation, UserConfirmationDecision, VersionInfo,
+    DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
+    OtaUploadVerifier, OtaWriteError, OtaWriteSession, Platform, UserConfirmation,
+    UserConfirmationDecision, VersionInfo,
 };
 use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
 
@@ -309,7 +310,7 @@ pub struct HardwareAttestationReply<'a> {
 pub type Esp32s3Runtime<P> = DeviceRuntime<P>;
 pub type Esp32s3V1Runtime<P, B> = jade_emulator::JadeRuntime<P, B>;
 pub type Esp32s3NvsStorage<B> = jade_storage::NvsStorage<B>;
-pub type Esp32s3OtaSession<W> = OtaWriteSession<W>;
+pub type Esp32s3OtaSession<W, V = jade_core::NoOtaUploadVerifier> = OtaWriteSession<W, V>;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Esp32s3V1PollReport {
@@ -498,11 +499,11 @@ pub trait Esp32s3BoardLoopHooks {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Esp32s3OtaStartError<E> {
+pub enum Esp32s3OtaStartError<E, V = core::convert::Infallible> {
     BootRequired,
     Manifest(&'static str),
     Partition(jade_core::DeviceOtaError),
-    Writer(OtaWriteError<E>),
+    Writer(OtaWriteError<E, V>),
 }
 
 pub fn begin_ota_update<W>(
@@ -518,6 +519,23 @@ where
         .validate_ota_request(&request)
         .map_err(Esp32s3OtaStartError::Partition)?;
     OtaWriteSession::begin(writer, request).map_err(Esp32s3OtaStartError::Writer)
+}
+
+pub fn begin_ota_update_verified<W, V>(
+    manifest: DeviceManifest,
+    writer: W,
+    request: OtaRequest,
+    verifier: V,
+) -> Result<Esp32s3OtaSession<W, V>, Esp32s3OtaStartError<W::Error, V::Error>>
+where
+    W: OtaImageWriter,
+    V: OtaUploadVerifier,
+{
+    assert_manifest_matches_real_device(manifest).map_err(Esp32s3OtaStartError::Manifest)?;
+    manifest
+        .validate_ota_request(&request)
+        .map_err(Esp32s3OtaStartError::Partition)?;
+    OtaWriteSession::begin_verified(writer, request, verifier).map_err(Esp32s3OtaStartError::Writer)
 }
 
 pub fn run_board_stream_loop_from_storage<P, B, H>(
@@ -819,6 +837,20 @@ where
     {
         self.runtime.begin_ota_update(writer, request)
     }
+
+    pub fn begin_ota_update_verified<W, V>(
+        &mut self,
+        writer: W,
+        request: OtaRequest,
+        verifier: V,
+    ) -> Result<Esp32s3OtaSession<W, V>, Esp32s3OtaStartError<W::Error, V::Error>>
+    where
+        W: OtaImageWriter,
+        V: OtaUploadVerifier,
+    {
+        self.runtime
+            .begin_ota_update_verified(writer, request, verifier)
+    }
 }
 
 impl<'a, P, B> Esp32s3BoardApp<'a, P, Esp32s3NvsStorage<B>>
@@ -948,6 +980,20 @@ where
         W: OtaImageWriter,
     {
         self.runtime.begin_ota_update(writer, request)
+    }
+
+    pub fn begin_ota_update_verified<W, V>(
+        &mut self,
+        writer: W,
+        request: OtaRequest,
+        verifier: V,
+    ) -> Result<Esp32s3OtaSession<W, V>, Esp32s3OtaStartError<W::Error, V::Error>>
+    where
+        W: OtaImageWriter,
+        V: OtaUploadVerifier,
+    {
+        self.runtime
+            .begin_ota_update_verified(writer, request, verifier)
     }
 }
 
@@ -1276,6 +1322,22 @@ where
             return Err(Esp32s3OtaStartError::BootRequired);
         }
         begin_ota_update(self.platform().manifest(), writer, request)
+    }
+
+    pub fn begin_ota_update_verified<W, V>(
+        &mut self,
+        writer: W,
+        request: OtaRequest,
+        verifier: V,
+    ) -> Result<Esp32s3OtaSession<W, V>, Esp32s3OtaStartError<W::Error, V::Error>>
+    where
+        W: OtaImageWriter,
+        V: OtaUploadVerifier,
+    {
+        if !self.booted {
+            return Err(Esp32s3OtaStartError::BootRequired);
+        }
+        begin_ota_update_verified(self.platform().manifest(), writer, request, verifier)
     }
 }
 
@@ -1897,6 +1959,50 @@ mod tests {
                 begun: false,
                 finished: false,
                 aborted: false,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestUploadVerifier {
+        received: usize,
+    }
+
+    impl TestUploadVerifier {
+        fn new() -> Self {
+            Self { received: 0 }
+        }
+
+        fn hash_for_len(len: usize) -> [u8; jade_core::OTA_HASH_LEN] {
+            let mut hash = [0; jade_core::OTA_HASH_LEN];
+            hash[0] = len as u8;
+            hash
+        }
+    }
+
+    impl OtaUploadVerifier for TestUploadVerifier {
+        type Error = DeviceBootFailure;
+
+        fn update(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+            self.received += data.len();
+            Ok(())
+        }
+
+        fn verify(
+            &mut self,
+            request: &OtaRequest,
+        ) -> Result<(), jade_core::OtaVerifyError<Self::Error>> {
+            if request.hash_type != jade_core::OtaHashType::CompressedUpload {
+                return Ok(());
+            }
+            let actual = Self::hash_for_len(self.received);
+            if actual == request.expected_hash {
+                Ok(())
+            } else {
+                Err(jade_core::OtaVerifyError::HashMismatch {
+                    expected: request.expected_hash,
+                    actual,
+                })
             }
         }
     }
@@ -2616,6 +2722,20 @@ mod tests {
         assert!(session.writer().unwrap().begun);
         assert_eq!(session.write(&[0; 600]).unwrap(), 100);
         let writer = session.finish().unwrap();
+        assert!(writer.finished);
+
+        let compressed_hash = TestUploadVerifier::hash_for_len(600);
+        let verified_request =
+            OtaRequest::full(1_000, 600, None, Some(compressed_hash), false).unwrap();
+        let mut verified_session = begin_ota_update_verified(
+            JADE_V2_MANIFEST,
+            TestOtaWriter::new(),
+            verified_request,
+            TestUploadVerifier::new(),
+        )
+        .unwrap();
+        assert_eq!(verified_session.write(&[0; 600]).unwrap(), 100);
+        let writer = verified_session.finish().unwrap();
         assert!(writer.finished);
 
         let too_large = OtaRequest::full(

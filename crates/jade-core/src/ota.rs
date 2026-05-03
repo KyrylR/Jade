@@ -1,4 +1,5 @@
 use crate::{CoreError, CoreResult};
+use core::convert::Infallible;
 
 pub const OTA_HASH_LEN: usize = 32;
 
@@ -35,23 +36,60 @@ pub trait OtaImageWriter {
     fn abort(&mut self);
 }
 
+pub trait OtaUploadVerifier {
+    type Error;
+
+    fn update(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+    fn verify(&mut self, request: &OtaRequest) -> Result<(), OtaVerifyError<Self::Error>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoOtaUploadVerifier;
+
+impl OtaUploadVerifier for NoOtaUploadVerifier {
+    type Error = Infallible;
+
+    fn update(&mut self, _data: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn verify(&mut self, _request: &OtaRequest) -> Result<(), OtaVerifyError<Self::Error>> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OtaWriteError<E> {
+pub enum OtaVerifyError<E> {
+    Verifier(E),
+    HashMismatch {
+        expected: [u8; OTA_HASH_LEN],
+        actual: [u8; OTA_HASH_LEN],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtaWriteError<E, V = Infallible> {
     Writer(E),
+    Verifier(V),
+    HashMismatch {
+        expected: [u8; OTA_HASH_LEN],
+        actual: [u8; OTA_HASH_LEN],
+    },
     TooMuchData,
     IncompleteUpload,
     Finalized,
 }
 
 #[derive(Debug)]
-pub struct OtaWriteSession<W: OtaImageWriter> {
+pub struct OtaWriteSession<W: OtaImageWriter, V: OtaUploadVerifier = NoOtaUploadVerifier> {
     request: OtaRequest,
     received_compressed: u64,
     writer: Option<W>,
+    verifier: Option<V>,
     finalized: bool,
 }
 
-impl<W> OtaWriteSession<W>
+impl<W> OtaWriteSession<W, NoOtaUploadVerifier>
 where
     W: OtaImageWriter,
 {
@@ -61,6 +99,28 @@ where
             request,
             received_compressed: 0,
             writer: Some(writer),
+            verifier: Some(NoOtaUploadVerifier),
+            finalized: false,
+        })
+    }
+}
+
+impl<W, V> OtaWriteSession<W, V>
+where
+    W: OtaImageWriter,
+    V: OtaUploadVerifier,
+{
+    pub fn begin_verified(
+        mut writer: W,
+        request: OtaRequest,
+        verifier: V,
+    ) -> Result<Self, OtaWriteError<W::Error, V::Error>> {
+        writer.begin(&request).map_err(OtaWriteError::Writer)?;
+        Ok(Self {
+            request,
+            received_compressed: 0,
+            writer: Some(writer),
+            verifier: Some(verifier),
             finalized: false,
         })
     }
@@ -86,7 +146,15 @@ where
         self.writer.as_mut()
     }
 
-    pub fn write(&mut self, data: &[u8]) -> Result<u64, OtaWriteError<W::Error>> {
+    pub fn verifier(&self) -> Option<&V> {
+        self.verifier.as_ref()
+    }
+
+    pub fn verifier_mut(&mut self) -> Option<&mut V> {
+        self.verifier.as_mut()
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> Result<u64, OtaWriteError<W::Error, V::Error>> {
         if self.finalized {
             return Err(OtaWriteError::Finalized);
         }
@@ -103,11 +171,23 @@ where
         writer
             .write(self.received_compressed, data)
             .map_err(OtaWriteError::Writer)?;
+        if let Err(err) = self
+            .verifier
+            .as_mut()
+            .ok_or(OtaWriteError::Finalized)?
+            .update(data)
+        {
+            if let Some(mut writer) = self.writer.take() {
+                writer.abort();
+            }
+            self.finalized = true;
+            return Err(OtaWriteError::Verifier(err));
+        }
         self.received_compressed = next;
         Ok(self.progress_percent())
     }
 
-    pub fn finish(mut self) -> Result<W, OtaWriteError<W::Error>> {
+    pub fn finish(mut self) -> Result<W, OtaWriteError<W::Error, V::Error>> {
         if self.finalized {
             return Err(OtaWriteError::Finalized);
         }
@@ -116,6 +196,17 @@ where
         }
 
         let mut writer = self.writer.take().ok_or(OtaWriteError::Finalized)?;
+        let mut verifier = self.verifier.take().ok_or(OtaWriteError::Finalized)?;
+        if let Err(err) = verifier.verify(&self.request) {
+            writer.abort();
+            self.finalized = true;
+            return Err(match err {
+                OtaVerifyError::Verifier(err) => OtaWriteError::Verifier(err),
+                OtaVerifyError::HashMismatch { expected, actual } => {
+                    OtaWriteError::HashMismatch { expected, actual }
+                }
+            });
+        }
         if let Err(err) = writer.finish(&self.request, self.received_compressed) {
             writer.abort();
             self.finalized = true;
@@ -136,9 +227,10 @@ where
     }
 }
 
-impl<W> Drop for OtaWriteSession<W>
+impl<W, V> Drop for OtaWriteSession<W, V>
 where
     W: OtaImageWriter,
+    V: OtaUploadVerifier,
 {
     fn drop(&mut self) {
         if !self.finalized {
@@ -292,6 +384,11 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestVerifyError {
+        Fail,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestWriter {
         writes: alloc::vec::Vec<(u64, alloc::vec::Vec<u8>)>,
         begun: bool,
@@ -371,6 +468,55 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LengthVerifier {
+        len: usize,
+        fail_update: bool,
+    }
+
+    impl LengthVerifier {
+        fn new() -> Self {
+            Self {
+                len: 0,
+                fail_update: false,
+            }
+        }
+
+        fn expected_hash(len: usize) -> [u8; OTA_HASH_LEN] {
+            let mut hash = [0; OTA_HASH_LEN];
+            hash[0] = len as u8;
+            hash
+        }
+    }
+
+    impl OtaUploadVerifier for LengthVerifier {
+        type Error = TestVerifyError;
+
+        fn update(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+            if self.fail_update {
+                return Err(TestVerifyError::Fail);
+            }
+            self.len += data.len();
+            Ok(())
+        }
+
+        fn verify(&mut self, request: &OtaRequest) -> Result<(), OtaVerifyError<Self::Error>> {
+            if request.hash_type != OtaHashType::CompressedUpload {
+                return Ok(());
+            }
+
+            let actual = Self::expected_hash(self.len);
+            if actual == request.expected_hash {
+                Ok(())
+            } else {
+                Err(OtaVerifyError::HashMismatch {
+                    expected: request.expected_hash,
+                    actual,
+                })
+            }
+        }
+    }
+
     #[test]
     fn ota_write_session_streams_chunks_with_offsets_and_progress() {
         let request =
@@ -388,6 +534,71 @@ mod tests {
         let writer = session.finish().unwrap();
         assert!(writer.finished);
         assert!(!writer.aborted);
+    }
+
+    #[test]
+    fn ota_write_session_can_verify_compressed_upload_before_finish() {
+        let expected_hash = LengthVerifier::expected_hash(600);
+        let request = OtaRequest::full(1_000, 600, None, Some(expected_hash), false).unwrap();
+        let mut session =
+            OtaWriteSession::begin_verified(TestWriter::new(), request, LengthVerifier::new())
+                .unwrap();
+
+        assert_eq!(session.write(&[1; 150]).unwrap(), 25);
+        assert_eq!(session.write(&[2; 450]).unwrap(), 100);
+        assert_eq!(session.verifier().unwrap().len, 600);
+        let writer = session.finish().unwrap();
+        assert!(writer.finished);
+        assert!(!writer.aborted);
+    }
+
+    #[test]
+    fn ota_write_session_aborts_on_upload_hash_mismatch() {
+        let expected_hash = LengthVerifier::expected_hash(1);
+        let request = OtaRequest::full(1_000, 600, None, Some(expected_hash), false).unwrap();
+        let aborted = Rc::new(Cell::new(false));
+        let mut session = OtaWriteSession::begin_verified(
+            SharedAbortWriter {
+                aborted: aborted.clone(),
+            },
+            request,
+            LengthVerifier::new(),
+        )
+        .unwrap();
+
+        session.write(&[1; 600]).unwrap();
+        assert!(matches!(
+            session.finish(),
+            Err(OtaWriteError::HashMismatch { expected, actual })
+                if expected == expected_hash && actual == LengthVerifier::expected_hash(600)
+        ));
+        assert!(aborted.get());
+    }
+
+    #[test]
+    fn ota_write_session_aborts_on_verifier_update_failure() {
+        let request =
+            OtaRequest::full(1_000, 600, None, Some([0x22; OTA_HASH_LEN]), false).unwrap();
+        let aborted = Rc::new(Cell::new(false));
+        let verifier = LengthVerifier {
+            fail_update: true,
+            ..LengthVerifier::new()
+        };
+        let mut session = OtaWriteSession::begin_verified(
+            SharedAbortWriter {
+                aborted: aborted.clone(),
+            },
+            request,
+            verifier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.write(&[1; 600]),
+            Err(OtaWriteError::Verifier(TestVerifyError::Fail))
+        );
+        assert!(aborted.get());
+        assert_eq!(session.write(&[1; 1]), Err(OtaWriteError::Finalized));
     }
 
     #[test]

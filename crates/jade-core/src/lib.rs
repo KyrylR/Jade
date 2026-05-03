@@ -30,7 +30,8 @@ pub use firmware::{
 };
 pub use jade_protocol_v2::{NetworkRestriction, VersionDebugInfo, VersionInfo, VersionInfoState};
 pub use ota::{
-    OtaHashType, OtaImageWriter, OtaKind, OtaRequest, OtaWriteError, OtaWriteSession, OTA_HASH_LEN,
+    NoOtaUploadVerifier, OtaHashType, OtaImageWriter, OtaKind, OtaRequest, OtaUploadVerifier,
+    OtaVerifyError, OtaWriteError, OtaWriteSession, OTA_HASH_LEN,
 };
 pub use platform::Platform;
 pub use state::{InterfaceKind, InterfaceSession, OperationState, WalletLifecycle};
