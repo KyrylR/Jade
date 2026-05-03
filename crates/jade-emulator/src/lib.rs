@@ -2939,7 +2939,7 @@ impl Emulator {
             let Some(liquid_network) = liquid_network_for_name(network_name) else {
                 return bad_parameters("Failed to extract valid network from parameters");
             };
-            match jade_crypto::pure_rust::sign_liquid_pset_singlesig_from_seed(
+            match jade_crypto::pure_rust::sign_liquid_pset_from_seed(
                 &psbt,
                 seed,
                 &fingerprint,
@@ -8942,38 +8942,41 @@ mod tests {
     }
 
     #[test]
-    fn sign_psbt_defers_for_liquid_multisig_pset_wallet_signature() {
-        let mut emulator = Emulator::new();
-        emulator
-            .platform_mut()
-            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
-        let fixture = include_str!("../../../test_data/pset_tm_green_multisig_2of2csv.json");
-        let psbt = fixture_psbt_base64(fixture);
+    fn sign_psbt_signs_liquid_green_multisig_pset_wallet_inputs() {
+        for fixture in [
+            include_str!("../../../test_data/pset_tm_green_multisig_2of2csv.json"),
+            include_str!("../../../test_data/pset_tm_green_multisig_2of2_norecovery_p2wsh.json"),
+        ] {
+            let mut emulator = Emulator::new();
+            emulator
+                .platform_mut()
+                .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+            let psbt = fixture_psbt_base64(fixture);
+            let expected = base64_decode(fixture_expected_output_psbt_base64(fixture)).unwrap();
 
-        let mut params = Vec::new();
-        minicbor::Encoder::new(&mut params)
-            .map(2)
-            .unwrap()
-            .str("network")
-            .unwrap()
-            .str(fixture_network(fixture))
-            .unwrap()
-            .str("psbt")
-            .unwrap()
-            .str(psbt)
-            .unwrap();
-        let request = Request {
-            id: Cow::Borrowed("psbt"),
-            method: Cow::Borrowed("sign_psbt"),
-            params: Some(&params),
-        };
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(2)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str(fixture_network(fixture))
+                .unwrap()
+                .str("psbt")
+                .unwrap()
+                .str(psbt)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("psbt"),
+                method: Cow::Borrowed("sign_psbt"),
+                params: Some(&params),
+            };
 
-        assert_eq!(
-            emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "sign_psbt signing".to_string()
-            }
-        );
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::BytesResult { result: expected }
+            );
+        }
     }
 
     #[test]

@@ -1128,7 +1128,7 @@ pub mod pure_rust {
         )?))
     }
 
-    pub fn sign_liquid_pset_singlesig_from_seed(
+    pub fn sign_liquid_pset_from_seed(
         pset_bytes: &[u8],
         seed: &[u8],
         wallet_fingerprint: &[u8; 4],
@@ -1811,6 +1811,33 @@ pub mod pure_rust {
             && p2sh_script_pubkey(&hash160(&witness_program)) == prevout.script_pubkey.as_bytes()
         {
             return Ok((elements::Script::from(p2pkh_script), true));
+        }
+
+        if let Some(witness_script) = &input.witness_script {
+            let script = witness_script.as_bytes();
+            if script_contains_pubkey(script, pubkey) {
+                let witness_script_hash = Sha256::digest(script);
+                let witness_program = witness_v0_script_pubkey(witness_script_hash.as_ref());
+                if witness_program == prevout.script_pubkey.as_bytes()
+                    || input
+                        .redeem_script
+                        .as_ref()
+                        .is_some_and(|script| script.as_bytes() == witness_program.as_slice())
+                        && p2sh_script_pubkey(&hash160(&witness_program))
+                            == prevout.script_pubkey.as_bytes()
+                {
+                    return Ok((elements::Script::from(script.to_vec()), true));
+                }
+            }
+        }
+
+        if let Some(redeem_script) = &input.redeem_script {
+            let script = redeem_script.as_bytes();
+            if script_contains_pubkey(script, pubkey)
+                && p2sh_script_pubkey(&hash160(script)) == prevout.script_pubkey.as_bytes()
+            {
+                return Ok((elements::Script::from(script.to_vec()), false));
+            }
         }
 
         Err(PsbtSignError::Unsupported)

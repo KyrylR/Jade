@@ -93,9 +93,11 @@ signers. It also covers staged Liquid Taproot key-path inputs by collecting the
 full prevout set from `tx_input`, using the Jade-compatible Liquid
 main/testnet/regtest genesis hashes for ELIP-0101 Taproot sighashes, verifying
 Elements Taproot tweaked output keys against the supplied script pubkeys, and
-producing DEFAULT/ALL Schnorr signatures. Remaining Liquid work is now narrower:
-script-path Taproot, broader PSET policy/finalization beyond singlesig, and
-full confidential transaction proof validation. Direct `secp256k1-zkp` usage
+producing DEFAULT/ALL Schnorr signatures. Liquid PSET signing now covers
+singlesig and the current Green witness-script fixtures. Remaining Liquid work
+is now narrower: script-path Taproot, generic PSET policy/finalization beyond
+the covered Green cases, and full confidential transaction proof validation.
+Direct `secp256k1-zkp` usage
 should still stay behind narrow Liquid helper APIs unless there is a reason to
 expose the lower-level backend.
 
@@ -149,14 +151,14 @@ The hard parts are hard for concrete compatibility reasons:
   byte results with `seqnum`/`seqlen` and validate `get_extended_data`
   continuation requests against the originating id and method. Liquid PSET
   signing now uses the permanent public `elements` PSET and sighash APIs to
-  mutate singlesig P2PKH, P2WPKH, P2SH-P2WPKH, and Taproot key-path fixtures
-  byte-for-byte against Jade `test_data`, preserving raw map ordering and
-  inserting only the new partial signatures. Broader Liquid PSET cases, such as
-  Green multisig, defer explicitly to the legacy core boundary until policy and
-  finalization parity are implemented. PSBT anti-exfil, script-path Taproot,
-  full multisig finalization, Liquid PSET multisig/policy/finalization, and
-  full Liquid proof validation remain active transaction-signing implementation
-  work.
+  mutate singlesig P2PKH, P2WPKH, P2SH-P2WPKH, Taproot key-path, and Green
+  witness-script CSV/no-recovery P2WSH fixtures byte-for-byte against Jade
+  `test_data`, preserving raw map ordering and inserting only the new partial
+  signatures. Unsupported Liquid PSET policy/finalization cases still defer
+  explicitly to the legacy core boundary until their parity is implemented.
+  PSBT anti-exfil, script-path Taproot, registered/generic multisig policy
+  validation, generic Liquid PSET policy/finalization, and full Liquid proof
+  validation remain active transaction-signing implementation work.
 - Bitcoin `sign_tx` flow: Rust now has stateful v1 `sign_tx` / `tx_input` /
   `get_signature` continuation paths for non-anti-exfil Bitcoin transactions
   and a pure-Rust transaction parser/sighash signer that matches the existing
@@ -191,11 +193,12 @@ The hard parts are hard for concrete compatibility reasons:
   Taproot key-path inputs now collect all prevouts, compute genesis-aware
   Elements Taproot sighashes, reject non-matching output keys, and return
   DEFAULT/ALL Schnorr signatures matching the Jade fixture. Liquid PSET
-  singlesig signing now covers p2pkh, p2wpkh, p2sh-p2wpkh, and Taproot key-path
-  fixtures through `sign_psbt`, with unsupported Liquid PSET policy cases
-  returning the explicit core-defer outcome. PSBT anti-exfil, Liquid script-path
-  Taproot, registered/generic multisig policy validation, Liquid PSET
-  multisig/finalization, and full confidential transaction proof validation
+  signing now covers p2pkh, p2wpkh, p2sh-p2wpkh, Taproot key-path, Green CSV
+  witness-script, and Green no-recovery P2WSH fixtures through `sign_psbt`,
+  with unsupported Liquid PSET policy/finalization cases returning the explicit
+  core-defer outcome. PSBT anti-exfil, Liquid script-path Taproot,
+  registered/generic multisig policy validation, generic Liquid PSET
+  policy/finalization, and full confidential transaction proof validation
   remain active implementation work.
 
 ## First Parity Gates
