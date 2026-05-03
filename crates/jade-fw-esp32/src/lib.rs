@@ -1973,6 +1973,25 @@ mod tests {
     }
 
     #[test]
+    fn esp32_device_platform_blocks_insecure_release_boot() {
+        let readiness = DeviceBootReadiness {
+            secure_boot_ready: false,
+            ..DeviceBootReadiness::ready()
+        };
+        let mut runtime = runtime_for_v1(Esp32DevicePlatform::new(ReadinessHardware {
+            manifest: JADE_MANIFEST,
+            readiness,
+        }));
+
+        assert_eq!(
+            runtime.boot(),
+            Err(DeviceRuntimeError::Boot(
+                DeviceBootFailure::SecureBootDisabled
+            ))
+        );
+    }
+
+    #[test]
     fn esp32_device_platform_adapter_delegates_hardware_and_runtime_state() {
         let mut platform = Esp32DevicePlatform::new(TestPlatform::new(JADE_MANIFEST));
         platform.set_wallet_seed(vec![1, 2, 3, 4]);

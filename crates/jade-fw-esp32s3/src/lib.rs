@@ -2432,6 +2432,25 @@ mod tests {
     }
 
     #[test]
+    fn s3_device_platform_blocks_unencrypted_flash_boot() {
+        let readiness = DeviceBootReadiness {
+            flash_encryption_ready: false,
+            ..DeviceBootReadiness::ready()
+        };
+        let mut runtime = runtime_for_v2(Esp32s3DevicePlatform::new(ReadinessHardware {
+            manifest: JADE_V2_MANIFEST,
+            readiness,
+        }));
+
+        assert_eq!(
+            runtime.boot(),
+            Err(DeviceRuntimeError::Boot(
+                DeviceBootFailure::FlashEncryptionDisabled
+            ))
+        );
+    }
+
+    #[test]
     fn s3_device_platform_adapter_delegates_hardware_and_runtime_state() {
         let mut platform = Esp32s3DevicePlatform::new(TestPlatform::new(JADE_V2_MANIFEST));
         platform.set_wallet_seed(vec![1, 2, 3, 4]);

@@ -147,6 +147,8 @@ pub enum DeviceBootFailure {
     EntropyUnavailable,
     StorageUnavailable,
     OtaStateInvalid,
+    SecureBootDisabled,
+    FlashEncryptionDisabled,
     TransportUnavailable,
     DisplayUnavailable,
     RollbackStateInvalid,
@@ -157,6 +159,8 @@ pub struct DeviceBootReadiness {
     pub entropy_ready: bool,
     pub storage_ready: bool,
     pub ota_ready: bool,
+    pub secure_boot_ready: bool,
+    pub flash_encryption_ready: bool,
     pub transport_ready: bool,
     pub display_ready: bool,
     pub rollback_ready: bool,
@@ -168,6 +172,8 @@ impl DeviceBootReadiness {
             entropy_ready: true,
             storage_ready: true,
             ota_ready: true,
+            secure_boot_ready: true,
+            flash_encryption_ready: true,
             transport_ready: true,
             display_ready: true,
             rollback_ready: true,
@@ -181,6 +187,10 @@ impl DeviceBootReadiness {
             Some(DeviceBootFailure::StorageUnavailable)
         } else if !self.ota_ready {
             Some(DeviceBootFailure::OtaStateInvalid)
+        } else if !self.secure_boot_ready {
+            Some(DeviceBootFailure::SecureBootDisabled)
+        } else if !self.flash_encryption_ready {
+            Some(DeviceBootFailure::FlashEncryptionDisabled)
         } else if !self.transport_ready {
             Some(DeviceBootFailure::TransportUnavailable)
         } else if !self.display_ready {
@@ -205,6 +215,8 @@ pub struct DeviceBootReport {
     pub entropy_ready: bool,
     pub storage_ready: bool,
     pub ota_ready: bool,
+    pub secure_boot_ready: bool,
+    pub flash_encryption_ready: bool,
     pub transport_ready: bool,
     pub display_ready: bool,
     pub rollback_ready: bool,
@@ -221,6 +233,8 @@ impl DeviceBootReport {
             entropy_ready: readiness.entropy_ready,
             storage_ready: readiness.storage_ready,
             ota_ready: readiness.ota_ready,
+            secure_boot_ready: readiness.secure_boot_ready,
+            flash_encryption_ready: readiness.flash_encryption_ready,
             transport_ready: readiness.transport_ready,
             display_ready: readiness.display_ready,
             rollback_ready: readiness.rollback_ready,
@@ -232,6 +246,8 @@ impl DeviceBootReport {
             entropy_ready: self.entropy_ready,
             storage_ready: self.storage_ready,
             ota_ready: self.ota_ready,
+            secure_boot_ready: self.secure_boot_ready,
+            flash_encryption_ready: self.flash_encryption_ready,
             transport_ready: self.transport_ready,
             display_ready: self.display_ready,
             rollback_ready: self.rollback_ready,
@@ -516,6 +532,29 @@ mod tests {
         assert_eq!(
             report.first_failure(),
             Some(DeviceBootFailure::TransportUnavailable)
+        );
+    }
+
+    #[test]
+    fn boot_readiness_fails_closed_on_missing_release_security() {
+        let insecure_boot = DeviceBootReadiness {
+            secure_boot_ready: false,
+            flash_encryption_ready: false,
+            ..DeviceBootReadiness::ready()
+        };
+        assert_eq!(
+            insecure_boot.first_failure(),
+            Some(DeviceBootFailure::SecureBootDisabled)
+        );
+
+        let unencrypted_flash = DeviceBootReadiness {
+            flash_encryption_ready: false,
+            ..DeviceBootReadiness::ready()
+        };
+        let report = DeviceBootReport::from_readiness(DeviceTarget::JadeV2, unencrypted_flash);
+        assert_eq!(
+            report.first_failure(),
+            Some(DeviceBootFailure::FlashEncryptionDisabled)
         );
     }
 

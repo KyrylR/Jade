@@ -75,6 +75,10 @@ rollback checks. The ESP32/ESP32-S3 hardware traits can derive the public
 `DeviceBootReport` from those booleans by default, so real board code does not
 need to hand-assemble the report or duplicate the first-failure ordering used
 by the boot gate.
+Secure boot and flash-encryption readiness are also part of that boot gate,
+not only manifest metadata. A production backend must report the actual eFuse
+state, and the Rust runtime now fails closed with explicit boot errors before
+accepting traffic if secure boot or flash encryption is not enabled.
 
 Both firmware crates also expose constructors for the full generic v1 runtime:
 `jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
