@@ -176,6 +176,84 @@ where
     poll_ble(runtime, rx_buffer, FirmwareProtocol::V2Cbor)
 }
 
+pub fn poll_serial_full_v1<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    rx_buffer: &mut [u8],
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    let len = runtime
+        .runtime_platform_mut()
+        .serial_recv(rx_buffer)
+        .map_err(FirmwareFrameError::Io)?;
+    if len == 0 {
+        return Ok(false);
+    }
+
+    let reply = runtime.handle_v1_cbor(&rx_buffer[..len]);
+    if !reply.is_empty() {
+        runtime
+            .runtime_platform_mut()
+            .serial_send(&reply)
+            .map_err(FirmwareFrameError::Io)?;
+    }
+    Ok(true)
+}
+
+pub fn poll_usb_full_v1<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    rx_buffer: &mut [u8],
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    let len = runtime
+        .runtime_platform_mut()
+        .usb_recv(rx_buffer)
+        .map_err(FirmwareFrameError::Io)?;
+    if len == 0 {
+        return Ok(false);
+    }
+
+    let reply = runtime.handle_v1_cbor(&rx_buffer[..len]);
+    if !reply.is_empty() {
+        runtime
+            .runtime_platform_mut()
+            .usb_send(&reply)
+            .map_err(FirmwareFrameError::Io)?;
+    }
+    Ok(true)
+}
+
+pub fn poll_ble_full_v1<P, B>(
+    runtime: &mut Esp32s3V1Runtime<P, B>,
+    rx_buffer: &mut [u8],
+) -> Result<bool, FirmwareFrameError>
+where
+    P: Esp32s3PlatformShim + jade_emulator::RuntimePlatform,
+    B: jade_storage::StorageBackend,
+{
+    let len = runtime
+        .runtime_platform_mut()
+        .ble_recv(rx_buffer)
+        .map_err(FirmwareFrameError::Io)?;
+    if len == 0 {
+        return Ok(false);
+    }
+
+    let reply = runtime.handle_v1_cbor(&rx_buffer[..len]);
+    if !reply.is_empty() {
+        runtime
+            .runtime_platform_mut()
+            .ble_send(&reply)
+            .map_err(FirmwareFrameError::Io)?;
+    }
+    Ok(true)
+}
+
 fn poll_serial<P>(
     runtime: &mut Esp32s3Runtime<P>,
     rx_buffer: &mut [u8],
@@ -253,11 +331,14 @@ mod tests {
     use super::*;
     use alloc::{borrow::Cow, vec::Vec};
     use jade_core::{CoreResult, CoreState, Platform, VersionInfo};
+    use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
     use jade_protocol_v2::{RequestBody, RequestKind, ResponseBody};
     use minicbor::{Decoder, Encoder};
 
     #[derive(Debug)]
     struct TestPlatform {
+        runtime_state: RuntimePlatformState,
+        epoch: Option<u64>,
         manifest: DeviceManifest,
         serial_rx: Option<Vec<u8>>,
         serial_tx: Vec<Vec<u8>>,
@@ -270,6 +351,8 @@ mod tests {
     impl TestPlatform {
         fn new(manifest: DeviceManifest) -> Self {
             Self {
+                runtime_state: RuntimePlatformState::default(),
+                epoch: None,
                 manifest,
                 serial_rx: None,
                 serial_tx: Vec::new(),
@@ -310,8 +393,23 @@ mod tests {
             Ok(())
         }
 
-        fn set_epoch(&mut self, _epoch: u64) -> CoreResult<()> {
+        fn set_epoch(&mut self, epoch: u64) -> CoreResult<()> {
+            self.epoch = Some(epoch);
             Ok(())
+        }
+    }
+
+    impl RuntimePlatformStateAccess for TestPlatform {
+        fn runtime_state(&self) -> &RuntimePlatformState {
+            &self.runtime_state
+        }
+
+        fn runtime_state_mut(&mut self) -> &mut RuntimePlatformState {
+            &mut self.runtime_state
+        }
+
+        fn runtime_current_epoch(&self) -> Option<u64> {
+            self.epoch
         }
     }
 
@@ -423,6 +521,26 @@ mod tests {
         assert_eq!(runtime.platform().serial_tx.len(), 1);
 
         let mut decoder = Decoder::new(&runtime.platform().serial_tx[0]);
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "id");
+        assert_eq!(decoder.str().unwrap(), "p");
+        assert_eq!(decoder.str().unwrap(), "result");
+        assert_eq!(decoder.u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn s3_usb_polls_full_v1_runtime_frames() {
+        let mut runtime = v1_runtime_for_v2(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        runtime.runtime_platform_mut().usb_rx = Some(v1_request("p", "ping"));
+
+        let mut rx = [0u8; 128];
+        assert_eq!(poll_usb_full_v1(&mut runtime, &mut rx), Ok(true));
+        assert_eq!(runtime.runtime_platform().usb_tx.len(), 1);
+
+        let mut decoder = Decoder::new(&runtime.runtime_platform().usb_tx[0]);
         assert_eq!(decoder.map().unwrap(), Some(2));
         assert_eq!(decoder.str().unwrap(), "id");
         assert_eq!(decoder.str().unwrap(), "p");

@@ -51,9 +51,11 @@ sizes and release gates: dual OTA slots, secure boot, flash encryption,
 anti-rollback, required user I/O, and the correct ESP32 vs. ESP32-S3 capability
 split. They also expose transport pollers for the real links:
 `jade-fw-esp32s3` has serial, USB, and BLE pollers for v1/v2 CBOR frames, while
-`jade-fw-esp32` has serial and BLE pollers. Each poller reads one frame through
-the platform shim, dispatches it through `DeviceRuntime`, and writes the reply
-back through the same link.
+`jade-fw-esp32` has serial and BLE pollers. The boot/core pollers dispatch
+through `DeviceRuntime`; the full-v1 pollers dispatch through
+`JadeRuntime<P, B>::handle_v1_cbor`, so board code can now wire the full Rust
+wallet/signing/auth/management v1 engine directly to serial/BLE/USB shims and
+write replies back through the same link.
 
 Both firmware crates also expose constructors for the full generic v1 runtime:
 `jade-fw-esp32s3::v1_runtime_for_v2` and `jade-fw-esp32::v1_runtime_for_v1`.
@@ -64,8 +66,9 @@ without pulling in host `std`.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
-conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, and call
-the transport pollers from the board event loop.
+conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, create
+the full `JadeRuntime<P, B>` over the same hardware-facing state and NVS
+backend, and call the v1/v2 transport pollers from the board event loop.
 
 The large v1 wallet/signing implementation is also no longer intrinsically
 host-only: `cargo check -p jade-emulator --no-default-features --lib` passes,
@@ -73,12 +76,20 @@ and the implementation now has `JadeRuntime<P, B>` with a host `Emulator` alias
 for `JadeRuntime<HostPlatform, MemoryStorage>`. The full `handle_v1_request`
 implementation is generic over `RuntimePlatform` and `StorageBackend`, so the
 same wallet/signing/auth/management handler can be instantiated with device
-platform hooks instead of the host emulator platform. A device-style storage
-backend test instantiates the generic runtime without `MemoryStorage`, which is
-the first step toward using NVS-backed storage on hardware. The remaining
-extraction work is to implement real ESP32/ESP32-S3 `RuntimePlatform` +
-`StorageBackend` adapters for entropy, clock, display, camera, confirmation,
-OTA, attestation, and NVS.
+platform hooks instead of the host emulator platform. `jade-emulator` now also
+exports `RuntimePlatformState` and a `RuntimePlatformStateAccess` blanket
+implementation, so production ESP32/ESP32-S3 platform structs can reuse the
+same transient wallet/PIN/attestation/debug state holder and only provide
+hardware-specific epoch, entropy, UI, camera, transport, OTA, attestation, and
+NVS behavior. A device-style storage backend test instantiates the generic
+runtime without `MemoryStorage`, which is the first step toward using
+NVS-backed storage on hardware. The firmware crate tests now instantiate
+full-v1 runtimes with platform types that implement both the real-device
+transport shims and `RuntimePlatformStateAccess`, proving that the same type
+boundary can serve board I/O and the Rust v1 behavior engine. The remaining
+extraction work is to implement production ESP32/ESP32-S3 `StorageBackend`
+adapters and hardware hook methods for entropy, clock, display, camera,
+confirmation, OTA, attestation, and NVS.
 
 ## State Domains
 
