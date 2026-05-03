@@ -24,7 +24,10 @@ pub use device::{
     DeviceMemoryBudget, DeviceOtaError, DevicePartitionLayout, DevicePlatform, DeviceRuntime,
     DeviceRuntimeError, DeviceSoc, DeviceTarget,
 };
-pub use firmware::{handle_v1_cbor, FirmwareFrameError, FirmwareProtocol};
+pub use firmware::{
+    complete_cbor_frame_len, handle_v1_cbor, CborFrameBuffer, CborFrameBufferError,
+    FirmwareFrameError, FirmwareProtocol,
+};
 pub use jade_protocol_v2::{NetworkRestriction, VersionDebugInfo, VersionInfo, VersionInfoState};
 pub use ota::{
     OtaHashType, OtaImageWriter, OtaKind, OtaRequest, OtaWriteError, OtaWriteSession, OTA_HASH_LEN,

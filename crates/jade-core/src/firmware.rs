@@ -6,6 +6,7 @@ use jade_protocol_v1::{
     Request as V1Request, ResultMapEntry, V1Value,
 };
 use jade_protocol_v2::{Request as V2Request, Response as V2Response, VersionInfo};
+use minicbor::Decoder;
 
 use crate::{
     CoreError, CoreState, DeviceBootFailure, DevicePlatform, DeviceRuntime, OperationState,
@@ -24,6 +25,119 @@ pub enum FirmwareFrameError {
     Decode,
     Encode,
     Io(DeviceBootFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CborFrameBufferError {
+    Overflow { capacity: usize, attempted: usize },
+    InvalidOrIncomplete { buffered: usize },
+}
+
+#[derive(Debug)]
+pub struct CborFrameBuffer<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> CborFrameBuffer<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, len: 0 }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn pending(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.capacity() - self.len
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn reject_pending(&mut self) -> usize {
+        let rejected = self.len;
+        self.clear();
+        rejected
+    }
+
+    pub fn push(&mut self, input: &[u8]) -> Result<(), CborFrameBufferError> {
+        let next = self
+            .len
+            .checked_add(input.len())
+            .ok_or(CborFrameBufferError::Overflow {
+                capacity: self.capacity(),
+                attempted: usize::MAX,
+            })?;
+        if next > self.capacity() {
+            return Err(CborFrameBufferError::Overflow {
+                capacity: self.capacity(),
+                attempted: next,
+            });
+        }
+
+        self.bytes[self.len..next].copy_from_slice(input);
+        self.len = next;
+        Ok(())
+    }
+
+    pub fn next_frame_len(&self) -> Result<Option<usize>, CborFrameBufferError> {
+        match complete_cbor_frame_len(self.pending())? {
+            Some(len) => Ok(Some(len)),
+            None if self.len == self.capacity() && self.len > 0 => {
+                Err(CborFrameBufferError::InvalidOrIncomplete { buffered: self.len })
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn handle_next_frame<R>(
+        &mut self,
+        handler: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>, CborFrameBufferError> {
+        let Some(frame_len) = self.next_frame_len()? else {
+            return Ok(None);
+        };
+
+        let result = handler(&self.bytes[..frame_len]);
+        self.consume(frame_len);
+        Ok(Some(result))
+    }
+
+    fn consume(&mut self, frame_len: usize) {
+        if frame_len >= self.len {
+            self.clear();
+            return;
+        }
+
+        self.bytes.copy_within(frame_len..self.len, 0);
+        self.len -= frame_len;
+    }
+}
+
+pub fn complete_cbor_frame_len(input: &[u8]) -> Result<Option<usize>, CborFrameBufferError> {
+    if input.is_empty() {
+        return Ok(None);
+    }
+
+    let mut decoder = Decoder::new(input);
+    match decoder.skip() {
+        Ok(()) => Ok(Some(decoder.position())),
+        Err(_) => Ok(None),
+    }
 }
 
 impl<P> DeviceRuntime<P>
@@ -435,6 +549,63 @@ mod tests {
         decoder.skip().unwrap();
         assert_eq!(decoder.str().unwrap(), "result");
         decoder.bool().unwrap()
+    }
+
+    #[test]
+    fn cbor_frame_buffer_assembles_split_and_trailing_frames() {
+        let first = v1_request("a", "ping", None);
+        let second = v1_request("b", "get_version_info", None);
+        let mut joined = first.clone();
+        joined.extend_from_slice(&second);
+        assert_eq!(complete_cbor_frame_len(&joined).unwrap(), Some(first.len()));
+
+        let mut storage = [0u8; 512];
+        let mut buffer = CborFrameBuffer::new(&mut storage);
+        let split = first.len() / 2;
+        buffer.push(&first[..split]).unwrap();
+        assert_eq!(buffer.next_frame_len().unwrap(), None);
+        buffer.push(&first[split..]).unwrap();
+        buffer.push(&second).unwrap();
+
+        let frame = buffer
+            .handle_next_frame(|frame| Vec::from(frame))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, first);
+        assert_eq!(buffer.pending(), &second[..]);
+
+        let frame = buffer
+            .handle_next_frame(|frame| Vec::from(frame))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, second);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn cbor_frame_buffer_rejects_overflow_and_full_invalid_data() {
+        let mut storage = [0u8; 4];
+        let mut buffer = CborFrameBuffer::new(&mut storage);
+        assert_eq!(
+            buffer.push(&[0; 5]),
+            Err(CborFrameBufferError::Overflow {
+                capacity: 4,
+                attempted: 5
+            })
+        );
+
+        buffer.push(&[0x83, 0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(buffer.next_frame_len().unwrap(), Some(4));
+        assert!(buffer.handle_next_frame(|_| ()).unwrap().is_some());
+        assert!(buffer.is_empty());
+
+        buffer.push(&[0x83, 0x01, 0x02, 0x9f]).unwrap();
+        assert_eq!(
+            buffer.next_frame_len(),
+            Err(CborFrameBufferError::InvalidOrIncomplete { buffered: 4 })
+        );
+        assert_eq!(buffer.reject_pending(), 4);
+        assert!(buffer.is_empty());
     }
 
     #[test]
