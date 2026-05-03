@@ -205,7 +205,13 @@ impl Emulator {
     pub fn storage_mut(&mut self) -> &mut JadeStorage<MemoryStorage> {
         &mut self.storage
     }
+}
 
+impl<P, B> JadeRuntime<P, B>
+where
+    P: RuntimePlatform,
+    B: StorageBackend,
+{
     pub fn handle_v1_request(&mut self, request: &Request<'_>) -> V1Outcome {
         if let Err(err) = request.validate() {
             return V1Outcome::Reject {
@@ -1108,7 +1114,7 @@ impl Emulator {
             .and_then(|params| params.bool("only_if_silent").ok())
             .flatten()
             .unwrap_or(false);
-        if only_if_silent && self.platform.confirm_export_blinding_key {
+        if only_if_silent && self.platform.confirm_export_blinding_key() {
             return V1Outcome::Reject {
                 code: ErrorCode::UserCancelled,
                 message: "User declined to export master blinding key".to_string(),
@@ -1278,7 +1284,7 @@ impl Emulator {
                     &path,
                     network,
                     variant,
-                    &self.platform.master_unblinding_key,
+                    self.platform.master_unblinding_key(),
                 )
             } else {
                 jade_crypto::pure_rust::liquid_unconfidential_singlesig_address_from_seed(
@@ -1384,7 +1390,7 @@ impl Emulator {
                     recovery_xpub.as_ref(),
                     csv_blocks,
                     network,
-                    &self.platform.master_unblinding_key,
+                    self.platform.master_unblinding_key(),
                 )
             } else {
                 jade_crypto::pure_rust::liquid_unconfidential_green_address_from_seed(
@@ -2109,8 +2115,8 @@ impl Emulator {
             nwords,
             index,
             host_pubkey,
-            &self.platform.bip85_ephemeral_private_key,
-            &self.platform.bip85_iv,
+            self.platform.bip85_ephemeral_private_key(),
+            self.platform.bip85_iv(),
         )
         .ok_or_else(|| V1Outcome::Reject {
             code: ErrorCode::InternalError,
@@ -2184,8 +2190,8 @@ impl Emulator {
             key_bits,
             index,
             host_pubkey,
-            &self.platform.bip85_ephemeral_private_key,
-            &self.platform.bip85_iv,
+            self.platform.bip85_ephemeral_private_key(),
+            self.platform.bip85_iv(),
         )
         .ok_or_else(|| V1Outcome::Reject {
             code: ErrorCode::InternalError,
@@ -2262,7 +2268,7 @@ impl Emulator {
             key.key_bits,
             key.index,
             &digests,
-            &self.platform.master_unblinding_key,
+            self.platform.master_unblinding_key(),
         ) {
             Some(result) => V1Outcome::BytesArrayResult { result },
             None => V1Outcome::Reject {
@@ -3550,7 +3556,7 @@ impl Emulator {
         params: jade_protocol_v1::Params<'_>,
     ) -> Result<[u8; 64], V1Outcome> {
         if !params.contains("multisig_name").unwrap_or(false) {
-            return Ok(self.platform.master_unblinding_key);
+            return Ok(*self.platform.master_unblinding_key());
         }
 
         let multisig_name = match params.str("multisig_name") {
@@ -3720,7 +3726,7 @@ impl Emulator {
             };
         };
 
-        self.platform.attestation.replace(HostAttestationData {
+        self.platform.set_attestation(RuntimeAttestationData {
             private_key_pem: privkey_pem.to_string(),
             pubkey_pem: material.pubkey_pem,
             ext_signature: material.ext_signature,
@@ -3736,7 +3742,7 @@ impl Emulator {
                 message: "Expecting parameters map".to_string(),
             };
         };
-        let Some(attestation) = &self.platform.attestation else {
+        let Some(attestation) = self.platform.attestation() else {
             return V1Outcome::Reject {
                 code: ErrorCode::InternalError,
                 message: "Attestation data not initialised".to_string(),
@@ -3797,7 +3803,7 @@ impl Emulator {
                 self.state.wallet = WalletLifecycle::Ready;
             }
             V1Outcome::BoolResult { result: true }
-        } else if self.platform.pending_pin_wallet_seed.is_some() {
+        } else if self.platform.pending_pin_wallet_seed().is_some() {
             self.start_pinserver_set_session()
         } else if self.has_encrypted_wallet_blob() {
             self.state.wallet = WalletLifecycle::Locked;
@@ -3808,12 +3814,16 @@ impl Emulator {
     }
 
     fn start_pinserver_set_session(&mut self) -> V1Outcome {
-        let Some(wallet_seed) = self.platform.pending_pin_wallet_seed.clone() else {
+        let Some(wallet_seed) = self
+            .platform
+            .pending_pin_wallet_seed()
+            .map(|seed| seed.to_vec())
+        else {
             return V1Outcome::BoolResult { result: false };
         };
         self.start_pinserver_session(
             "set_pin",
-            Some(self.platform.pinserver_set_entropy),
+            Some(self.platform.pinserver_set_entropy()),
             PinClientMode::SetWalletSeed { seed: wallet_seed },
         )
     }
@@ -3828,7 +3838,7 @@ impl Emulator {
         client_entropy: Option<[u8; jade_crypto::SHA256_LEN]>,
         mode: PinClientMode,
     ) -> V1Outcome {
-        if self.platform.debug_pin.is_empty() {
+        if self.platform.debug_pin().is_empty() {
             return bad_parameters("Failed to extract valid PIN");
         }
 
@@ -3862,13 +3872,13 @@ impl Emulator {
         };
 
         let Some(request) = jade_crypto::pure_rust::pinserver_client_request(
-            &self.platform.debug_pin,
+            self.platform.debug_pin(),
             &unit_private_key,
-            &self.platform.pinserver_client_private_key,
+            &self.platform.pinserver_client_private_key(),
             &server_public_key,
             replay_counter,
             client_entropy.as_ref(),
-            &self.platform.pinserver_request_iv,
+            self.platform.pinserver_request_iv(),
         ) else {
             return V1Outcome::Reject {
                 code: ErrorCode::InternalError,
@@ -3877,8 +3887,8 @@ impl Emulator {
         };
 
         self.pin = Some(PinClientSession {
-            pin: self.platform.debug_pin.clone(),
-            client_private_key: self.platform.pinserver_client_private_key,
+            pin: self.platform.debug_pin().to_vec(),
+            client_private_key: self.platform.pinserver_client_private_key(),
             server_public_key,
             replay_counter: request.replay_counter,
             mode,
@@ -3908,7 +3918,7 @@ impl Emulator {
 
     fn sync_wallet_storage_state(&mut self) {
         let has_pin = self.has_encrypted_wallet_blob();
-        self.platform.jade_has_pin = has_pin;
+        self.platform.set_jade_has_pin(has_pin);
         if self.platform.wallet_seed().is_none() {
             self.state.wallet = if has_pin {
                 WalletLifecycle::Locked
@@ -3930,7 +3940,7 @@ impl Emulator {
             return stored.as_slice().try_into().ok();
         }
 
-        let key = self.platform.pinserver_unit_private_key;
+        let key = self.platform.pinserver_unit_private_key();
         self.storage
             .set_record(StorageRecord::PinPrivateKey, &key)
             .ok()?;
@@ -3946,7 +3956,7 @@ impl Emulator {
         {
             return stored.as_slice().try_into().ok();
         }
-        Some(self.platform.pinserver_public_key)
+        Some(self.platform.pinserver_public_key())
     }
 
     fn pinserver_http_params(&self, document: &str, data: String) -> OwnedV1Value {
@@ -4068,7 +4078,7 @@ impl Emulator {
     ) -> V1Outcome {
         let Some(encrypted) = jade_crypto::pure_rust::wallet_blob_encrypt(
             final_aes,
-            &self.platform.wallet_blob_iv,
+            self.platform.wallet_blob_iv(),
             &seed,
         ) else {
             return V1Outcome::Reject {
@@ -4083,9 +4093,9 @@ impl Emulator {
             };
         }
 
-        self.platform.jade_has_pin = true;
-        self.platform.set_debug_wallet_seed(seed);
-        self.platform.pending_pin_wallet_seed = None;
+        self.platform.set_jade_has_pin(true);
+        self.platform.set_wallet_seed(seed);
+        self.platform.clear_pending_pin_wallet_seed();
         self.state.wallet = WalletLifecycle::Ready;
         V1Outcome::BoolResult { result: true }
     }
@@ -4098,34 +4108,34 @@ impl Emulator {
         let mut encrypted = Vec::new();
         if self.storage.get_encrypted_blob(&mut encrypted).is_err() {
             let _ = self.storage.erase_encrypted_blob();
-            self.platform.jade_has_pin = false;
+            self.platform.set_jade_has_pin(false);
             return V1Outcome::BoolResult { result: false };
         }
 
         let Some(seed) = jade_crypto::pure_rust::wallet_blob_decrypt(final_aes, &encrypted) else {
             if self.storage.pin_counter() == 0 {
                 let _ = self.storage.erase_encrypted_blob();
-                self.platform.jade_has_pin = false;
+                self.platform.set_jade_has_pin(false);
             }
             return V1Outcome::BoolResult { result: false };
         };
         if !matches!(seed.len(), 32 | 64) {
             if self.storage.pin_counter() == 0 {
                 let _ = self.storage.erase_encrypted_blob();
-                self.platform.jade_has_pin = false;
+                self.platform.set_jade_has_pin(false);
             }
             return V1Outcome::BoolResult { result: false };
         }
 
         let _ = self.storage.restore_pin_counter();
-        self.platform.jade_has_pin = true;
-        self.platform.set_debug_wallet_seed(seed);
+        self.platform.set_jade_has_pin(true);
+        self.platform.set_wallet_seed(seed);
         self.state.wallet = WalletLifecycle::Ready;
         V1Outcome::BoolResult { result: true }
     }
 
     fn debug_handshake_result(&mut self) -> V1Outcome {
-        self.platform.debug_handshake_count = self.platform.debug_handshake_count.saturating_add(1);
+        self.platform.increment_debug_handshake_count();
         V1Outcome::BoolResult { result: true }
     }
 
@@ -4138,13 +4148,13 @@ impl Emulator {
         };
         let check_qr = params.bool("check_qr").ok().flatten().unwrap_or(false);
 
-        let Some(image) = &self.platform.debug_capture_image_data else {
+        let Some(image) = self.platform.debug_capture_image_data() else {
             return V1Outcome::Reject {
                 code: ErrorCode::UserCancelled,
                 message: "User declined to capture image".to_string(),
             };
         };
-        if check_qr && !self.platform.debug_capture_image_contains_qr {
+        if check_qr && !self.platform.debug_capture_image_contains_qr() {
             return V1Outcome::Reject {
                 code: ErrorCode::UserCancelled,
                 message: "User declined to capture image".to_string(),
@@ -4152,7 +4162,7 @@ impl Emulator {
         }
 
         V1Outcome::BytesResult {
-            result: image.clone(),
+            result: image.to_vec(),
         }
     }
 
@@ -4246,7 +4256,7 @@ impl Emulator {
             };
         };
 
-        self.platform.set_debug_wallet_seed(seed);
+        self.platform.set_wallet_seed(seed);
         self.platform
             .set_master_unblinding_key(master_unblinding_key);
         self.platform.set_confirm_export_blinding_key(true);
@@ -6828,10 +6838,42 @@ impl fmt::Debug for HostOtaSession {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HostAttestationData {
+pub struct RuntimeAttestationData {
     private_key_pem: String,
     pubkey_pem: String,
     ext_signature: Vec<u8>,
+}
+
+pub trait RuntimePlatform: Platform {
+    fn wallet_seed(&self) -> Option<&[u8]>;
+    fn set_wallet_seed(&mut self, seed: Vec<u8>);
+    fn clear_debug_wallet(&mut self);
+    fn master_unblinding_key(&self) -> &[u8; 64];
+    fn set_master_unblinding_key(&mut self, key: [u8; 64]);
+    fn master_blinding_key(&self) -> &[u8];
+    fn confirm_export_blinding_key(&self) -> bool;
+    fn set_confirm_export_blinding_key(&mut self, confirm: bool);
+    fn current_epoch(&self) -> Option<u64>;
+    fn attestation(&self) -> Option<&RuntimeAttestationData>;
+    fn set_attestation(&mut self, data: RuntimeAttestationData);
+    fn pending_pin_wallet_seed(&self) -> Option<&[u8]>;
+    fn set_pending_pin_wallet_seed(&mut self, seed: Vec<u8>);
+    fn clear_pending_pin_wallet_seed(&mut self);
+    fn pinserver_unit_private_key(&self) -> [u8; jade_crypto::EC_PRIVATE_KEY_LEN];
+    fn pinserver_client_private_key(&self) -> [u8; jade_crypto::EC_PRIVATE_KEY_LEN];
+    fn pinserver_public_key(&self) -> [u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN];
+    fn pinserver_set_entropy(&self) -> [u8; jade_crypto::SHA256_LEN];
+    fn pinserver_request_iv(&self) -> &[u8; 16];
+    fn bip85_ephemeral_private_key(&self) -> &[u8; jade_crypto::EC_PRIVATE_KEY_LEN];
+    fn bip85_iv(&self) -> &[u8; 16];
+    fn wallet_blob_iv(&self) -> &[u8; 16];
+    fn jade_has_pin(&self) -> bool;
+    fn set_jade_has_pin(&mut self, has_pin: bool);
+    fn debug_pin(&self) -> &[u8];
+    fn increment_debug_handshake_count(&mut self);
+    fn debug_capture_image_data(&self) -> Option<&[u8]>;
+    fn debug_capture_image_contains_qr(&self) -> bool;
+    fn debug_scan_qr_result_for_image(&self, image_data: &[u8]) -> Option<Vec<u8>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6841,7 +6883,7 @@ pub struct HostPlatform {
     epoch: Option<u64>,
     wallet_seed: Option<Vec<u8>>,
     master_unblinding_key: [u8; 64],
-    attestation: Option<HostAttestationData>,
+    attestation: Option<RuntimeAttestationData>,
     jade_has_pin: bool,
     debug_handshake_count: u64,
     debug_capture_image_data: Option<Vec<u8>>,
@@ -6990,9 +7032,123 @@ impl HostPlatform {
             None
         }
     }
+}
+
+impl RuntimePlatform for HostPlatform {
+    fn wallet_seed(&self) -> Option<&[u8]> {
+        self.wallet_seed.as_deref()
+    }
+
+    fn set_wallet_seed(&mut self, seed: Vec<u8>) {
+        self.wallet_seed = Some(seed);
+    }
+
+    fn clear_debug_wallet(&mut self) {
+        HostPlatform::clear_debug_wallet(self);
+    }
+
+    fn master_unblinding_key(&self) -> &[u8; 64] {
+        &self.master_unblinding_key
+    }
+
+    fn set_master_unblinding_key(&mut self, key: [u8; 64]) {
+        self.master_unblinding_key = key;
+    }
 
     fn master_blinding_key(&self) -> &[u8] {
         &self.master_unblinding_key[32..64]
+    }
+
+    fn confirm_export_blinding_key(&self) -> bool {
+        self.confirm_export_blinding_key
+    }
+
+    fn set_confirm_export_blinding_key(&mut self, confirm: bool) {
+        self.confirm_export_blinding_key = confirm;
+    }
+
+    fn current_epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    fn attestation(&self) -> Option<&RuntimeAttestationData> {
+        self.attestation.as_ref()
+    }
+
+    fn set_attestation(&mut self, data: RuntimeAttestationData) {
+        self.attestation = Some(data);
+    }
+
+    fn pending_pin_wallet_seed(&self) -> Option<&[u8]> {
+        self.pending_pin_wallet_seed.as_deref()
+    }
+
+    fn set_pending_pin_wallet_seed(&mut self, seed: Vec<u8>) {
+        self.pending_pin_wallet_seed = Some(seed);
+    }
+
+    fn clear_pending_pin_wallet_seed(&mut self) {
+        self.pending_pin_wallet_seed = None;
+    }
+
+    fn pinserver_unit_private_key(&self) -> [u8; jade_crypto::EC_PRIVATE_KEY_LEN] {
+        self.pinserver_unit_private_key
+    }
+
+    fn pinserver_client_private_key(&self) -> [u8; jade_crypto::EC_PRIVATE_KEY_LEN] {
+        self.pinserver_client_private_key
+    }
+
+    fn pinserver_public_key(&self) -> [u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN] {
+        self.pinserver_public_key
+    }
+
+    fn pinserver_set_entropy(&self) -> [u8; jade_crypto::SHA256_LEN] {
+        self.pinserver_set_entropy
+    }
+
+    fn pinserver_request_iv(&self) -> &[u8; 16] {
+        &self.pinserver_request_iv
+    }
+
+    fn bip85_ephemeral_private_key(&self) -> &[u8; jade_crypto::EC_PRIVATE_KEY_LEN] {
+        &self.bip85_ephemeral_private_key
+    }
+
+    fn bip85_iv(&self) -> &[u8; 16] {
+        &self.bip85_iv
+    }
+
+    fn wallet_blob_iv(&self) -> &[u8; 16] {
+        &self.wallet_blob_iv
+    }
+
+    fn jade_has_pin(&self) -> bool {
+        self.jade_has_pin
+    }
+
+    fn set_jade_has_pin(&mut self, has_pin: bool) {
+        self.jade_has_pin = has_pin;
+    }
+
+    fn debug_pin(&self) -> &[u8] {
+        &self.debug_pin
+    }
+
+    fn increment_debug_handshake_count(&mut self) {
+        self.debug_handshake_count = self.debug_handshake_count.saturating_add(1);
+    }
+
+    fn debug_capture_image_data(&self) -> Option<&[u8]> {
+        self.debug_capture_image_data.as_deref()
+    }
+
+    fn debug_capture_image_contains_qr(&self) -> bool {
+        self.debug_capture_image_contains_qr
+    }
+
+    fn debug_scan_qr_result_for_image(&self, image_data: &[u8]) -> Option<Vec<u8>> {
+        HostPlatform::debug_scan_qr_result_for_image(self, image_data)
     }
 }
 

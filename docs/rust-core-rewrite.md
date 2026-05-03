@@ -63,12 +63,15 @@ the transport pollers from the board event loop.
 The large v1 wallet/signing implementation is also no longer intrinsically
 host-only: `cargo check -p jade-emulator --no-default-features --lib` passes,
 and the implementation now has `JadeRuntime<P, B>` with a host `Emulator` alias
-for `JadeRuntime<HostPlatform, MemoryStorage>`. A device-style storage backend
-test instantiates the generic runtime without `MemoryStorage`, which is the
-first step toward using NVS-backed storage on hardware. The remaining extraction
-work is to move the full `handle_v1_request` implementation off the host alias
-and replace `HostPlatform` hooks with device-backed entropy, clock, display,
-camera, confirmation, OTA, and attestation traits.
+for `JadeRuntime<HostPlatform, MemoryStorage>`. The full `handle_v1_request`
+implementation is generic over `RuntimePlatform` and `StorageBackend`, so the
+same wallet/signing/auth/management handler can be instantiated with device
+platform hooks instead of the host emulator platform. A device-style storage
+backend test instantiates the generic runtime without `MemoryStorage`, which is
+the first step toward using NVS-backed storage on hardware. The remaining
+extraction work is to implement real ESP32/ESP32-S3 `RuntimePlatform` +
+`StorageBackend` adapters for entropy, clock, display, camera, confirmation,
+OTA, attestation, and NVS.
 
 ## State Domains
 
