@@ -86,7 +86,13 @@ struct PinClientSession {
     client_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
     server_public_key: [u8; jade_crypto::EC_PUBLIC_KEY_COMPRESSED_LEN],
     replay_counter: [u8; 4],
-    wallet_seed: Vec<u8>,
+    mode: PinClientMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinClientMode {
+    SetWalletSeed { seed: Vec<u8> },
+    UnlockWallet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3707,6 +3713,9 @@ impl Emulator {
             V1Outcome::BoolResult { result: true }
         } else if self.platform.pending_pin_wallet_seed.is_some() {
             self.start_pinserver_set_session()
+        } else if self.has_encrypted_wallet_blob() {
+            self.state.wallet = WalletLifecycle::Locked;
+            self.start_pinserver_get_session()
         } else {
             V1Outcome::BoolResult { result: false }
         }
@@ -3716,6 +3725,23 @@ impl Emulator {
         let Some(wallet_seed) = self.platform.pending_pin_wallet_seed.clone() else {
             return V1Outcome::BoolResult { result: false };
         };
+        self.start_pinserver_session(
+            "set_pin",
+            Some(self.platform.pinserver_set_entropy),
+            PinClientMode::SetWalletSeed { seed: wallet_seed },
+        )
+    }
+
+    fn start_pinserver_get_session(&mut self) -> V1Outcome {
+        self.start_pinserver_session("get_pin", None, PinClientMode::UnlockWallet)
+    }
+
+    fn start_pinserver_session(
+        &mut self,
+        document: &'static str,
+        client_entropy: Option<[u8; jade_crypto::SHA256_LEN]>,
+        mode: PinClientMode,
+    ) -> V1Outcome {
         if self.platform.debug_pin.is_empty() {
             return bad_parameters("Failed to extract valid PIN");
         }
@@ -3755,7 +3781,7 @@ impl Emulator {
             &self.platform.pinserver_client_private_key,
             &server_public_key,
             replay_counter,
-            Some(&self.platform.pinserver_set_entropy),
+            client_entropy.as_ref(),
             &self.platform.pinserver_request_iv,
         ) else {
             return V1Outcome::Reject {
@@ -3769,7 +3795,7 @@ impl Emulator {
             client_private_key: self.platform.pinserver_client_private_key,
             server_public_key,
             replay_counter: request.replay_counter,
-            wallet_seed,
+            mode,
         });
 
         V1Outcome::OwnedMapResult {
@@ -3778,7 +3804,7 @@ impl Emulator {
                 value: OwnedV1Value::Map(vec![
                     OwnedResultMapEntry {
                         key: "params".to_string(),
-                        value: self.pinserver_http_params("set_pin", request.data),
+                        value: self.pinserver_http_params(document, request.data),
                     },
                     OwnedResultMapEntry {
                         key: "on-reply".to_string(),
@@ -3787,6 +3813,11 @@ impl Emulator {
                 ]),
             }],
         }
+    }
+
+    fn has_encrypted_wallet_blob(&self) -> bool {
+        let mut encrypted = Vec::new();
+        self.storage.get_encrypted_blob(&mut encrypted).is_ok() && !encrypted.is_empty()
     }
 
     fn pinserver_unit_private_key(&mut self) -> Option<[u8; jade_crypto::EC_PRIVATE_KEY_LEN]> {
@@ -3911,7 +3942,7 @@ impl Emulator {
                 };
             }
         };
-        let Some(_final_aes) = jade_crypto::pure_rust::pinserver_final_aes_key(
+        let Some(final_aes) = jade_crypto::pure_rust::pinserver_final_aes_key(
             &session.pin,
             &session.client_private_key,
             &session.server_public_key,
@@ -3924,8 +3955,66 @@ impl Emulator {
             };
         };
 
-        self.platform.set_debug_wallet_seed(session.wallet_seed);
+        match session.mode {
+            PinClientMode::SetWalletSeed { seed } => self.save_pin_wallet_seed(seed, &final_aes),
+            PinClientMode::UnlockWallet => self.unlock_pin_wallet_seed(&final_aes),
+        }
+    }
+
+    fn save_pin_wallet_seed(
+        &mut self,
+        seed: Vec<u8>,
+        final_aes: &[u8; jade_crypto::SHA256_LEN],
+    ) -> V1Outcome {
+        let Some(encrypted) = jade_crypto::pure_rust::wallet_blob_encrypt(
+            final_aes,
+            &self.platform.wallet_blob_iv,
+            &seed,
+        ) else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to encrypt key data".to_string(),
+            };
+        };
+        if self.storage.set_encrypted_blob(&encrypted).is_err() {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to store encrypted key data".to_string(),
+            };
+        }
+
+        self.platform.set_debug_wallet_seed(seed);
         self.platform.pending_pin_wallet_seed = None;
+        self.state.wallet = WalletLifecycle::Ready;
+        V1Outcome::BoolResult { result: true }
+    }
+
+    fn unlock_pin_wallet_seed(&mut self, final_aes: &[u8; jade_crypto::SHA256_LEN]) -> V1Outcome {
+        if self.storage.decrement_pin_counter().is_err() {
+            return V1Outcome::BoolResult { result: false };
+        }
+
+        let mut encrypted = Vec::new();
+        if self.storage.get_encrypted_blob(&mut encrypted).is_err() {
+            let _ = self.storage.erase_encrypted_blob();
+            return V1Outcome::BoolResult { result: false };
+        }
+
+        let Some(seed) = jade_crypto::pure_rust::wallet_blob_decrypt(final_aes, &encrypted) else {
+            if self.storage.pin_counter() == 0 {
+                let _ = self.storage.erase_encrypted_blob();
+            }
+            return V1Outcome::BoolResult { result: false };
+        };
+        if !matches!(seed.len(), 32 | 64) {
+            if self.storage.pin_counter() == 0 {
+                let _ = self.storage.erase_encrypted_blob();
+            }
+            return V1Outcome::BoolResult { result: false };
+        }
+
+        let _ = self.storage.restore_pin_counter();
+        self.platform.set_debug_wallet_seed(seed);
         self.state.wallet = WalletLifecycle::Ready;
         V1Outcome::BoolResult { result: true }
     }
@@ -6540,6 +6629,7 @@ pub struct HostPlatform {
     pinserver_request_iv: [u8; 16],
     bip85_ephemeral_private_key: [u8; jade_crypto::EC_PRIVATE_KEY_LEN],
     bip85_iv: [u8; 16],
+    wallet_blob_iv: [u8; 16],
     confirm_export_blinding_key: bool,
 }
 
@@ -6580,6 +6670,10 @@ impl Default for HostPlatform {
             bip85_iv: [
                 0xbd, 0x5d, 0x47, 0x24, 0x24, 0x38, 0x80, 0x73, 0x8e, 0x7e, 0x8b, 0x0c, 0x02, 0x65,
                 0x87, 0x00,
+            ],
+            wallet_blob_iv: [
+                0x9f, 0x49, 0x4a, 0x8d, 0x31, 0x5a, 0x2c, 0x08, 0x7b, 0x28, 0x5f, 0xe7, 0x14, 0x2d,
+                0x5b, 0xe1,
             ],
             confirm_export_blinding_key: false,
         }
@@ -15286,6 +15380,74 @@ mod tests {
         assert_eq!(emulator.platform().wallet_seed(), Some(&expected_seed[..]));
         assert_eq!(emulator.state.wallet, WalletLifecycle::Ready);
         assert!(emulator.pin.is_none());
+        assert_eq!(emulator.storage.pin_counter(), 3);
+        let mut encrypted_blob = Vec::new();
+        emulator
+            .storage
+            .get_encrypted_blob(&mut encrypted_blob)
+            .expect("encrypted wallet seed blob");
+        assert!(!encrypted_blob.is_empty());
+
+        emulator.platform_mut().clear_debug_wallet();
+        emulator.state.wallet = WalletLifecycle::Locked;
+        match emulator.handle_v1_request(&auth_request) {
+            V1Outcome::OwnedMapResult { entries } => {
+                let http_request = entries
+                    .iter()
+                    .find(|entry| entry.key == "http_request")
+                    .expect("http request result");
+                let OwnedV1Value::Map(http_entries) = &http_request.value else {
+                    panic!("expected http request map");
+                };
+                let params = http_entries
+                    .iter()
+                    .find(|entry| entry.key == "params")
+                    .expect("http params");
+                let OwnedV1Value::Map(params) = &params.value else {
+                    panic!("expected http params map");
+                };
+                let urls = params
+                    .iter()
+                    .find(|entry| entry.key == "urls")
+                    .expect("urls");
+                let OwnedV1Value::Array(urls) = &urls.value else {
+                    panic!("expected urls array");
+                };
+                assert!(urls.iter().any(|url| {
+                    url == &OwnedV1Value::Text(format!("{DEFAULT_PINSERVER_URL}/get_pin"))
+                }));
+            }
+            other => panic!("expected get_pin http request, got {other:?}"),
+        }
+
+        let session = emulator.pin.as_ref().expect("pin session").clone();
+        let encrypted_reply = jade_crypto::pure_rust::pinserver_host_server_reply(
+            &session.client_private_key,
+            &session.server_public_key,
+            session.replay_counter,
+            &[0x33; 32],
+            &[0x55; 16],
+        )
+        .unwrap();
+        let mut params = Vec::new();
+        minicbor::Encoder::new(&mut params)
+            .map(1)
+            .unwrap()
+            .str("data")
+            .unwrap()
+            .str(&base64_encode_test(&encrypted_reply))
+            .unwrap();
+        let pin_request = Request {
+            id: Cow::Borrowed("pin"),
+            method: Cow::Borrowed("pin"),
+            params: Some(&params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&pin_request),
+            V1Outcome::BoolResult { result: true }
+        );
+        assert_eq!(emulator.platform().wallet_seed(), Some(&expected_seed[..]));
+        assert_eq!(emulator.storage.pin_counter(), 3);
     }
 
     #[test]

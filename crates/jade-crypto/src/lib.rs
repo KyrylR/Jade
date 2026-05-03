@@ -4434,6 +4434,21 @@ pub mod pure_rust {
         final_mac.finalize().into_bytes().as_slice().try_into().ok()
     }
 
+    pub fn wallet_blob_encrypt(
+        aes_key: &[u8; PIN_SERVER_AES_KEY_LEN],
+        iv: &[u8; 16],
+        cleartext: &[u8],
+    ) -> Option<Vec<u8>> {
+        aes256_cbc_hmac_encrypt(aes_key, iv, cleartext)
+    }
+
+    pub fn wallet_blob_decrypt(
+        aes_key: &[u8; PIN_SERVER_AES_KEY_LEN],
+        encrypted: &[u8],
+    ) -> Option<Vec<u8>> {
+        aes256_cbc_hmac_decrypt(aes_key, encrypted)
+    }
+
     pub fn pinserver_host_server_reply(
         client_private_key: &[u8; EC_PRIVATE_KEY_LEN],
         server_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
@@ -5126,6 +5141,54 @@ pub mod pure_rust {
         let enc_key = &keys[..32];
         let hmac_key = &keys[32..64];
 
+        aes256_cbc_hmac_encrypt_with_keys(enc_key, hmac_key, iv, payload)
+    }
+
+    fn wally_aes_cbc_with_ecdh_key_decrypt(
+        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+        encrypted: &[u8],
+        peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        label: &[u8],
+    ) -> Option<Vec<u8>> {
+        if label.is_empty()
+            || encrypted.len() < 16 + 16 + SHA256_LEN
+            || (encrypted.len() - 16 - SHA256_LEN) % 16 != 0
+        {
+            return None;
+        }
+
+        let secret = secp256k1_ecdh_secret(private_key, peer_public_key)?;
+        let mut mac = HmacSha512::new_from_slice(&secret).ok()?;
+        mac.update(label);
+        let keys = mac.finalize().into_bytes();
+        let enc_key = &keys[..32];
+        let hmac_key = &keys[32..64];
+
+        aes256_cbc_hmac_decrypt_with_keys(enc_key, hmac_key, encrypted)
+    }
+
+    fn aes256_cbc_hmac_encrypt(
+        aes_key: &[u8; 32],
+        iv: &[u8; 16],
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        aes256_cbc_hmac_encrypt_with_keys(aes_key, aes_key, iv, payload)
+    }
+
+    fn aes256_cbc_hmac_decrypt(aes_key: &[u8; 32], encrypted: &[u8]) -> Option<Vec<u8>> {
+        aes256_cbc_hmac_decrypt_with_keys(aes_key, aes_key, encrypted)
+    }
+
+    fn aes256_cbc_hmac_encrypt_with_keys(
+        enc_key: &[u8],
+        hmac_key: &[u8],
+        iv: &[u8; 16],
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        if payload.is_empty() {
+            return None;
+        }
+
         let cipher = Aes256::new_from_slice(enc_key).ok()?;
         let mut previous = *iv;
         let mut output = Vec::with_capacity(16 + ((payload.len() / 16) + 1) * 16 + 32);
@@ -5163,25 +5226,14 @@ pub mod pure_rust {
         Some(output)
     }
 
-    fn wally_aes_cbc_with_ecdh_key_decrypt(
-        private_key: &[u8; EC_PRIVATE_KEY_LEN],
+    fn aes256_cbc_hmac_decrypt_with_keys(
+        enc_key: &[u8],
+        hmac_key: &[u8],
         encrypted: &[u8],
-        peer_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
-        label: &[u8],
     ) -> Option<Vec<u8>> {
-        if label.is_empty()
-            || encrypted.len() < 16 + 16 + SHA256_LEN
-            || (encrypted.len() - 16 - SHA256_LEN) % 16 != 0
-        {
+        if encrypted.len() < 16 + 16 + SHA256_LEN || (encrypted.len() - 16 - SHA256_LEN) % 16 != 0 {
             return None;
         }
-
-        let secret = secp256k1_ecdh_secret(private_key, peer_public_key)?;
-        let mut mac = HmacSha512::new_from_slice(&secret).ok()?;
-        mac.update(label);
-        let keys = mac.finalize().into_bytes();
-        let enc_key = &keys[..32];
-        let hmac_key = &keys[32..64];
 
         let (authenticated, hmac) = encrypted.split_at(encrypted.len() - SHA256_LEN);
         let mut expected_hmac = HmacSha256::new_from_slice(hmac_key).ok()?;
@@ -5447,6 +5499,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn wallet_blob_encrypts_and_rejects_bad_hmac() {
+        let aes_key = [0x77; 32];
+        let iv = [0x88; 16];
+        let seed = [0x99; SHA512_LEN];
+
+        let encrypted = pure_rust::wallet_blob_encrypt(&aes_key, &iv, &seed).unwrap();
+        assert_eq!(&encrypted[..16], &iv);
+        assert_eq!(
+            pure_rust::wallet_blob_decrypt(&aes_key, &encrypted).unwrap(),
+            seed
+        );
+
+        let mut tampered = encrypted;
+        *tampered.last_mut().unwrap() ^= 0x01;
+        assert_eq!(pure_rust::wallet_blob_decrypt(&aes_key, &tampered), None);
     }
 
     #[test]
