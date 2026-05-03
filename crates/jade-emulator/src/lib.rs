@@ -2217,6 +2217,13 @@ impl Emulator {
         if actual_inputs != expected_inputs {
             return bad_parameters("Wrong number of inputs");
         }
+        if let Some(seed) = self.platform.wallet_seed() {
+            if let Err(message) =
+                validate_bitcoin_change_outputs(params.raw(), &txn, seed, network_name)
+            {
+                return bad_parameters(message);
+            }
+        }
         let flow = if optional_bool(params, "use_ae_signatures") {
             BitcoinSignTxFlow::Staged
         } else {
@@ -4650,6 +4657,145 @@ fn optional_cbor_map_bytes_array<const N: usize>(
         .transpose()
 }
 
+fn validate_bitcoin_change_outputs(
+    raw_params: &[u8],
+    txn: &[u8],
+    seed: &[u8],
+    network_name: &str,
+) -> Result<(), &'static str> {
+    let Some(raw) = cbor_map_field(raw_params, "change")
+        .map_err(|_| "Unexpected number of output entries for transaction")?
+    else {
+        return Ok(());
+    };
+    if cbor_is_null(raw) {
+        return Ok(());
+    }
+
+    let items =
+        cbor_array_items(raw).map_err(|_| "Unexpected number of output entries for transaction")?;
+    let output_scripts = jade_crypto::pure_rust::bitcoin_tx_output_scripts(txn)
+        .map_err(|_| "Failed to extract txn from parameters")?;
+    if items.len() != output_scripts.len() {
+        return Err("Unexpected number of output entries for transaction");
+    }
+
+    let service_xpub = green_service_xpub_for_network(network_name)
+        .ok_or("Receive script cannot be constructed")?;
+    let xpub_prefix =
+        xpub_prefix_for_network(network_name).ok_or("Receive script cannot be constructed")?;
+
+    for (item, expected_script) in items.iter().zip(output_scripts.iter()) {
+        if cbor_is_null(item) {
+            continue;
+        }
+        if !cbor_is_map(item) {
+            return Err("Failed to extract valid receive path from parameters");
+        }
+        if cbor_map_field(item, "descriptor_name")
+            .map_err(|_| "Failed to extract valid receive path from parameters")?
+            .is_some()
+        {
+            return Err("Descriptor change validation is not implemented");
+        }
+        if cbor_map_field(item, "multisig_name")
+            .map_err(|_| "Failed to extract valid receive path from parameters")?
+            .is_some()
+        {
+            return Err("Registered multisig change validation is not implemented");
+        }
+
+        let path = cbor_map_field(item, "path")
+            .map_err(|_| "Failed to extract valid receive path from parameters")?
+            .ok_or("Failed to extract valid receive path from parameters")?;
+        let path = cbor_u32_array(path, MAX_PATH_LEN)
+            .map_err(|_| "Failed to extract valid receive path from parameters")?;
+        if path.is_empty() {
+            return Err("Failed to extract valid receive path from parameters");
+        }
+
+        let actual_script = if let Some(variant) = cbor_optional_singlesig_variant(item)? {
+            jade_crypto::pure_rust::bitcoin_singlesig_script_pubkey_from_seed(seed, &path, variant)
+        } else {
+            let csv_blocks = cbor_optional_u32(item, "csv_blocks")?.unwrap_or(0);
+            if csv_blocks != 0 && !network_allows_csv_blocks(network_name, csv_blocks) {
+                return Err("Receive script cannot be constructed");
+            }
+            let recovery_xpub = cbor_optional_recovery_xpub(item, xpub_prefix)?;
+            jade_crypto::pure_rust::bitcoin_green_script_pubkey_from_seed(
+                seed,
+                &path,
+                &service_xpub,
+                recovery_xpub.as_ref(),
+                csv_blocks,
+            )
+        }
+        .ok_or("Receive script cannot be constructed")?;
+
+        if actual_script != *expected_script {
+            return Err("Receive script cannot be validated");
+        }
+    }
+
+    Ok(())
+}
+
+fn cbor_optional_singlesig_variant(
+    raw: &[u8],
+) -> Result<Option<jade_crypto::SinglesigScriptVariant>, &'static str> {
+    let Some(variant) =
+        cbor_map_str(raw, "variant").map_err(|_| "Invalid script variant parameter")?
+    else {
+        return Ok(None);
+    };
+    match variant {
+        "pkh(k)" => Ok(Some(jade_crypto::SinglesigScriptVariant::Pkh)),
+        "wpkh(k)" => Ok(Some(jade_crypto::SinglesigScriptVariant::Wpkh)),
+        "sh(wpkh(k))" => Ok(Some(jade_crypto::SinglesigScriptVariant::ShWpkh)),
+        "tr(k)" => Ok(Some(jade_crypto::SinglesigScriptVariant::Tr)),
+        _ => Err("Invalid script variant parameter"),
+    }
+}
+
+fn cbor_optional_recovery_xpub(
+    raw: &[u8],
+    xpub_prefix: jade_crypto::XpubPrefix,
+) -> Result<Option<[u8; jade_storage::BIP32_SERIALIZED_LEN]>, &'static str> {
+    let Some(value) =
+        cbor_map_field(raw, "recovery_xpub").map_err(|_| "Receive script cannot be constructed")?
+    else {
+        return Ok(None);
+    };
+    if cbor_is_null(value) {
+        return Ok(None);
+    }
+    let xpub = cbor_str(value).map_err(|_| "Receive script cannot be constructed")?;
+    decode_xpub_for_prefix(xpub, xpub_prefix)
+        .map(Some)
+        .ok_or("Receive script cannot be constructed")
+}
+
+fn cbor_optional_u32(raw: &[u8], field: &str) -> Result<Option<u32>, &'static str> {
+    let Some(value) =
+        cbor_map_field(raw, field).map_err(|_| "Receive script cannot be constructed")?
+    else {
+        return Ok(None);
+    };
+    if cbor_is_null(value) {
+        return Ok(None);
+    }
+    let value = match cbor_u64(value) {
+        Ok(value) => value,
+        Err(()) => cbor_str(value)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or("Receive script cannot be constructed")?,
+    };
+    u32::try_from(value)
+        .map(Some)
+        .map_err(|_| "Receive script cannot be constructed")
+}
+
 fn validate_liquid_change_outputs(
     raw_params: &[u8],
     output_count: usize,
@@ -6510,11 +6656,37 @@ mod tests {
         }
     }
 
+    fn fixture_object_optional_bool_value(object: &str, field: &str) -> Option<bool> {
+        let marker = format!("\"{field}\": ");
+        let start = object.find(&marker)? + marker.len();
+        let rest = &object[start..];
+        if rest.starts_with("true") {
+            Some(true)
+        } else if rest.starts_with("false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn fixture_object_string_value<'a>(object: &'a str, field: &str) -> Option<&'a str> {
+        let marker = format!("\"{field}\": ");
+        let start = object.find(&marker)? + marker.len();
+        let rest = object[start..].trim_start();
+        if !rest.starts_with('"') {
+            return None;
+        }
+        let value_rest = &rest[1..];
+        let value_end = value_rest.find('"').unwrap();
+        Some(&value_rest[..value_end])
+    }
+
     fn fixture_object_u64_value(object: &str, field: &str) -> Option<u64> {
         let marker = format!("\"{field}\": ");
         let start = object.find(&marker)?;
         let value_start = start + marker.len();
-        let rest = &object[value_start..];
+        let rest = object[value_start..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
         let end = rest
             .find(|byte: char| !byte.is_ascii_digit())
             .unwrap_or(rest.len());
@@ -6617,6 +6789,85 @@ mod tests {
             .unwrap()
             .bool(use_ae_signatures)
             .unwrap();
+        params
+    }
+
+    fn sign_tx_start_params_from_fixture(
+        fixture: &str,
+        txn: &[u8],
+        num_inputs: u64,
+        use_ae_signatures: bool,
+    ) -> Vec<u8> {
+        let change = fixture_array_entries(fixture, "change");
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(fixture_network(fixture))
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(num_inputs)
+            .unwrap()
+            .str("use_ae_signatures")
+            .unwrap()
+            .bool(use_ae_signatures)
+            .unwrap()
+            .str("change")
+            .unwrap()
+            .array(change.len() as u64)
+            .unwrap();
+
+        for item in change {
+            let Some(object) = item else {
+                encoder.null().unwrap();
+                continue;
+            };
+            let path = fixture_object_path(object);
+            let recovery_xpub = fixture_object_string_value(object, "recovery_xpub");
+            let csv_blocks = fixture_object_u64_value(object, "csv_blocks");
+            let is_change = fixture_object_optional_bool_value(object, "is_change");
+            let variant = fixture_object_string_value(object, "variant");
+            let entry_len = 1
+                + usize::from(recovery_xpub.is_some())
+                + usize::from(csv_blocks.is_some())
+                + usize::from(is_change.is_some())
+                + usize::from(variant.is_some());
+            encoder
+                .map(entry_len as u64)
+                .unwrap()
+                .str("path")
+                .unwrap()
+                .array(path.len() as u64)
+                .unwrap();
+            for value in path {
+                encoder.u32(value).unwrap();
+            }
+            if let Some(recovery_xpub) = recovery_xpub {
+                encoder
+                    .str("recovery_xpub")
+                    .unwrap()
+                    .str(recovery_xpub)
+                    .unwrap();
+            }
+            if let Some(csv_blocks) = csv_blocks {
+                encoder.str("csv_blocks").unwrap().u64(csv_blocks).unwrap();
+            }
+            if let Some(is_change) = is_change {
+                encoder.str("is_change").unwrap().bool(is_change).unwrap();
+            }
+            if let Some(variant) = variant {
+                encoder.str("variant").unwrap().str(variant).unwrap();
+            }
+        }
+
         params
     }
 
@@ -8743,7 +8994,8 @@ mod tests {
             assert_eq!(paths.len(), host_entropies.len());
             assert_eq!(paths.len() * 2, expected.len());
 
-            let start_params = sign_tx_start_params(&txn, paths.len() as u64, true);
+            let start_params =
+                sign_tx_start_params_from_fixture(fixture, &txn, paths.len() as u64, true);
             let start_request = Request {
                 id: Cow::Borrowed("tx"),
                 method: Cow::Borrowed("sign_tx"),
@@ -9099,7 +9351,7 @@ mod tests {
             let script = decode_hex_vec(fixture_hex_values(fixture, "script")[0]);
             let expected = fixture_expected_output_signatures(fixture);
 
-            let start_params = sign_tx_start_params(&txn, 1, false);
+            let start_params = sign_tx_start_params_from_fixture(fixture, &txn, 1, false);
             let start_request = Request {
                 id: Cow::Borrowed("tx"),
                 method: Cow::Borrowed("sign_tx"),
@@ -9123,6 +9375,29 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn sign_tx_start_rejects_mismatched_green_change_script() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let fixture = include_str!("../../../test_data/badtxn_2of2csv_change_nonopt_script.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let start_params = sign_tx_start_params_from_fixture(fixture, &txn, 1, false);
+        let start_request = Request {
+            id: Cow::Borrowed("tx"),
+            method: Cow::Borrowed("sign_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::Reject {
+                code: ErrorCode::BadParameters,
+                message: "Receive script cannot be validated".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -9194,7 +9469,8 @@ mod tests {
             assert_eq!(paths.len(), input_txs.len());
             assert_eq!(paths.len(), expected.len());
 
-            let start_params = sign_tx_start_params(&txn, paths.len() as u64, true);
+            let start_params =
+                sign_tx_start_params_from_fixture(fixture, &txn, paths.len() as u64, true);
             let start_request = Request {
                 id: Cow::Borrowed("tx"),
                 method: Cow::Borrowed("sign_tx"),

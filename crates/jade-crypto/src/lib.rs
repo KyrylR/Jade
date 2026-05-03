@@ -1316,6 +1316,17 @@ pub mod pure_rust {
             .ok_or(TxSignError::Invalid)
     }
 
+    pub fn bitcoin_tx_output_scripts(txn: &[u8]) -> Result<Vec<Vec<u8>>, TxSignError> {
+        bitcoin_transaction_view(txn)
+            .map(|tx| {
+                tx.outputs
+                    .into_iter()
+                    .map(|output| output.script.to_vec())
+                    .collect()
+            })
+            .ok_or(TxSignError::Invalid)
+    }
+
     pub fn bitcoin_prevout_amount(
         txn: &[u8],
         tx_input_index: usize,
@@ -3148,6 +3159,20 @@ pub mod pure_rust {
         bitcoin_p2sh_p2wsh_address_from_script(&script, network)
     }
 
+    pub fn bitcoin_green_script_pubkey_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        service_xpub: &[u8; 78],
+        recovery_xpub: Option<&[u8; 78]>,
+        csv_blocks: u32,
+    ) -> Option<Vec<u8>> {
+        let script =
+            green_script_from_seed(seed, path, service_xpub, recovery_xpub, csv_blocks, false)?;
+        let witness_script_hash = Sha256::digest(&script);
+        let witness_program = witness_v0_script_pubkey(witness_script_hash.as_slice());
+        Some(p2sh_script_pubkey(&hash160(&witness_program)))
+    }
+
     pub fn liquid_unconfidential_green_address_from_seed(
         seed: &[u8],
         path: &[u32],
@@ -3838,6 +3863,29 @@ pub mod pure_rust {
             SinglesigScriptVariant::Tr => {
                 let output_key = taproot_keyspend_output_key(&public_key)?;
                 bech32::segwit::encode_v1(segwit_hrp(network), &output_key).ok()
+            }
+        }
+    }
+
+    pub fn bitcoin_singlesig_script_pubkey_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        variant: SinglesigScriptVariant,
+    ) -> Option<Vec<u8>> {
+        let public_key = public_key_from_seed_path(seed, path)?;
+        let pubkey_hash = hash160(&public_key);
+        match variant {
+            SinglesigScriptVariant::Pkh => Some(p2pkh_script_pubkey(&pubkey_hash)),
+            SinglesigScriptVariant::Wpkh => Some(witness_v0_script_pubkey(&pubkey_hash)),
+            SinglesigScriptVariant::ShWpkh => {
+                let mut redeem_script = [0u8; 22];
+                redeem_script[1] = 0x14;
+                redeem_script[2..].copy_from_slice(&pubkey_hash);
+                Some(p2sh_script_pubkey(&hash160(&redeem_script)))
+            }
+            SinglesigScriptVariant::Tr => {
+                let output_key = taproot_keyspend_output_key(&public_key)?;
+                Some(p2tr_script_pubkey(&output_key))
             }
         }
     }

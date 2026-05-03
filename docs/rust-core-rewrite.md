@@ -185,7 +185,13 @@ The hard parts are hard for concrete compatibility reasons:
   P2SH-P2WPKH legacy-output fixtures. It now preserves the v1 empty-signature
   behavior for unowned inputs and signs Green 2-of-2, Green 2-of-3, CSV, and
   multi-input Green multisig witness-script fixtures, including low-R ECDSA
-  grinding compatible with libwally. Taproot key-path `sign_tx` signs
+  grinding compatible with libwally. Bitcoin `sign_tx` start now validates
+  declared `change` entries against the actual transaction output scripts for
+  Green 2-of-2, Green 2-of-3 recovery-xpub, Green CSV, and singlesig
+  P2PKH/P2WPKH/P2SH-P2WPKH/Taproot key-path change outputs, and rejects the
+  existing non-matching Green CSV change fixture with `Receive script cannot be
+  validated` before any input signature is requested. Taproot key-path
+  `sign_tx` signs
   SIGHASH_DEFAULT and SIGHASH_ALL staged fixtures, and rejects non-empty
   Taproot anti-exfil host commitments with the v1-compatible error. Non-Taproot
   Bitcoin anti-exfil `sign_tx` now returns signer commitments from `tx_input`
