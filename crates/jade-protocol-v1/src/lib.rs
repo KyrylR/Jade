@@ -613,6 +613,25 @@ pub fn encode_bytes_result(id: &str, result: &[u8]) -> Vec<u8> {
     output
 }
 
+pub fn encode_bytes_array_result(id: &str, results: &[Vec<u8>]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut encoder = Encoder::new(&mut output);
+    encoder
+        .map(2)
+        .and_then(|e| e.str("id"))
+        .and_then(|e| e.str(id))
+        .and_then(|e| e.str("result"))
+        .and_then(|e| e.array(results.len() as u64))
+        .expect("Vec-backed CBOR encoding is infallible");
+
+    for result in results {
+        encoder
+            .bytes(result)
+            .expect("Vec-backed CBOR encoding is infallible");
+    }
+    output
+}
+
 pub fn encode_bytes_sequence_result(id: &str, seqnum: u64, seqlen: u64, result: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     let mut encoder = Encoder::new(&mut output);
@@ -1080,5 +1099,19 @@ mod tests {
         assert_eq!(decoder.map().unwrap(), Some(1));
         assert_eq!(decoder.str().unwrap(), "path");
         assert_eq!(decoder.array().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn encodes_bytes_array_results() {
+        let encoded = encode_bytes_array_result("rsa", &[vec![1, 2], vec![3, 4, 5]]);
+
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(decoder.map().unwrap(), Some(2));
+        assert_eq!(decoder.str().unwrap(), "id");
+        assert_eq!(decoder.str().unwrap(), "rsa");
+        assert_eq!(decoder.str().unwrap(), "result");
+        assert_eq!(decoder.array().unwrap(), Some(2));
+        assert_eq!(decoder.bytes().unwrap(), &[1, 2]);
+        assert_eq!(decoder.bytes().unwrap(), &[3, 4, 5]);
     }
 }

@@ -12,10 +12,11 @@ use jade_core::{
     Platform, VersionDebugInfo, VersionInfo, WalletLifecycle,
 };
 use jade_protocol_v1::{
-    decode_request, encode_bool_result, encode_bytes_result, encode_bytes_sequence_result,
-    encode_error_response, encode_map_result, encode_owned_map_result, encode_text_result,
-    encode_uint_result, method_spec, ErrorCode, ErrorResponse, MethodClass, OwnedResultMapEntry,
-    OwnedV1Value, Request, ResultMapEntry, V1Value,
+    decode_request, encode_bool_result, encode_bytes_array_result, encode_bytes_result,
+    encode_bytes_sequence_result, encode_error_response, encode_map_result,
+    encode_owned_map_result, encode_text_result, encode_uint_result, method_spec, ErrorCode,
+    ErrorResponse, MethodClass, OwnedResultMapEntry, OwnedV1Value, Request, ResultMapEntry,
+    V1Value,
 };
 use jade_storage::{
     key_name_valid, parse_descriptor_details, parse_descriptor_summary, parse_multisig_details,
@@ -357,6 +358,9 @@ impl Emulator {
                 V1Outcome::TextResult { result } => encode_text_result(&request.id, &result),
                 V1Outcome::BytesResult { result } => {
                     self.encode_bytes_result_maybe_sequence(&request.id, &request.method, result)
+                }
+                V1Outcome::BytesArrayResult { result } => {
+                    encode_bytes_array_result(&request.id, &result)
                 }
                 V1Outcome::BytesSequenceResult {
                     result,
@@ -2106,12 +2110,26 @@ impl Emulator {
                 message: "Expecting parameters map".to_string(),
             };
         };
-        if let Err(message) = parse_bip85_rsa_key_params(params) {
-            return bad_parameters(message);
-        }
-
-        V1Outcome::DeferredToCore {
-            method: "get_bip85_pubkey RSA generation".to_string(),
+        let key = match parse_bip85_rsa_key_params(params) {
+            Ok(key) => key,
+            Err(message) => return bad_parameters(message),
+        };
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Wallet seed is not available".to_string(),
+            };
+        };
+        match jade_crypto::pure_rust::bip85_rsa_public_key_pem_from_seed(
+            seed,
+            key.key_bits,
+            key.index,
+        ) {
+            Some(result) => V1Outcome::TextResult { result },
+            None => V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to generate RSA key".to_string(),
+            },
         }
     }
 
@@ -2143,8 +2161,24 @@ impl Emulator {
             return bad_parameters("Unsupported number of digests");
         }
 
-        V1Outcome::DeferredToCore {
-            method: "sign_bip85_digests RSA generation".to_string(),
+        let Some(seed) = self.platform.wallet_seed() else {
+            return V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Wallet seed is not available".to_string(),
+            };
+        };
+        match jade_crypto::pure_rust::sign_bip85_rsa_digests_from_seed(
+            seed,
+            key.key_bits,
+            key.index,
+            &digests,
+            &self.platform.master_unblinding_key,
+        ) {
+            Some(result) => V1Outcome::BytesArrayResult { result },
+            None => V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Failed to generate RSA signatures".to_string(),
+            },
         }
     }
 
@@ -4406,6 +4440,7 @@ fn cbor_u32_array(raw: &[u8], max_len: usize) -> Result<Vec<u32>, ()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Bip85RsaKeyParams {
     key_bits: u32,
+    index: u32,
 }
 
 fn parse_bip85_rsa_key_params(
@@ -4419,12 +4454,12 @@ fn parse_bip85_rsa_key_params(
         Ok(Some(key_bits)) if valid_rsa_generation_key_bits(key_bits) => key_bits as u32,
         Ok(_) | Err(_) => return Err("Failed to fetch valid key length from message"),
     };
-    match params.u64("index") {
-        Ok(Some(index)) if index <= 0x7fff_ffff => {}
+    let index = match params.u64("index") {
+        Ok(Some(index)) if index <= 0x7fff_ffff => index as u32,
         Ok(_) | Err(_) => return Err("Failed to fetch valid index from message"),
     };
 
-    Ok(Bip85RsaKeyParams { key_bits })
+    Ok(Bip85RsaKeyParams { key_bits, index })
 }
 
 fn decode_digest_array(
@@ -5671,6 +5706,9 @@ pub enum V1Outcome {
     },
     BytesResult {
         result: Vec<u8>,
+    },
+    BytesArrayResult {
+        result: Vec<Vec<u8>>,
     },
     BytesSequenceResult {
         result: Vec<u8>,
@@ -10463,11 +10501,11 @@ mod tests {
             .unwrap()
             .str("key_bits")
             .unwrap()
-            .u64(4096)
+            .u64(1024)
             .unwrap()
             .str("index")
             .unwrap()
-            .u64(0)
+            .u64(1)
             .unwrap();
         let request = Request {
             id: Cow::Borrowed("rsa"),
@@ -10476,10 +10514,69 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "get_bip85_pubkey RSA generation".to_string(),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Wallet seed is not available".to_string(),
             }
         );
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        let V1Outcome::TextResult { result } = emulator.handle_v1_request(&request) else {
+            panic!("expected BIP85 RSA public key PEM");
+        };
+        assert!(result.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+        assert!(result.ends_with("-----END PUBLIC KEY-----\n"));
+    }
+
+    #[test]
+    fn sign_bip85_digests_returns_rsa_pss_signatures() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_seed().to_vec());
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key([0x42; 64]);
+
+        let digest = [0xab; jade_crypto::SHA256_LEN];
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(4)
+            .unwrap()
+            .str("key_type")
+            .unwrap()
+            .str("RSA")
+            .unwrap()
+            .str("key_bits")
+            .unwrap()
+            .u64(1024)
+            .unwrap()
+            .str("index")
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .str("digests")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .bytes(&digest)
+            .unwrap()
+            .bytes(&[0xcd; jade_crypto::SHA256_LEN])
+            .unwrap();
+        let request = Request {
+            id: Cow::Borrowed("rsa"),
+            method: Cow::Borrowed("sign_bip85_digests"),
+            params: Some(&params),
+        };
+        let V1Outcome::BytesArrayResult { result } = emulator.handle_v1_request(&request) else {
+            panic!("expected BIP85 RSA signatures");
+        };
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 128);
+        assert_eq!(result[1].len(), 128);
+        assert_ne!(result[0], result[1]);
     }
 
     #[test]
@@ -10564,7 +10661,7 @@ mod tests {
             .unwrap()
             .str("key_bits")
             .unwrap()
-            .u64(3072)
+            .u64(1024)
             .unwrap()
             .str("index")
             .unwrap()
@@ -10583,8 +10680,9 @@ mod tests {
         };
         assert_eq!(
             emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "sign_bip85_digests RSA generation".to_string(),
+            V1Outcome::Reject {
+                code: ErrorCode::InternalError,
+                message: "Wallet seed is not available".to_string(),
             }
         );
     }

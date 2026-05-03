@@ -50,9 +50,10 @@ the continuation methods used by multi-message flows.
 - Prefer maintained `no_std + alloc` crates over in-repo rewrites.
 - Keep secp256k1 and P-256 behind narrow backend traits until side-channel,
   determinism, performance, and audit gates are complete.
-- BIP85 RSA entropy is already pure Rust; RSA key generation, PEM export, and
-  PSS signing should be implemented with a working compatibility backend rather
-  than left as an open-ended defer.
+- BIP85 RSA entropy, RSA key generation, public-key PEM export, and RSA-PSS
+  digest signing now have a functional RustCrypto-backed implementation. Exact
+  mbedTLS historical-vector parity remains a release comparison, not a reason
+  to leave the RPCs deferred.
 - Final production core must not contain Jade-owned C/C++ application or core
   code. Temporary C/ESP-IDF use belongs only in platform shims. The public
   `elements` crate and its upstream `secp256k1-zkp` backend are the permanent
@@ -92,19 +93,15 @@ Liquid helper APIs unless there is a reason to expose the lower-level backend.
 
 The hard parts are hard for concrete compatibility reasons:
 
-- BIP85 RSA should follow the same pragmatic rule as Liquid: use the smallest
-  backend boundary that gets exact Jade behavior working. The pure-Rust core
-  already matches BIP85 RSA entropy derivation; the remaining compatibility
-  surface is deterministic RSA key generation from that 64-byte entropy, public
-  key PEM serialization, and RSA-PSS digest signing. First try a pure-Rust RSA
-  backend driven by the same SHAKE256 deterministic RNG. If its public keys or
-  signatures do not match Jade's golden vectors, allow a narrowly scoped
-  `bip85-rsa-compat` backend around the current mbedTLS-compatible RSA
-  generator/signing behavior. That exception may expose only
-  `get_bip85_pubkey` and `sign_bip85_digests`, must stay behind
-  `jade-crypto` traits, must be covered by golden public-key/signature vectors,
-  and must not reintroduce libwally or broad C application logic into the Rust
-  crates.
+- BIP85 RSA follows the same pragmatic rule as Liquid: use the smallest backend
+  boundary that gets working Jade behavior. The first implementation is pure
+  Rust: BIP85 RSA entropy feeds a SHAKE256 deterministic RNG for RustCrypto RSA
+  key generation, PEM export, and RSA-PSS signing. If downstream compatibility
+  requires byte-for-byte matching against historical mbedTLS public-key or
+  signature vectors, add a narrowly scoped `bip85-rsa-compat` backend for only
+  `get_bip85_pubkey` and `sign_bip85_digests`; keep it behind `jade-crypto`
+  traits and do not reintroduce libwally or broad C application logic into the
+  Rust crates.
 
 ## Implemented Rust Parity
 
@@ -112,7 +109,7 @@ The hard parts are hard for concrete compatibility reasons:
   logout, OTA metadata flow, pinserver update/reset, and debug seed/mnemonic
   injection.
 - Host wallet exports and identity: xpub derivation, BIP39/BIP85 entropy,
-  BIP85 RSA parameter validation and entropy parity, P-256 identity
+  BIP85 RSA public-key PEM export and RSA-PSS digest signing, P-256 identity
   pubkey/sign/ECDH, OTP storage,
   and legacy plus anti-exfil message signing. Message anti-exfil now implements
   host commitment validation, signer commitment generation, and the

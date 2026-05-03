@@ -15,7 +15,10 @@ pure-rust-curves = [
     "dep:bip32",
     "dep:k256",
     "dep:p256",
+    "dep:rand_core",
     "dep:ripemd",
+    "dep:rsa",
+    "dep:sha3",
 ]
 
 [dependencies]
@@ -28,9 +31,12 @@ hmac.workspace = true
 k256 = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 pbkdf2.workspace = true
+rand_core = { workspace = true, optional = true }
 ripemd = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
 sha1.workspace = true
 sha2.workspace = true
+sha3 = { workspace = true, optional = true }
 zeroize.workspace = true
 
 [dev-dependencies]

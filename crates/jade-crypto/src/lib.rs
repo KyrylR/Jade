@@ -771,7 +771,12 @@ pub mod pure_rust {
         FieldBytes as P256FieldBytes, ProjectivePoint as P256ProjectivePoint,
         PublicKey as P256PublicKey, Scalar as P256Scalar, SecretKey as P256SecretKey,
     };
+    use rand_core::{CryptoRng, Error as RandError, RngCore};
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::{BigUint, Pss, RsaPrivateKey, RsaPublicKey};
     use sha2::{Digest, Sha256, Sha512};
+    use sha3::digest::{ExtendableOutput, Update as Sha3Update, XofReader};
+    use sha3::{Shake256, Shake256Reader};
     use zeroize::Zeroize;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -2905,6 +2910,36 @@ pub mod pure_rust {
         mac.finalize().into_bytes().as_slice().try_into().ok()
     }
 
+    pub fn bip85_rsa_public_key_pem_from_seed(
+        seed: &[u8],
+        key_bits: u32,
+        index: u32,
+    ) -> Option<String> {
+        let private_key = bip85_rsa_private_key_from_seed(seed, key_bits, index)?;
+        let public_key = RsaPublicKey::from(&private_key);
+        public_key.to_public_key_pem(LineEnding::LF).ok()
+    }
+
+    pub fn sign_bip85_rsa_digests_from_seed(
+        seed: &[u8],
+        key_bits: u32,
+        index: u32,
+        digests: &[[u8; SHA256_LEN]],
+        signing_rng_seed: &[u8; SHA512_LEN],
+    ) -> Option<Vec<Vec<u8>>> {
+        let private_key = bip85_rsa_private_key_from_seed(seed, key_bits, index)?;
+        let mut rng = Shake256Rng::new(signing_rng_seed);
+        let mut signatures = Vec::with_capacity(digests.len());
+        for digest in digests {
+            signatures.push(
+                private_key
+                    .sign_with_rng(&mut rng, Pss::new::<rsa::sha2::Sha256>(), digest)
+                    .ok()?,
+            );
+        }
+        Some(signatures)
+    }
+
     pub fn bip85_rsa_encrypted_entropy_from_seed(
         seed: &[u8],
         key_bits: u32,
@@ -2922,6 +2957,55 @@ pub mod pure_rust {
             iv,
         )
     }
+
+    fn bip85_rsa_private_key_from_seed(
+        seed: &[u8],
+        key_bits: u32,
+        index: u32,
+    ) -> Option<RsaPrivateKey> {
+        let entropy = bip85_rsa_entropy_from_seed(seed, key_bits, index)?;
+        let mut rng = Shake256Rng::new(&entropy);
+        RsaPrivateKey::new_with_exp(&mut rng, key_bits as usize, &BigUint::from(65_537u32)).ok()
+    }
+
+    struct Shake256Rng {
+        reader: Shake256Reader,
+    }
+
+    impl Shake256Rng {
+        fn new(seed: &[u8]) -> Self {
+            let mut hasher = Shake256::default();
+            Sha3Update::update(&mut hasher, seed);
+            Self {
+                reader: hasher.finalize_xof(),
+            }
+        }
+    }
+
+    impl RngCore for Shake256Rng {
+        fn next_u32(&mut self) -> u32 {
+            let mut bytes = [0u8; 4];
+            self.fill_bytes(&mut bytes);
+            u32::from_le_bytes(bytes)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut bytes = [0u8; 8];
+            self.fill_bytes(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.reader.read(dest);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for Shake256Rng {}
 
     fn bip85_encrypted_entropy(
         entropy: &[u8],
@@ -3806,6 +3890,7 @@ mod otp_tests {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+    use rsa::pkcs8::DecodePublicKey;
 
     #[test]
     fn slip77_master_unblinding_key_from_seed_matches_wally_symmetric_derivation() {
@@ -4313,6 +4398,46 @@ mod tests {
                 "{key_bits}/{index}"
             );
         }
+    }
+
+    #[test]
+    fn bip85_rsa_pubkey_and_pss_signing_are_deterministic() {
+        let mnemonic = bip39::Mnemonic::parse(
+            "fish inner face ginger orchard permit useful method fence kidney chuckle party \
+             favorite sunset draw limb science crane oval letter slot invite sadness banana",
+        )
+        .unwrap();
+        let seed = mnemonic.to_seed("");
+        let pem = pure_rust::bip85_rsa_public_key_pem_from_seed(&seed, 1024, 1).unwrap();
+        assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+        assert!(pem.ends_with("-----END PUBLIC KEY-----\n"));
+        assert_eq!(
+            pure_rust::bip85_rsa_public_key_pem_from_seed(&seed, 1024, 1).unwrap(),
+            pem
+        );
+
+        let digest =
+            decode_hex_32("8ac2f58e782977adb6b6ab4cf0916d730dea6b81ce3a1bbeb2eeb5e48b2bd646");
+        let rng_seed = [0x42; SHA512_LEN];
+        let signatures =
+            pure_rust::sign_bip85_rsa_digests_from_seed(&seed, 1024, 1, &[digest], &rng_seed)
+                .unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].len(), 128);
+        assert_eq!(
+            pure_rust::sign_bip85_rsa_digests_from_seed(&seed, 1024, 1, &[digest], &rng_seed)
+                .unwrap(),
+            signatures
+        );
+
+        let public_key = rsa::RsaPublicKey::from_public_key_pem(&pem).unwrap();
+        public_key
+            .verify(
+                rsa::Pss::new::<rsa::sha2::Sha256>(),
+                &digest,
+                &signatures[0],
+            )
+            .unwrap();
     }
 
     #[test]
