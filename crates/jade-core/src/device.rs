@@ -179,6 +179,43 @@ impl DeviceOtaBootReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticVersionContext<'a> {
+    pub idf_version: &'a str,
+    pub chip_features: &'a str,
+    pub efusemac: &'a str,
+    pub attestation_initialised: bool,
+    pub battery_status: u64,
+    pub battery_millivolts: u64,
+    pub battery_charging: bool,
+    pub has_pin: bool,
+    pub debug: Option<crate::VersionDebugInfo>,
+}
+
+impl<'a> StaticVersionContext<'a> {
+    pub fn for_manifest(
+        manifest: DeviceManifest,
+        idf_version: &'a str,
+        efusemac: &'a str,
+        has_pin: bool,
+    ) -> Self {
+        Self {
+            idf_version,
+            chip_features: match manifest.soc() {
+                DeviceSoc::Esp32 => "ESP32",
+                DeviceSoc::Esp32S3 => "ESP32S3",
+            },
+            efusemac,
+            attestation_initialised: manifest.supports_real_attestation(),
+            battery_status: 0,
+            battery_millivolts: 0,
+            battery_charging: false,
+            has_pin,
+            debug: Some(default_version_debug_info(manifest)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceBootFailure {
     EntropyUnavailable,
@@ -427,6 +464,31 @@ pub fn static_version_info(
     efusemac: &'static str,
     has_pin: bool,
 ) -> VersionInfo<'static> {
+    static_version_info_with_context(
+        manifest,
+        state,
+        StaticVersionContext::for_manifest(manifest, idf_version, efusemac, has_pin),
+    )
+}
+
+pub fn default_version_debug_info(manifest: DeviceManifest) -> crate::VersionDebugInfo {
+    crate::VersionDebugInfo {
+        nvs_entries_used: 0,
+        nvs_entries_free: 0,
+        free_heap: manifest.memory.heap_bytes as u64,
+        free_dram: manifest.memory.heap_bytes as u64,
+        largest_dram: manifest.memory.heap_bytes as u64,
+        free_spiram: 0,
+        largest_spiram: 0,
+        gcov: false,
+    }
+}
+
+pub fn static_version_info_with_context<'a>(
+    manifest: DeviceManifest,
+    state: &CoreState,
+    context: StaticVersionContext<'a>,
+) -> VersionInfo<'a> {
     VersionInfo {
         jade_version: Cow::Borrowed(env!("CARGO_PKG_VERSION")),
         jade_ota_max_chunk: 4096,
@@ -440,29 +502,17 @@ pub fn static_version_info(
         } else {
             "NORADIO,RUST"
         }),
-        idf_version: Cow::Borrowed(idf_version),
-        chip_features: Cow::Borrowed(match manifest.soc() {
-            DeviceSoc::Esp32 => "ESP32",
-            DeviceSoc::Esp32S3 => "ESP32S3",
-        }),
-        efusemac: Cow::Borrowed(efusemac),
-        attestation_initialised: manifest.supports_real_attestation(),
-        battery_status: 0,
-        battery_millivolts: 0,
-        battery_charging: false,
+        idf_version: Cow::Borrowed(context.idf_version),
+        chip_features: Cow::Borrowed(context.chip_features),
+        efusemac: Cow::Borrowed(context.efusemac),
+        attestation_initialised: context.attestation_initialised,
+        battery_status: context.battery_status,
+        battery_millivolts: context.battery_millivolts,
+        battery_charging: context.battery_charging,
         jade_state: state.wallet.into(),
         jade_networks: crate::NetworkRestriction::All,
-        jade_has_pin: has_pin,
-        debug: Some(crate::VersionDebugInfo {
-            nvs_entries_used: 0,
-            nvs_entries_free: 0,
-            free_heap: manifest.memory.heap_bytes as u64,
-            free_dram: manifest.memory.heap_bytes as u64,
-            largest_dram: manifest.memory.heap_bytes as u64,
-            free_spiram: 0,
-            largest_spiram: 0,
-            gcov: false,
-        }),
+        jade_has_pin: context.has_pin,
+        debug: context.debug,
     }
 }
 
@@ -752,6 +802,35 @@ mod tests {
         assert_eq!(info.jade_state, VersionInfoState::Uninit);
         assert!(info.attestation_initialised);
         assert!(info.jade_has_pin);
+    }
+
+    #[test]
+    fn static_version_info_accepts_real_device_context_values() {
+        let state = CoreState::default();
+        let info = static_version_info_with_context(
+            TEST_MANIFEST,
+            &state,
+            StaticVersionContext {
+                idf_version: "esp-idf-5.4",
+                chip_features: "01020304",
+                efusemac: "AABBCCDDEEFF",
+                attestation_initialised: false,
+                battery_status: 7,
+                battery_millivolts: 4123,
+                battery_charging: true,
+                has_pin: true,
+                debug: None,
+            },
+        );
+
+        assert_eq!(info.idf_version, "esp-idf-5.4");
+        assert_eq!(info.chip_features, "01020304");
+        assert_eq!(info.efusemac, "AABBCCDDEEFF");
+        assert!(!info.attestation_initialised);
+        assert_eq!(info.battery_status, 7);
+        assert_eq!(info.battery_millivolts, 4123);
+        assert!(info.battery_charging);
+        assert!(info.debug.is_none());
     }
 
     #[test]

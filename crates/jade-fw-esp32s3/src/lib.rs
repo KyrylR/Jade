@@ -10,8 +10,8 @@ use jade_core::{
     DeviceBootReadiness, DeviceBootReport, DeviceFeatureSet, DeviceManifest, DeviceMemoryBudget,
     DevicePartitionLayout, DevicePlatform, DeviceRunningImage, DeviceRuntime, DeviceRuntimeError,
     DeviceTarget, DisplayStatus, FirmwareFrameError, FirmwareProtocol, OtaImageWriter, OtaRequest,
-    OtaUploadVerifier, OtaWriteError, OtaWriteSession, Platform, UserConfirmation,
-    UserConfirmationDecision, VersionInfo,
+    OtaUploadVerifier, OtaWriteError, OtaWriteSession, Platform, StaticVersionContext,
+    UserConfirmation, UserConfirmationDecision, VersionDebugInfo, VersionInfo,
 };
 use jade_emulator::{RuntimePlatformState, RuntimePlatformStateAccess};
 
@@ -98,8 +98,26 @@ pub trait Esp32s3Hardware {
     fn idf_version(&self) -> &'static str {
         "rust"
     }
+    fn chip_features(&self) -> &'static str {
+        "ESP32S3"
+    }
     fn efusemac(&self) -> &'static str {
         ""
+    }
+    fn attestation_initialised(&self) -> bool {
+        self.hardware_attestation_available()
+    }
+    fn battery_status(&self) -> u64 {
+        0
+    }
+    fn battery_millivolts(&self) -> u64 {
+        0
+    }
+    fn battery_charging(&self) -> bool {
+        false
+    }
+    fn version_debug_info(&self) -> Option<VersionDebugInfo> {
+        Some(jade_core::default_version_debug_info(self.manifest()))
     }
     fn add_entropy(&mut self, _entropy: &[u8]) -> CoreResult<()> {
         Ok(())
@@ -175,12 +193,20 @@ impl<H> Esp32s3DevicePlatform<H> {
 
 impl<H: Esp32s3Hardware> Platform for Esp32s3DevicePlatform<H> {
     fn version_info<'a>(&'a self, state: &CoreState) -> VersionInfo<'a> {
-        jade_core::static_version_info(
+        jade_core::static_version_info_with_context(
             self.hardware.manifest(),
             state,
-            self.hardware.idf_version(),
-            self.hardware.efusemac(),
-            self.runtime_state.jade_has_pin(),
+            StaticVersionContext {
+                idf_version: self.hardware.idf_version(),
+                chip_features: self.hardware.chip_features(),
+                efusemac: self.hardware.efusemac(),
+                attestation_initialised: self.hardware.attestation_initialised(),
+                battery_status: self.hardware.battery_status(),
+                battery_millivolts: self.hardware.battery_millivolts(),
+                battery_charging: self.hardware.battery_charging(),
+                has_pin: self.runtime_state.jade_has_pin(),
+                debug: self.hardware.version_debug_info(),
+            },
         )
     }
 

@@ -219,6 +219,14 @@ engine. The remaining extraction work is to implement production
 ESP32/ESP32-S3 hardware hook methods for entropy, clock, display driver
 rendering, camera decoding, confirmation input policy, OTA, and attestation,
 plus the concrete ESP NVS driver behind the storage shim.
+Version reporting is also now a board-service boundary instead of a fixed host
+placeholder. `StaticVersionContext` lets ESP backends supply the actual IDF
+version, chip feature bits, eFuse MAC, attestation-initialised state, battery
+level/voltage/charging fields, and debug heap/NVS/GCOV counters used by the
+public `get_version_info` reply. The reusable ESP32 and ESP32-S3 hardware
+adapters expose defaults that keep tests deterministic while allowing real
+board code to bind those fields to `esp_get_idf_version`, `esp_chip_info`,
+`esp_efuse_mac_get_default`, power, heap, and NVS statistics.
 
 The storage crate now includes an `NvsKeyValueBackend` + `NvsStorage<B>`
 adapter. It maps Jade's typed `StorageNamespace` values to fixed NVS namespace
