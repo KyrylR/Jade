@@ -799,6 +799,7 @@ pub mod pure_rust {
         pub script_code: &'a [u8],
         pub sighash: u32,
         pub is_witness: bool,
+        pub asset_commitment: Option<&'a [u8]>,
         pub value_commitment: Option<&'a [u8]>,
     }
 
@@ -1279,11 +1280,43 @@ pub mod pure_rust {
     pub fn sign_liquid_tx_from_seed(
         txn: &[u8],
         seed: &[u8],
+        network: LiquidNetwork,
         signing_inputs: &[LiquidTxSignInput<'_>],
     ) -> Result<Vec<Vec<u8>>, TxSignError> {
+        use elements::encode;
+
+        let tx: elements::Transaction =
+            encode::deserialize(txn).map_err(|_| TxSignError::Invalid)?;
+        let taproot_prevouts = if signing_inputs
+            .iter()
+            .any(|input| is_p2tr_script_pubkey(input.script_code))
+        {
+            Some(liquid_taproot_prevouts(&tx, signing_inputs)?)
+        } else {
+            None
+        };
         let mut signatures = Vec::with_capacity(signing_inputs.len());
         for signing_input in signing_inputs {
-            let digest = liquid_tx_ecdsa_sighash(txn, signing_input)?;
+            if is_p2tr_script_pubkey(signing_input.script_code) {
+                let digest = liquid_tx_taproot_key_sighash(
+                    &tx,
+                    seed,
+                    network,
+                    taproot_prevouts.as_deref().ok_or(TxSignError::Invalid)?,
+                    signing_input,
+                )?;
+                let signature = sign_elements_taproot_key_spend_from_seed(
+                    seed,
+                    signing_input.path,
+                    &digest,
+                    signing_input.sighash as u8,
+                )
+                .ok_or(TxSignError::Unsupported)?;
+                signatures.push(signature);
+                continue;
+            }
+
+            let digest = liquid_tx_ecdsa_sighash_for_tx(&tx, signing_input)?;
             let sighash = elements::EcdsaSighashType::from_standard(signing_input.sighash)
                 .map_err(|_| TxSignError::Unsupported)?;
             let signature = sign_digest_der_from_seed(
@@ -1337,12 +1370,20 @@ pub mod pure_rust {
         signing_input: &LiquidTxSignInput<'_>,
     ) -> Result<[u8; SHA256_LEN], TxSignError> {
         use elements::encode;
+
+        let tx: elements::Transaction =
+            encode::deserialize(txn).map_err(|_| TxSignError::Invalid)?;
+        liquid_tx_ecdsa_sighash_for_tx(&tx, signing_input)
+    }
+
+    fn liquid_tx_ecdsa_sighash_for_tx(
+        tx: &elements::Transaction,
+        signing_input: &LiquidTxSignInput<'_>,
+    ) -> Result<[u8; SHA256_LEN], TxSignError> {
         use elements::hashes::Hash as _;
         use elements::sighash::SighashCache;
         use elements::{EcdsaSighashType, Script};
 
-        let tx: elements::Transaction =
-            encode::deserialize(txn).map_err(|_| TxSignError::Invalid)?;
         if signing_input.path.is_empty()
             || signing_input.script_code.is_empty()
             || signing_input.tx_input_index >= tx.input.len()
@@ -1354,7 +1395,7 @@ pub mod pure_rust {
         }
         let sighash = EcdsaSighashType::from_standard(signing_input.sighash)
             .map_err(|_| TxSignError::Unsupported)?;
-        let mut sighash_cache = SighashCache::new(&tx);
+        let mut sighash_cache = SighashCache::new(tx);
         let script = Script::from(signing_input.script_code.to_vec());
         let digest = if signing_input.is_witness {
             let value = liquid_value_commitment(
@@ -1368,6 +1409,83 @@ pub mod pure_rust {
         Ok(*digest.as_byte_array())
     }
 
+    fn liquid_tx_taproot_key_sighash(
+        tx: &elements::Transaction,
+        seed: &[u8],
+        network: LiquidNetwork,
+        prevouts: &[elements::TxOut],
+        signing_input: &LiquidTxSignInput<'_>,
+    ) -> Result<[u8; SHA256_LEN], TxSignError> {
+        use elements::hashes::Hash as _;
+        use elements::sighash::{Prevouts, SchnorrSighashType, SighashCache};
+
+        if signing_input.path.is_empty()
+            || !is_p2tr_script_pubkey(signing_input.script_code)
+            || signing_input.tx_input_index >= tx.input.len()
+        {
+            return Err(TxSignError::Invalid);
+        }
+        if !matches!(signing_input.sighash, 0 | 1) {
+            return Err(TxSignError::Unsupported);
+        }
+        let public_key =
+            public_key_from_seed_path(seed, signing_input.path).ok_or(TxSignError::Unsupported)?;
+        let output_key =
+            elements_taproot_keyspend_output_key(&public_key).ok_or(TxSignError::Unsupported)?;
+        if p2tr_script_pubkey(&output_key) != signing_input.script_code {
+            return Err(TxSignError::Unsupported);
+        }
+        let sighash = SchnorrSighashType::from_u8(signing_input.sighash as u8)
+            .ok_or(TxSignError::Unsupported)?;
+        let mut sighash_cache = SighashCache::new(tx);
+        let digest = sighash_cache
+            .taproot_key_spend_signature_hash(
+                signing_input.tx_input_index,
+                &Prevouts::All(prevouts),
+                sighash,
+                liquid_genesis_hash(network),
+            )
+            .map_err(|_| TxSignError::Invalid)?;
+        Ok(digest.to_byte_array())
+    }
+
+    fn liquid_taproot_prevouts(
+        tx: &elements::Transaction,
+        signing_inputs: &[LiquidTxSignInput<'_>],
+    ) -> Result<Vec<elements::TxOut>, TxSignError> {
+        use elements::{confidential, Script, TxOut, TxOutWitness};
+
+        if signing_inputs.len() != tx.input.len() {
+            return Err(TxSignError::Unsupported);
+        }
+        let mut prevouts = Vec::with_capacity(tx.input.len());
+        for (index, signing_input) in signing_inputs.iter().enumerate() {
+            if signing_input.tx_input_index != index || signing_input.script_code.is_empty() {
+                return Err(TxSignError::Unsupported);
+            }
+            let asset = liquid_asset_commitment(
+                signing_input.asset_commitment.ok_or(TxSignError::Invalid)?,
+            )
+            .ok_or(TxSignError::Invalid)?;
+            let value = liquid_value_commitment(
+                signing_input.value_commitment.ok_or(TxSignError::Invalid)?,
+            )
+            .ok_or(TxSignError::Invalid)?;
+            prevouts.push(TxOut {
+                asset,
+                value,
+                nonce: confidential::Nonce::Null,
+                script_pubkey: Script::from(signing_input.script_code.to_vec()),
+                witness: TxOutWitness::default(),
+            });
+        }
+        Ok(prevouts)
+    }
+
+    fn liquid_asset_commitment(asset: &[u8]) -> Option<elements::confidential::Asset> {
+        elements::encode::deserialize(asset).ok()
+    }
+
     fn liquid_value_commitment(value: &[u8]) -> Option<elements::confidential::Value> {
         match value.len() {
             LIQUID_COMMITMENT_LEN => elements::confidential::Value::from_commitment(value).ok(),
@@ -1377,6 +1495,29 @@ pub mod pure_rust {
             }
             _ => None,
         }
+    }
+
+    fn liquid_genesis_hash(network: LiquidNetwork) -> elements::BlockHash {
+        use elements::hashes::Hash as _;
+
+        let bytes = match network {
+            LiquidNetwork::Main => [
+                0x03, 0x60, 0x20, 0x8a, 0x88, 0x96, 0x92, 0x37, 0x2c, 0x8d, 0x68, 0xb0, 0x84, 0xa6,
+                0x2e, 0xfd, 0xf6, 0x0e, 0xa1, 0xa3, 0x59, 0xa0, 0x4c, 0x94, 0xb2, 0x0d, 0x22, 0x36,
+                0x58, 0x27, 0x66, 0x14,
+            ],
+            LiquidNetwork::Test => [
+                0xc1, 0xb1, 0x6a, 0xe2, 0x4f, 0x24, 0x23, 0xae, 0xa2, 0xea, 0x34, 0x55, 0x22, 0x92,
+                0x79, 0x3b, 0x5b, 0x5e, 0x82, 0x99, 0x9a, 0x1e, 0xed, 0x81, 0xd5, 0x6a, 0xee, 0x52,
+                0x8e, 0xda, 0x71, 0xa7,
+            ],
+            LiquidNetwork::Regtest => [
+                0x21, 0xca, 0xb1, 0xe5, 0xda, 0x47, 0x18, 0xea, 0x14, 0x0d, 0x97, 0x16, 0x93, 0x17,
+                0x02, 0x42, 0x2f, 0x0e, 0x6a, 0xd9, 0x15, 0xc8, 0xd9, 0xb5, 0x83, 0xca, 0xc2, 0x70,
+                0x6b, 0x2a, 0x90, 0x00,
+            ],
+        };
+        elements::BlockHash::from_byte_array(bytes)
     }
 
     fn bitcoin_tx_ecdsa_sighash(
@@ -2343,6 +2484,31 @@ pub mod pure_rust {
         digest: &[u8; SHA256_LEN],
         sighash_type: u8,
     ) -> Option<Vec<u8>> {
+        sign_taproot_key_spend_from_seed_with_tag(seed, path, digest, sighash_type, b"TapTweak")
+    }
+
+    fn sign_elements_taproot_key_spend_from_seed(
+        seed: &[u8],
+        path: &[u32],
+        digest: &[u8; SHA256_LEN],
+        sighash_type: u8,
+    ) -> Option<Vec<u8>> {
+        sign_taproot_key_spend_from_seed_with_tag(
+            seed,
+            path,
+            digest,
+            sighash_type,
+            b"TapTweak/elements",
+        )
+    }
+
+    fn sign_taproot_key_spend_from_seed_with_tag(
+        seed: &[u8],
+        path: &[u32],
+        digest: &[u8; SHA256_LEN],
+        sighash_type: u8,
+        tweak_tag: &[u8],
+    ) -> Option<Vec<u8>> {
         let private_key = private_key_from_seed_path(seed, path)?;
         let public_key = public_key_from_private_key(&private_key)?;
         let secret = SecretKey::from_slice(&private_key).ok()?;
@@ -2353,7 +2519,7 @@ pub mod pure_rust {
 
         let mut xonly = [0u8; SHA256_LEN];
         xonly.copy_from_slice(&public_key[1..]);
-        let tweak_hash = tagged_hash(b"TapTweak", &xonly);
+        let tweak_hash = tagged_hash(tweak_tag, &xonly);
         let tweak_bytes: FieldBytes = tweak_hash.into();
         let tweak = <Scalar as Reduce<U256>>::reduce_bytes(&tweak_bytes);
         let tweaked = scalar + tweak;

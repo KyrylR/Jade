@@ -60,6 +60,7 @@ struct BitcoinSignTxSession {
     received_inputs: usize,
     next_signature: usize,
     flow: BitcoinSignTxFlow,
+    liquid_network: Option<jade_crypto::LiquidNetwork>,
     inputs: Vec<BitcoinTxInputParams>,
     liquid_inputs: Vec<LiquidTxInputParams>,
 }
@@ -2228,6 +2229,7 @@ impl Emulator {
             received_inputs: 0,
             next_signature: 0,
             flow,
+            liquid_network: None,
             inputs: Vec::with_capacity(expected_inputs),
             liquid_inputs: Vec::new(),
         });
@@ -2247,9 +2249,9 @@ impl Emulator {
                 return bad_parameters("Failed to extract valid network from parameters");
             }
         };
-        if liquid_network_for_name(network_name).is_none() {
+        let Some(liquid_network) = liquid_network_for_name(network_name) else {
             return bad_parameters("sign_liquid_tx call only appropriate for liquid network");
-        }
+        };
         let txn = match params.bytes("txn") {
             Ok(Some(txn)) if !txn.is_empty() => txn,
             Ok(_) | Err(_) => return bad_parameters("Failed to extract tx from parameters"),
@@ -2296,6 +2298,7 @@ impl Emulator {
             received_inputs: 0,
             next_signature: 0,
             flow,
+            liquid_network: Some(liquid_network),
             inputs: Vec::new(),
             liquid_inputs: Vec::with_capacity(expected_inputs),
         });
@@ -2455,15 +2458,27 @@ impl Emulator {
                         message: "Wallet seed is not available".to_string(),
                     };
                 };
-                let signature = sign_liquid_tx_input(&session.txn, seed, tx_input_index, &input)
-                    .map_err(|err| match err {
-                        jade_crypto::TxSignError::Invalid => {
-                            bad_parameters("Failed to extract tx input from parameters")
-                        }
-                        jade_crypto::TxSignError::Unsupported => V1Outcome::DeferredToCore {
-                            method: "sign_liquid_tx signing".to_string(),
-                        },
-                    });
+                let Some(liquid_network) = session.liquid_network else {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::ProtocolError,
+                        message: "Unexpected method".to_string(),
+                    };
+                };
+                let signature = sign_liquid_tx_input(
+                    &session.txn,
+                    seed,
+                    liquid_network,
+                    tx_input_index,
+                    &input,
+                )
+                .map_err(|err| match err {
+                    jade_crypto::TxSignError::Invalid => {
+                        bad_parameters("Failed to extract tx input from parameters")
+                    }
+                    jade_crypto::TxSignError::Unsupported => V1Outcome::DeferredToCore {
+                        method: "sign_liquid_tx signing".to_string(),
+                    },
+                });
                 if done {
                     self.sign_tx = None;
                 }
@@ -2619,8 +2634,27 @@ impl Emulator {
                                 .to_string(),
                     };
                 }
-                match sign_liquid_tx_input(&session.txn, seed, signature_index, &input) {
-                    Ok(signature) => signature,
+                let Some(liquid_network) = session.liquid_network else {
+                    return V1Outcome::Reject {
+                        code: ErrorCode::ProtocolError,
+                        message: "Unexpected method".to_string(),
+                    };
+                };
+                match sign_liquid_tx_inputs(
+                    &session.txn,
+                    seed,
+                    liquid_network,
+                    &session.liquid_inputs,
+                ) {
+                    Ok(signatures) => match signatures.get(signature_index) {
+                        Some(signature) => signature.clone(),
+                        None => {
+                            return V1Outcome::Reject {
+                                code: ErrorCode::ProtocolError,
+                                message: "Unexpected method".to_string(),
+                            };
+                        }
+                    },
                     Err(jade_crypto::TxSignError::Invalid) => {
                         return bad_parameters("Failed to extract tx input from parameters");
                     }
@@ -4058,6 +4092,7 @@ struct LiquidTxInputParams {
     script: Option<Vec<u8>>,
     sighash: u32,
     is_witness: bool,
+    asset_commitment: Option<Vec<u8>>,
     value_commitment: Option<Vec<u8>>,
     ae_host_commitment: Option<[u8; jade_crypto::SHA256_LEN]>,
 }
@@ -4078,6 +4113,7 @@ fn parse_liquid_tx_input_params(
             script: None,
             sighash: 1,
             is_witness: false,
+            asset_commitment: None,
             value_commitment: None,
             ae_host_commitment: None,
         });
@@ -4100,6 +4136,19 @@ fn parse_liquid_tx_input_params(
     if !liquid_sighash_is_supported(script, sighash) {
         return Err("Unsupported sighash value");
     }
+    let asset_commitment =
+        match cbor_map_bytes_or_null_alias(params.raw(), &["asset_generator", "asset"]) {
+            Ok(Some(commitment)) if commitment.len() == jade_crypto::LIQUID_COMMITMENT_LEN => {
+                Some(commitment)
+            }
+            Ok(Some(_)) | Err(()) => {
+                return Err("Failed to extract asset generator from parameters")
+            }
+            Ok(None) if is_taproot_script_pubkey(script) => {
+                return Err("Failed to extract asset generator from parameters")
+            }
+            Ok(None) => None,
+        };
     let value_commitment =
         match cbor_map_bytes_or_null_alias(params.raw(), &["value_commitment", "value commitment"])
         {
@@ -4142,6 +4191,7 @@ fn parse_liquid_tx_input_params(
         script: Some(script.to_vec()),
         sighash,
         is_witness,
+        asset_commitment: asset_commitment.map(Vec::from),
         value_commitment: value_commitment.map(Vec::from),
         ae_host_commitment,
     })
@@ -4186,6 +4236,7 @@ fn sign_bitcoin_tx_input(
 fn sign_liquid_tx_input(
     txn: &[u8],
     seed: &[u8],
+    network: jade_crypto::LiquidNetwork,
     tx_input_index: usize,
     input: &LiquidTxInputParams,
 ) -> Result<Vec<u8>, jade_crypto::TxSignError> {
@@ -4193,8 +4244,38 @@ fn sign_liquid_tx_input(
         return Ok(Vec::new());
     };
     let mut signatures =
-        jade_crypto::pure_rust::sign_liquid_tx_from_seed(txn, seed, &[signing_input])?;
+        jade_crypto::pure_rust::sign_liquid_tx_from_seed(txn, seed, network, &[signing_input])?;
     Ok(signatures.remove(0))
+}
+
+fn sign_liquid_tx_inputs(
+    txn: &[u8],
+    seed: &[u8],
+    network: jade_crypto::LiquidNetwork,
+    inputs: &[LiquidTxInputParams],
+) -> Result<Vec<Vec<u8>>, jade_crypto::TxSignError> {
+    let mut signing_inputs = Vec::with_capacity(inputs.len());
+    let mut signing_indexes = Vec::with_capacity(inputs.len());
+    for (index, input) in inputs.iter().enumerate() {
+        if let Some(signing_input) = liquid_tx_sign_input(index, input)? {
+            signing_indexes.push(index);
+            signing_inputs.push(signing_input);
+        }
+    }
+    if signing_inputs.is_empty() {
+        return Ok(vec![Vec::new(); inputs.len()]);
+    }
+    let signatures =
+        jade_crypto::pure_rust::sign_liquid_tx_from_seed(txn, seed, network, &signing_inputs)?;
+    if signatures.len() != signing_indexes.len() {
+        return Err(jade_crypto::TxSignError::Invalid);
+    }
+
+    let mut ordered = vec![Vec::new(); inputs.len()];
+    for (index, signature) in signing_indexes.into_iter().zip(signatures) {
+        ordered[index] = signature;
+    }
+    Ok(ordered)
 }
 
 fn liquid_tx_signer_commitment(
@@ -4250,6 +4331,7 @@ fn liquid_tx_sign_input<'a>(
         script_code: script,
         sighash: input.sighash,
         is_witness: input.is_witness,
+        asset_commitment: input.asset_commitment.as_deref(),
         value_commitment: input.value_commitment.as_deref(),
     }))
 }
@@ -6281,50 +6363,140 @@ mod tests {
         params
     }
 
-    fn encode_good_liquid_commitment(encoder: &mut minicbor::Encoder<&mut Vec<u8>>) {
+    fn sign_liquid_tx_start_params_with_taproot_trusted_ae(
+        network: &str,
+        txn: &[u8],
+        num_inputs: u64,
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
         encoder
-            .map(7)
+            .map(5)
+            .unwrap()
+            .str("network")
+            .unwrap()
+            .str(network)
+            .unwrap()
+            .str("txn")
+            .unwrap()
+            .bytes(txn)
+            .unwrap()
+            .str("num_inputs")
+            .unwrap()
+            .u64(num_inputs)
+            .unwrap()
+            .str("use_ae_signatures")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("trusted_commitments")
+            .unwrap()
+            .array(3)
+            .unwrap();
+        encode_liquid_commitment(
+            &mut encoder,
+            LiquidCommitmentFixture {
+                abf: "3fad6f8ee7412df34ab7650bd531963de553f22f58a88e35fd0dc35bb8f200ea",
+                asset_generator:
+                    "0bbd8ce9c80307c558709c70bc70bffdd7ba942ba546f3a5e144dbc0aae982fa00",
+                asset_id: "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225",
+                blinding_key: Some(
+                    "03d48e3df01004b7c52d7dea7afa2f1125adbf6a9e04692d01f62f84115457e158",
+                ),
+                value: 29_000,
+                value_commitment:
+                    "0976758231f5995f33327db97d9480d91df919d61a13156cd2e648da773130128d",
+                vbf: "9b6b21b5ee6095b523971559d38a0d41895f6d11a06bd4fc51ae12cb778ef7e7",
+            },
+        );
+        encode_liquid_commitment(
+            &mut encoder,
+            LiquidCommitmentFixture {
+                abf: "7c4d63e3ce990e792fb7fd8529d5a7d99d226c603ddf4afe3106e8db77a83281",
+                asset_generator:
+                    "0bd15be7027302ba3d5f95813d0a824d3bbdbd933920495e1bf98f41e3a350c73f",
+                asset_id: "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225",
+                blinding_key: Some(
+                    "02566c2895176a03e22b1ea19b86c66e6c1d9e1f6b62b25926cb71717599fe67e3",
+                ),
+                value: 270_968,
+                value_commitment:
+                    "094acb2c56fac8a994507afb839df34c5ad04f1c721fa2f5ddec542d9756b927fd",
+                vbf: "bd1fa344ad0caa3828d83f71aa0f9671743265846e7d2b7a57fcd8302a0241df",
+            },
+        );
+        encoder.map(0).unwrap();
+        params
+    }
+
+    fn encode_good_liquid_commitment(encoder: &mut minicbor::Encoder<&mut Vec<u8>>) {
+        encode_liquid_commitment(
+            encoder,
+            LiquidCommitmentFixture {
+                abf: "a3510210bbab6ed67429af9beaf42f09382e12146a3db466971b58a45516bba0",
+                asset_generator:
+                    "0abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713",
+                asset_id: "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225",
+                blinding_key: Some(
+                    "023454c233497be73ed98c07d5e9069e21519e94d0663375ca57c982037546e352",
+                ),
+                value: 9_000_000,
+                value_commitment:
+                    "094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43",
+                vbf: "6ec064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53",
+            },
+        );
+    }
+
+    struct LiquidCommitmentFixture<'a> {
+        abf: &'a str,
+        asset_generator: &'a str,
+        asset_id: &'a str,
+        blinding_key: Option<&'a str>,
+        value: u64,
+        value_commitment: &'a str,
+        vbf: &'a str,
+    }
+
+    fn encode_liquid_commitment(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        fixture: LiquidCommitmentFixture<'_>,
+    ) {
+        let field_count = 6 + u64::from(fixture.blinding_key.is_some());
+        encoder
+            .map(field_count)
             .unwrap()
             .str("abf")
             .unwrap()
-            .bytes(&decode_hex::<32>(
-                "a3510210bbab6ed67429af9beaf42f09382e12146a3db466971b58a45516bba0",
-            ))
+            .bytes(&decode_hex::<32>(fixture.abf))
             .unwrap()
             .str("asset_generator")
             .unwrap()
-            .bytes(&decode_hex::<33>(
-                "0abd23178d9ff73cf848d8d88a7c7e269a464f53017cab0f9f53ed9d64b2849713",
-            ))
+            .bytes(&decode_hex::<33>(fixture.asset_generator))
             .unwrap()
             .str("asset_id")
             .unwrap()
-            .bytes(&decode_hex::<32>(
-                "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225",
-            ))
-            .unwrap()
-            .str("blinding_key")
-            .unwrap()
-            .bytes(&decode_hex::<33>(
-                "023454c233497be73ed98c07d5e9069e21519e94d0663375ca57c982037546e352",
-            ))
+            .bytes(&decode_hex::<32>(fixture.asset_id))
             .unwrap()
             .str("value")
             .unwrap()
-            .u64(9_000_000)
+            .u64(fixture.value)
             .unwrap()
             .str("value_commitment")
             .unwrap()
-            .bytes(&decode_hex::<33>(
-                "094d9a00f1661a2a805a8afec9c188310d4c43353cc319886ee4d9f439389d8f43",
-            ))
+            .bytes(&decode_hex::<33>(fixture.value_commitment))
             .unwrap()
             .str("vbf")
             .unwrap()
-            .bytes(&decode_hex::<32>(
-                "6ec064a68075a278bfca4a10f777c730116e9ba02fbb343a237c847e4d2fbf53",
-            ))
+            .bytes(&decode_hex::<32>(fixture.vbf))
             .unwrap();
+        if let Some(blinding_key) = fixture.blinding_key {
+            encoder
+                .str("blinding_key")
+                .unwrap()
+                .bytes(&decode_hex::<33>(blinding_key))
+                .unwrap();
+        }
     }
 
     fn get_signature_params() -> Vec<u8> {
@@ -6456,6 +6628,53 @@ mod tests {
         if let Some(input_tx) = input_tx {
             encoder.str("input_tx").unwrap().bytes(input_tx).unwrap();
         }
+        params
+    }
+
+    fn sign_liquid_taproot_input_params(
+        path: &[u32],
+        script: &[u8],
+        asset_generator: &[u8],
+        value_commitment: &[u8],
+        sighash: u64,
+    ) -> Vec<u8> {
+        let mut params = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut params);
+        encoder
+            .map(7)
+            .unwrap()
+            .str("is_witness")
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .str("path")
+            .unwrap()
+            .array(path.len() as u64)
+            .unwrap();
+        for child in path {
+            encoder.u32(*child).unwrap();
+        }
+        encoder
+            .str("script")
+            .unwrap()
+            .bytes(script)
+            .unwrap()
+            .str("sighash")
+            .unwrap()
+            .u64(sighash)
+            .unwrap()
+            .str("asset_generator")
+            .unwrap()
+            .bytes(asset_generator)
+            .unwrap()
+            .str("value_commitment")
+            .unwrap()
+            .bytes(value_commitment)
+            .unwrap()
+            .str("ae_host_commitment")
+            .unwrap()
+            .bytes(&[])
+            .unwrap();
         params
     }
 
@@ -7251,6 +7470,83 @@ mod tests {
                 result: decode_hex_vec(expected[1])
             }
         );
+    }
+
+    #[test]
+    fn sign_liquid_tx_staged_flow_signs_taproot_keypath_inputs() {
+        let mut emulator = Emulator::new();
+        emulator
+            .platform_mut()
+            .set_debug_wallet_seed(test_mnemonic_single_sig_seed().to_vec());
+        let fixture = include_str!("../../../test_data/tx_liquid_ss_p2tr_ae.json");
+        let txn = decode_hex_vec(fixture_hex_values(fixture, "txn")[0]);
+        let expected = fixture_expected_output_signatures(fixture);
+        assert_eq!(expected.len(), 2);
+
+        let start_params =
+            sign_liquid_tx_start_params_with_taproot_trusted_ae("localtest-liquid", &txn, 2);
+        let start_request = Request {
+            id: Cow::Borrowed("liq"),
+            method: Cow::Borrowed("sign_liquid_tx"),
+            params: Some(&start_params),
+        };
+        assert_eq!(
+            emulator.handle_v1_request(&start_request),
+            V1Outcome::BoolResult { result: true }
+        );
+
+        for (index, path, script, asset_generator, value_commitment, sighash) in [
+            (
+                0,
+                &[2_147_483_734, 2_147_483_649, 2_147_483_648, 0, 2][..],
+                "51205624eb967de3594a221e4dffe81a8bfef204fc255c5fdaaccd5626ab07d1d8e6",
+                "0b1257095ec123a2b32798bba687ac75bceb4477d9783f6f64b8c59b220b3fe6e5",
+                "09d8b282f73cdb041db26b5a6b252d397ab02e9a9b5da9c1197e48053e78a526da",
+                0,
+            ),
+            (
+                1,
+                &[2_147_483_734, 2_147_483_649, 2_147_483_648, 0, 1][..],
+                "5120b850370392dafc3e7d02db13b447c927e98b6439681fea582401e570904cd6a5",
+                "0a3b8c19d66579bf9f3635a17c48819554f8782990ac2934c7a5a2f0b660b769be",
+                "096090a6269c7b3856ba0d7f7e6587a4ad16e2d32c0fb0500326e52a522820d746",
+                1,
+            ),
+        ] {
+            assert_eq!(index, emulator.sign_tx.as_ref().unwrap().received_inputs);
+            let script = decode_hex_vec(script);
+            let input_params = sign_liquid_taproot_input_params(
+                path,
+                &script,
+                &decode_hex_vec(asset_generator),
+                &decode_hex_vec(value_commitment),
+                sighash,
+            );
+            let input_request = Request {
+                id: Cow::Borrowed("input"),
+                method: Cow::Borrowed("tx_input"),
+                params: Some(&input_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&input_request),
+                V1Outcome::BytesResult { result: Vec::new() }
+            );
+        }
+
+        for signature in expected {
+            let signature_params = get_signature_params();
+            let signature_request = Request {
+                id: Cow::Borrowed("sig"),
+                method: Cow::Borrowed("get_signature"),
+                params: Some(&signature_params),
+            };
+            assert_eq!(
+                emulator.handle_v1_request(&signature_request),
+                V1Outcome::BytesResult {
+                    result: decode_hex_vec(signature)
+                }
+            );
+        }
     }
 
     #[test]
