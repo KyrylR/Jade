@@ -73,8 +73,9 @@ serial/BLE/USB traffic through the full Rust v1 behavior engine. They also
 expose boot-gated camera QR polling over caller-owned buffers, returning
 `Ok(None)` when no QR payload is ready and surfacing platform buffer/transport
 failures without panicking, and the ESP32-S3 board runtime exposes the same
-boot-gated boundary for touch press/release events. This is the entrypoint
-shape expected by a real board event loop.
+boot-gated boundary for touch press/release events and hardware attestation
+challenge signing. This is the entrypoint shape expected by a real board event
+loop.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
@@ -123,6 +124,15 @@ crates expose `begin_ota_update` helpers that first assert the official target
 manifest and OTA partition fit, then start the platform writer. The remaining
 board work is the concrete ESP OTA writer that maps this trait to the device
 OTA slot APIs and signed-image verification path.
+
+`jade-fw-esp32s3` now has a hardware-attestation platform boundary for the real
+device-specific key path: `sign_hardware_attestation` asks the platform shim
+for the hardware public key PEM, external attestation signature, and a device
+signature over the challenge, all written into caller-provided buffers. The
+Rust board runtime boot-gates that operation and returns `Ok(None)` when a
+platform reports that hardware attestation is unavailable, so v2/v2c bring-up
+can wire eFuse/DS-backed signing without putting attestation request handling
+back into C.
 
 ## State Domains
 
@@ -258,7 +268,8 @@ The hard parts are hard for concrete compatibility reasons:
   runtimes now expose the same QR byte boundary through boot-gated firmware
   polling helpers, so a real camera decoder can feed the Rust v1/debug scan
   paths without adding C-owned request handling. The ESP32-S3 board runtime
-  also exposes boot-gated touch events for the UI event loop. ESP32-S3
+  also exposes boot-gated touch events for the UI event loop and a
+  device-attestation signing hook for the eFuse/DS-backed key path. ESP32-S3
   eFuse/DS burning and real camera/QR decoder backends remain target firmware
   platform shims, but
   the v1 core response shapes and request validation no longer require

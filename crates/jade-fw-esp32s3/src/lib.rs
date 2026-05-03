@@ -51,12 +51,32 @@ pub trait Esp32s3PlatformShim: DevicePlatform {
     fn camera_qr_scan(&mut self, out: &mut [u8]) -> Result<usize, DeviceBootFailure>;
     fn touch_poll(&mut self) -> Result<Option<TouchEvent>, DeviceBootFailure>;
     fn hardware_attestation_available(&self) -> bool;
+    fn hardware_attestation_public_key_pem(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure>;
+    fn hardware_attestation_ext_signature(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure>;
+    fn hardware_attestation_sign(
+        &mut self,
+        challenge: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, DeviceBootFailure>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TouchEvent {
     Press { x: u16, y: u16 },
     Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareAttestationReply<'a> {
+    pub signature: &'a [u8],
+    pub pubkey_pem: &'a [u8],
+    pub ext_signature: &'a [u8],
 }
 
 pub type Esp32s3Runtime<P> = DeviceRuntime<P>;
@@ -171,6 +191,26 @@ where
         }
         poll_touch(self.platform_mut()).map_err(FirmwareFrameError::Io)
     }
+
+    pub fn sign_hardware_attestation<'a>(
+        &mut self,
+        challenge: &[u8],
+        signature_out: &'a mut [u8],
+        pubkey_out: &'a mut [u8],
+        ext_signature_out: &'a mut [u8],
+    ) -> Result<Option<HardwareAttestationReply<'a>>, FirmwareFrameError> {
+        if !self.booted {
+            return Err(FirmwareFrameError::BootRequired);
+        }
+        sign_hardware_attestation(
+            self.platform_mut(),
+            challenge,
+            signature_out,
+            pubkey_out,
+            ext_signature_out,
+        )
+        .map_err(FirmwareFrameError::Io)
+    }
 }
 
 pub fn runtime_for_v2<P>(platform: P) -> Esp32s3Runtime<P>
@@ -249,6 +289,44 @@ where
     P: Esp32s3PlatformShim,
 {
     platform.touch_poll()
+}
+
+pub fn sign_hardware_attestation<'a, P>(
+    platform: &mut P,
+    challenge: &[u8],
+    signature_out: &'a mut [u8],
+    pubkey_out: &'a mut [u8],
+    ext_signature_out: &'a mut [u8],
+) -> Result<Option<HardwareAttestationReply<'a>>, DeviceBootFailure>
+where
+    P: Esp32s3PlatformShim,
+{
+    if !platform.hardware_attestation_available() {
+        return Ok(None);
+    }
+
+    let pubkey_len = platform.hardware_attestation_public_key_pem(pubkey_out)?;
+    let ext_signature_len = platform.hardware_attestation_ext_signature(ext_signature_out)?;
+    let signature_len = platform.hardware_attestation_sign(challenge, signature_out)?;
+    if pubkey_len == 0 || ext_signature_len == 0 || signature_len == 0 {
+        return Err(DeviceBootFailure::RollbackStateInvalid);
+    }
+
+    let pubkey_pem = pubkey_out
+        .get(..pubkey_len)
+        .ok_or(DeviceBootFailure::TransportUnavailable)?;
+    let ext_signature = ext_signature_out
+        .get(..ext_signature_len)
+        .ok_or(DeviceBootFailure::TransportUnavailable)?;
+    let signature = signature_out
+        .get(..signature_len)
+        .ok_or(DeviceBootFailure::TransportUnavailable)?;
+
+    Ok(Some(HardwareAttestationReply {
+        signature,
+        pubkey_pem,
+        ext_signature,
+    }))
 }
 
 pub fn poll_serial_v1<P>(
@@ -483,6 +561,11 @@ mod tests {
         ble_tx: Vec<Vec<u8>>,
         camera_rx: Option<Vec<u8>>,
         touch_rx: Option<TouchEvent>,
+        attestation_available: bool,
+        attestation_pubkey_pem: Option<Vec<u8>>,
+        attestation_ext_signature: Option<Vec<u8>>,
+        attestation_signature: Option<Vec<u8>>,
+        attestation_challenge: Option<Vec<u8>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,6 +628,11 @@ mod tests {
                 ble_tx: Vec::new(),
                 camera_rx: None,
                 touch_rx: None,
+                attestation_available: true,
+                attestation_pubkey_pem: None,
+                attestation_ext_signature: None,
+                attestation_signature: None,
+                attestation_challenge: None,
             }
         }
 
@@ -559,6 +647,17 @@ mod tests {
                 return Err(DeviceBootFailure::TransportUnavailable);
             }
             out[..frame.len()].copy_from_slice(&frame);
+            Ok(frame.len())
+        }
+
+        fn copy_frame(frame: &Option<Vec<u8>>, out: &mut [u8]) -> Result<usize, DeviceBootFailure> {
+            let Some(frame) = frame else {
+                return Err(DeviceBootFailure::TransportUnavailable);
+            };
+            if frame.len() > out.len() {
+                return Err(DeviceBootFailure::TransportUnavailable);
+            }
+            out[..frame.len()].copy_from_slice(frame);
             Ok(frame.len())
         }
     }
@@ -658,7 +757,30 @@ mod tests {
         }
 
         fn hardware_attestation_available(&self) -> bool {
-            true
+            self.attestation_available
+        }
+
+        fn hardware_attestation_public_key_pem(
+            &mut self,
+            out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Self::copy_frame(&self.attestation_pubkey_pem, out)
+        }
+
+        fn hardware_attestation_ext_signature(
+            &mut self,
+            out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            Self::copy_frame(&self.attestation_ext_signature, out)
+        }
+
+        fn hardware_attestation_sign(
+            &mut self,
+            challenge: &[u8],
+            out: &mut [u8],
+        ) -> Result<usize, DeviceBootFailure> {
+            self.attestation_challenge = Some(challenge.to_vec());
+            Self::copy_frame(&self.attestation_signature, out)
         }
     }
 
@@ -802,6 +924,82 @@ mod tests {
             Some(TouchEvent::Press { x: 123, y: 45 })
         );
         assert_eq!(board.poll_touch(), Ok(None));
+    }
+
+    #[test]
+    fn s3_board_runtime_signs_hardware_attestation_after_boot() {
+        let mut board = Esp32s3V1BoardRuntime::new(
+            TestPlatform::new(JADE_V2_MANIFEST),
+            jade_storage::MemoryStorage::new(),
+        );
+        board.platform_mut().attestation_pubkey_pem = Some(b"pubkey".to_vec());
+        board.platform_mut().attestation_ext_signature = Some(b"external-signature".to_vec());
+        board.platform_mut().attestation_signature = Some(b"device-signature".to_vec());
+
+        let mut signature = [0u8; 32];
+        let mut pubkey = [0u8; 16];
+        let mut ext_signature = [0u8; 32];
+        assert_eq!(
+            board.sign_hardware_attestation(
+                b"challenge",
+                &mut signature,
+                &mut pubkey,
+                &mut ext_signature
+            ),
+            Err(FirmwareFrameError::BootRequired)
+        );
+
+        board.boot().unwrap();
+        let reply = board
+            .sign_hardware_attestation(
+                b"challenge",
+                &mut signature,
+                &mut pubkey,
+                &mut ext_signature,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.signature, b"device-signature");
+        assert_eq!(reply.pubkey_pem, b"pubkey");
+        assert_eq!(reply.ext_signature, b"external-signature");
+        assert_eq!(
+            board.platform().attestation_challenge.as_deref(),
+            Some(&b"challenge"[..])
+        );
+    }
+
+    #[test]
+    fn s3_hardware_attestation_reports_unavailable_or_oversized_material() {
+        let mut platform = TestPlatform::new(JADE_V2_MANIFEST);
+        platform.attestation_available = false;
+        let mut signature = [0u8; 4];
+        let mut pubkey = [0u8; 4];
+        let mut ext_signature = [0u8; 4];
+        assert_eq!(
+            sign_hardware_attestation(
+                &mut platform,
+                b"challenge",
+                &mut signature,
+                &mut pubkey,
+                &mut ext_signature
+            ),
+            Ok(None)
+        );
+
+        platform.attestation_available = true;
+        platform.attestation_pubkey_pem = Some(b"too-large".to_vec());
+        platform.attestation_ext_signature = Some(b"ok".to_vec());
+        platform.attestation_signature = Some(b"ok".to_vec());
+        assert_eq!(
+            sign_hardware_attestation(
+                &mut platform,
+                b"challenge",
+                &mut signature,
+                &mut pubkey,
+                &mut ext_signature
+            ),
+            Err(DeviceBootFailure::TransportUnavailable)
+        );
     }
 
     #[test]
