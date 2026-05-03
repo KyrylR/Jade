@@ -6,18 +6,65 @@ be expanded under differential tests.
 
 ## Architecture
 
-- `jade-core`: `no_std + alloc` state and core errors.
+- `jade-core`: `no_std + alloc` state, core errors, device runtime, and
+  firmware frame dispatch.
 - `jade-protocol-v1`: current CBOR-RPC compatibility catalog and v1 wire limits.
 - `jade-protocol-v2`: typed canonical request/response model.
 - `jade-crypto`: backend traits for secp256k1, P-256, and BIP85 RSA behavior.
 - `jade-storage`: storage trait boundary for NVS/host backends.
-- `jade-emulator`: host-side Rust emulator entrypoint.
-- `jade-fw-esp32s3`: Jade v2/v2c platform shell.
-- `jade-fw-esp32`: Jade v1/v1.1 platform shell.
+- `jade-emulator`: Rust v1 behavior engine and host emulator entrypoint. The
+  library now supports `no_std + alloc` with `default-features = false`; the
+  CLI binary keeps the default `std` feature for host conveniences.
+- `jade-fw-esp32s3`: Jade v2/v2c platform shell with official target
+  manifests, partition/OTA slot budgets, runtime constructor, and ESP32-S3
+  capability traits for serial, BLE, USB, camera QR, touch, rollback, and
+  hardware attestation.
+- `jade-fw-esp32`: Jade v1/v1.1 platform shell with official target
+  manifests, partition/OTA slot budgets, runtime constructor, and ESP32
+  capability traits for serial, BLE, camera QR, rollback, and release security
+  gates.
 
 The core is intentionally not tied to ESP-IDF, `esp-hal`, Embassy, radio, USB,
 camera, or OTA implementations. Those remain platform shims until each subsystem
 has parity evidence.
+
+## Real-Device Firmware Boundary
+
+The first real-device Rust boundary now exists in code rather than just in this
+plan. `jade-core::DeviceRuntime` owns the shared `CoreState`, accepts any
+target platform that implements `DevicePlatform`, performs boot readiness
+checks, exposes the target `DeviceManifest`, and dispatches typed v2 requests
+through the same core path used by host tests. `jade-core::FirmwareProtocol`
+and `DeviceRuntime::handle_firmware_frame` process v1 CBOR compatibility frames
+and v2 typed CBOR frames after boot, returning `BootRequired` before the
+platform is ready. The target firmware crates bind that generic runtime to the
+official Jade targets:
+
+| Crate | Official targets | SoC | Partition baseline | Required platform shims |
+| --- | --- | --- | --- | --- |
+| `jade-fw-esp32s3` | `jade_v2`, `jade_v2c` | ESP32-S3 | `partitionss3.csv`, dual 4024K OTA slots, 64K NVS, attest partition | serial, BLE, USB, camera QR, touch, entropy, storage, OTA/rollback, hardware attestation |
+| `jade-fw-esp32` | `jade`, `jade_v1_1` | ESP32 | `partitions.csv`, dual 1984K OTA slots, 16K NVS | serial, BLE, camera QR, entropy, storage, OTA/rollback |
+
+Both firmware crates now assert their manifests against shipping partition
+sizes and release gates: dual OTA slots, secure boot, flash encryption,
+anti-rollback, required user I/O, and the correct ESP32 vs. ESP32-S3 capability
+split. They also expose transport pollers for the real links:
+`jade-fw-esp32s3` has serial, USB, and BLE pollers for v1/v2 CBOR frames, while
+`jade-fw-esp32` has serial and BLE pollers. Each poller reads one frame through
+the platform shim, dispatches it through `DeviceRuntime`, and writes the reply
+back through the same link.
+
+This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
+concrete target API: implement the platform shim traits for an `esp-hal` or
+conservative ESP-IDF-hosted transitional backend, boot `DeviceRuntime`, and call
+the transport pollers from the board event loop.
+
+The large v1 wallet/signing implementation is also no longer intrinsically
+host-only: `cargo check -p jade-emulator --no-default-features --lib` passes, so
+that Rust behavior engine can be split further and linked into firmware crates
+without pulling in `std`. The remaining extraction work is to replace
+`HostPlatform`/`MemoryStorage` ownership with device-backed storage, entropy,
+clock, display, camera, and confirmation traits.
 
 ## State Domains
 

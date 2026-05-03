@@ -499,6 +499,8 @@ name = "jade-fw-esp32"
 version = "0.1.0"
 dependencies = [
  "jade-core",
+ "jade-protocol-v2",
+ "minicbor",
 ]
 
 [[package]]
@@ -506,6 +508,8 @@ name = "jade-fw-esp32s3"
 version = "0.1.0"
 dependencies = [
  "jade-core",
+ "jade-protocol-v2",
+ "minicbor",
 ]
 
 [[package]]

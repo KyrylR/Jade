@@ -1,10 +1,17 @@
-use std::borrow::Cow;
-use std::boxed::Box;
-use std::fmt;
-use std::str;
-use std::string::String;
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt;
+use core::str;
+#[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::vec::Vec;
 
 use jade_core::{
     bip32_path::{JadeDerivationPath, MAX_PATH_LEN},
@@ -4232,10 +4239,18 @@ fn bad_parameters(message: &'static str) -> V1Outcome {
 }
 
 fn current_unix_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+    #[cfg(feature = "std")]
+    {
+        return SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        0
+    }
 }
 
 fn split_once_byte(value: &str, byte: u8) -> Option<(&str, &str)> {

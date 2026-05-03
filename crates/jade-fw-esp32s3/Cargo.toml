@@ -8,3 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 jade-core.workspace = true
+
+[dev-dependencies]
+jade-protocol-v2.workspace = true
+minicbor = { workspace = true, features = ["std"] }
