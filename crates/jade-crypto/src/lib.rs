@@ -793,6 +793,23 @@ pub mod pure_rust {
         const CODE_LENGTH: usize = 1024;
     }
 
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    enum Blech32m {}
+
+    impl bech32::Checksum for Blech32m {
+        type MidstateRepr = u64;
+        const CHECKSUM_LENGTH: usize = 12;
+        const GENERATOR_SH: [u64; 5] = [
+            0x7d52fba40bd886,
+            0x5e8dbf1a03950c,
+            0x1c3a3c74072a18,
+            0x385d72fa0e5139,
+            0x7093e5a608865b,
+        ];
+        const TARGET_RESIDUE: u64 = 0x455972a3350f7a1;
+        const CODE_LENGTH: usize = 1024;
+    }
+
     pub fn sign_bitcoin_message_from_seed(
         seed: &[u8],
         path: &[u32],
@@ -3069,7 +3086,10 @@ pub mod pure_rust {
                 payload.extend_from_slice(&script_hash);
                 Some(base58ck::encode_check(&payload))
             }
-            SinglesigScriptVariant::Tr => None,
+            SinglesigScriptVariant::Tr => {
+                let output_key = elements_taproot_keyspend_output_key(&public_key)?;
+                bech32::segwit::encode_v1(liquid_segwit_hrp(network), &output_key).ok()
+            }
         }
     }
 
@@ -3115,7 +3135,13 @@ pub mod pure_rust {
                     &blinding_public_key,
                 )
             }
-            SinglesigScriptVariant::Tr => None,
+            SinglesigScriptVariant::Tr => {
+                let output_key = elements_taproot_keyspend_output_key(&public_key)?;
+                let script_pubkey = p2tr_script_pubkey(&output_key);
+                let blinding_public_key =
+                    blinding_public_key_for_script(master_unblinding_key, &script_pubkey)?;
+                liquid_confidential_taproot_address(network, &output_key, &blinding_public_key)
+            }
         }
     }
 
@@ -3256,6 +3282,27 @@ pub mod pure_rust {
             .bytes_to_fes()
             .with_checksum::<Blech32>(&hrp)
             .with_witness_version(bech32::Fe32::Q)
+            .chars();
+
+        let mut output = String::new();
+        output.extend(chars);
+        Some(output)
+    }
+
+    fn liquid_confidential_taproot_address(
+        network: LiquidNetwork,
+        witness_program: &[u8; SHA256_LEN],
+        blinding_public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<String> {
+        let hrp = liquid_blech32_hrp(network);
+        let byte_iter = blinding_public_key
+            .iter()
+            .copied()
+            .chain(witness_program.iter().copied());
+        let chars = byte_iter
+            .bytes_to_fes()
+            .with_checksum::<Blech32m>(&hrp)
+            .with_witness_version(bech32::Fe32::P)
             .chars();
 
         let mut output = String::new();
@@ -3467,13 +3514,26 @@ pub mod pure_rust {
     pub(crate) fn taproot_keyspend_output_key(
         public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
     ) -> Option<[u8; SHA256_LEN]> {
+        taproot_keyspend_output_key_with_tag(public_key, b"TapTweak")
+    }
+
+    fn elements_taproot_keyspend_output_key(
+        public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+    ) -> Option<[u8; SHA256_LEN]> {
+        taproot_keyspend_output_key_with_tag(public_key, b"TapTweak/elements")
+    }
+
+    fn taproot_keyspend_output_key_with_tag(
+        public_key: &[u8; EC_PUBLIC_KEY_COMPRESSED_LEN],
+        tag: &[u8],
+    ) -> Option<[u8; SHA256_LEN]> {
         let mut even_internal_key = [0u8; EC_PUBLIC_KEY_COMPRESSED_LEN];
         even_internal_key[0] = 0x02;
         even_internal_key[1..].copy_from_slice(&public_key[1..]);
 
         let internal_public_key = PublicKey::from_sec1_bytes(&even_internal_key).ok()?;
         let internal_point = ProjectivePoint::from(*internal_public_key.as_affine());
-        let tweak_hash = tagged_hash(b"TapTweak", &public_key[1..]);
+        let tweak_hash = tagged_hash(tag, &public_key[1..]);
         let tweak_bytes: FieldBytes = tweak_hash.into();
         let tweak = <Scalar as Reduce<U256>>::reduce_bytes(&tweak_bytes);
         let output_point = (internal_point + ProjectivePoint::GENERATOR * tweak).to_affine();
@@ -3954,6 +4014,39 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn liquid_taproot_singlesig_addresses_match_fixed_vectors() {
+        let seed =
+            decode_hex_32("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c");
+        let master_unblinding_key = slip77_master_unblinding_key_from_seed(&seed).unwrap();
+        let path = [0x8000_0000, 0x8000_0000, 0x8000_0004];
+
+        let unconfidential = pure_rust::liquid_unconfidential_singlesig_address_from_seed(
+            &seed,
+            &path,
+            LiquidNetwork::Regtest,
+            SinglesigScriptVariant::Tr,
+        )
+        .unwrap();
+        let confidential = pure_rust::liquid_confidential_singlesig_address_from_seed(
+            &seed,
+            &path,
+            LiquidNetwork::Regtest,
+            SinglesigScriptVariant::Tr,
+            &master_unblinding_key,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unconfidential,
+            "ert1pv0u7jvpmt7x7ld7zgnuwe66j4zdat6mfjmsyeplayjknye8rnsusjjwqq7"
+        );
+        assert_eq!(
+            confidential,
+            "el1pqw7kmd69pjf6raw5crdkfjjvj6j0vjfh4njkhhvkn7uau9hz36fqscleaycrkhuda7muy38can4492ym6h4kn9hqfjrl6f9dxfjw88peuh48sgzztuan"
+        );
     }
 
     #[test]

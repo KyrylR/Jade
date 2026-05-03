@@ -1140,11 +1140,6 @@ impl Emulator {
                     method: "get_receive_address".to_string(),
                 };
             };
-            if variant == jade_crypto::SinglesigScriptVariant::Tr {
-                return V1Outcome::DeferredToCore {
-                    method: "get_receive_address".to_string(),
-                };
-            }
             if confidential {
                 jade_crypto::pure_rust::liquid_confidential_singlesig_address_from_seed(
                     seed,
@@ -8091,6 +8086,70 @@ mod tests {
     }
 
     #[test]
+    fn get_receive_address_derives_liquid_taproot_singlesig_addresses() {
+        let seed =
+            decode_hex::<32>("b90e532426d0dc20fffe01037048c018e940300038b165c211915c672e07762c");
+        let master_unblinding_key =
+            jade_crypto::slip77_master_unblinding_key_from_seed(&seed).unwrap();
+        let mut emulator = Emulator::new();
+        emulator.platform_mut().set_debug_wallet_seed(seed.to_vec());
+        emulator
+            .platform_mut()
+            .set_master_unblinding_key(master_unblinding_key);
+
+        for (confidential, expected) in [
+            (
+                false,
+                "ert1pv0u7jvpmt7x7ld7zgnuwe66j4zdat6mfjmsyeplayjknye8rnsusjjwqq7",
+            ),
+            (
+                true,
+                "el1pqw7kmd69pjf6raw5crdkfjjvj6j0vjfh4njkhhvkn7uau9hz36fqscleaycrkhuda7muy38can4492ym6h4kn9hqfjrl6f9dxfjw88peuh48sgzztuan",
+            ),
+        ] {
+            let mut params = Vec::new();
+            minicbor::Encoder::new(&mut params)
+                .map(4)
+                .unwrap()
+                .str("network")
+                .unwrap()
+                .str("localtest-liquid")
+                .unwrap()
+                .str("variant")
+                .unwrap()
+                .str("tr(k)")
+                .unwrap()
+                .str("confidential")
+                .unwrap()
+                .bool(confidential)
+                .unwrap()
+                .str("path")
+                .unwrap()
+                .array(3)
+                .unwrap()
+                .u32(0x8000_0000)
+                .unwrap()
+                .u32(0x8000_0000)
+                .unwrap()
+                .u32(0x8000_0004)
+                .unwrap();
+            let request = Request {
+                id: Cow::Borrowed("a"),
+                method: Cow::Borrowed("get_receive_address"),
+                params: Some(&params),
+            };
+
+            assert_eq!(
+                emulator.handle_v1_request(&request),
+                V1Outcome::TextResult {
+                    result: expected.to_string()
+                },
+                "confidential={confidential}"
+            );
+        }
+    }
+
+    #[test]
     fn get_receive_address_derives_taproot_bip86_address() {
         let mut emulator = Emulator::new();
         emulator.platform_mut().set_debug_wallet_seed(vec![
@@ -9339,7 +9398,7 @@ mod tests {
     }
 
     #[test]
-    fn get_receive_address_rejects_invalid_singlesig_inputs_and_defers_other_branches() {
+    fn get_receive_address_rejects_invalid_singlesig_inputs() {
         let mut emulator = Emulator::new();
         emulator
             .platform_mut()
@@ -9459,40 +9518,6 @@ mod tests {
             V1Outcome::Reject {
                 code: ErrorCode::BadParameters,
                 message: "Cannot find named multisig wallet".to_string()
-            }
-        );
-
-        let mut params = Vec::new();
-        minicbor::Encoder::new(&mut params)
-            .map(4)
-            .unwrap()
-            .str("network")
-            .unwrap()
-            .str("liquid")
-            .unwrap()
-            .str("variant")
-            .unwrap()
-            .str("tr(k)")
-            .unwrap()
-            .str("confidential")
-            .unwrap()
-            .bool(false)
-            .unwrap()
-            .str("path")
-            .unwrap()
-            .array(1)
-            .unwrap()
-            .u32(0x8000_0000)
-            .unwrap();
-        let request = Request {
-            id: Cow::Borrowed("a"),
-            method: Cow::Borrowed("get_receive_address"),
-            params: Some(&params),
-        };
-        assert_eq!(
-            emulator.handle_v1_request(&request),
-            V1Outcome::DeferredToCore {
-                method: "get_receive_address".to_string()
             }
         );
     }
