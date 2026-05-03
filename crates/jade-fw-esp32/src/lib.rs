@@ -103,6 +103,53 @@ pub struct Esp32BoardStreamBuffers<'a> {
     pub qr_buffer: &'a mut [u8],
 }
 
+#[derive(Debug)]
+pub struct Esp32BoardStreamStorage {
+    serial_frame_buffer: [u8; RX_BUFFER_BYTES],
+    ble_frame_buffer: [u8; RX_BUFFER_BYTES],
+    qr_buffer: [u8; QR_BUFFER_BYTES],
+}
+
+impl Esp32BoardStreamStorage {
+    pub const SERIAL_CAPACITY: usize = RX_BUFFER_BYTES;
+    pub const BLE_CAPACITY: usize = RX_BUFFER_BYTES;
+    pub const QR_CAPACITY: usize = QR_BUFFER_BYTES;
+
+    pub const fn new() -> Self {
+        Self {
+            serial_frame_buffer: [0; Self::SERIAL_CAPACITY],
+            ble_frame_buffer: [0; Self::BLE_CAPACITY],
+            qr_buffer: [0; Self::QR_CAPACITY],
+        }
+    }
+
+    pub fn buffers(&mut self) -> Esp32BoardStreamBuffers<'_> {
+        Esp32BoardStreamBuffers {
+            serial_frame_buffer: &mut self.serial_frame_buffer,
+            ble_frame_buffer: &mut self.ble_frame_buffer,
+            qr_buffer: &mut self.qr_buffer,
+        }
+    }
+
+    pub const fn serial_capacity(&self) -> usize {
+        Self::SERIAL_CAPACITY
+    }
+
+    pub const fn ble_capacity(&self) -> usize {
+        Self::BLE_CAPACITY
+    }
+
+    pub const fn qr_capacity(&self) -> usize {
+        Self::QR_CAPACITY
+    }
+}
+
+impl Default for Esp32BoardStreamStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> Esp32BoardStreamBuffers<'a> {
     pub fn validate(&self) -> Result<(), Esp32BoardAppError> {
         validate_board_stream_buffers(
@@ -239,6 +286,14 @@ where
         )?))
     }
 
+    pub fn new_from_storage(
+        platform: P,
+        storage_backend: B,
+        storage: &'a mut Esp32BoardStreamStorage,
+    ) -> Result<Self, Esp32BoardAppError> {
+        Self::new_from_parts(platform, storage_backend, storage.buffers())
+    }
+
     pub fn app(&self) -> &Esp32BoardStreamApp<'a, P, B> {
         &self.app
     }
@@ -330,6 +385,14 @@ where
             jade_storage::NvsStorage::new(nvs_backend),
             buffers,
         )
+    }
+
+    pub fn new_with_nvs_storage(
+        platform: P,
+        nvs_backend: B,
+        storage: &'a mut Esp32BoardStreamStorage,
+    ) -> Result<Self, Esp32BoardAppError> {
+        Self::new_with_nvs(platform, nvs_backend, storage.buffers())
     }
 }
 
@@ -455,6 +518,14 @@ where
         })
     }
 
+    pub fn new_with_storage(
+        platform: P,
+        storage_backend: B,
+        storage: &'a mut Esp32BoardStreamStorage,
+    ) -> Result<Self, Esp32BoardAppError> {
+        Self::new_with_buffers(platform, storage_backend, storage.buffers())
+    }
+
     pub fn boot(&mut self) -> Result<jade_core::DeviceBootReport, DeviceRuntimeError> {
         self.runtime.boot()
     }
@@ -529,6 +600,20 @@ where
             serial_frame_buffer,
             ble_frame_buffer,
             qr_buffer,
+        )
+    }
+
+    pub fn new_with_nvs_storage(
+        platform: P,
+        nvs_backend: B,
+        storage: &'a mut Esp32BoardStreamStorage,
+    ) -> Result<Self, Esp32BoardAppError> {
+        Self::new_with_nvs(
+            platform,
+            nvs_backend,
+            storage.serial_frame_buffer.as_mut_slice(),
+            storage.ble_frame_buffer.as_mut_slice(),
+            storage.qr_buffer.as_mut_slice(),
         )
     }
 }
@@ -2168,18 +2253,35 @@ mod tests {
 
     #[test]
     fn esp32_board_stream_loop_builds_from_startup_buffers_and_nvs() {
-        let mut serial_frames = vec![0; RX_BUFFER_BYTES];
-        let mut ble_frames = vec![0; RX_BUFFER_BYTES];
-        let mut qr = vec![0; QR_BUFFER_BYTES];
-        let buffers = Esp32BoardStreamBuffers {
-            serial_frame_buffer: &mut serial_frames,
-            ble_frame_buffer: &mut ble_frames,
-            qr_buffer: &mut qr,
-        };
+        let mut storage = Esp32BoardStreamStorage::new();
+        assert_eq!(storage.serial_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(storage.ble_capacity(), RX_BUFFER_BYTES);
+        assert_eq!(storage.qr_capacity(), QR_BUFFER_BYTES);
+        assert_eq!(storage.buffers().validate(), Ok(()));
+
         let mut event_loop = Esp32BoardStreamLoop::new_with_nvs(
             TestPlatform::new(JADE_MANIFEST),
             TestNvs::new(),
-            buffers,
+            storage.buffers(),
+        )
+        .unwrap();
+        event_loop.app_mut().runtime_mut().platform_mut().serial_rx = Some(v1_request("s", "ping"));
+
+        let mut hooks = Esp32LoopTestHooks::new(1);
+        let run = event_loop.run_until_stop(&mut hooks, 1).unwrap();
+
+        assert_eq!(run.stop_reason, Esp32BoardLoopStopReason::Hook);
+        assert_eq!(run.ticks, 1);
+        assert_eq!(event_loop.app().runtime().platform().serial_tx.len(), 1);
+    }
+
+    #[test]
+    fn esp32_board_stream_loop_builds_directly_from_static_storage() {
+        let mut storage = Esp32BoardStreamStorage::default();
+        let mut event_loop = Esp32BoardStreamLoop::new_with_nvs_storage(
+            TestPlatform::new(JADE_MANIFEST),
+            TestNvs::new(),
+            &mut storage,
         )
         .unwrap();
         event_loop.app_mut().runtime_mut().platform_mut().serial_rx = Some(v1_request("s", "ping"));

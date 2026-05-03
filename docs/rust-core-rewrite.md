@@ -136,6 +136,13 @@ Those runners also have startup constructors over named buffer bundles,
 `new_with_nvs` constructors. This gives board startup code one typed object
 for the static serial/BLE/USB/QR buffers and keeps the positional buffer
 ordering out of the final hardware entrypoint.
+For firmware targets that want the Rust crate to own the exact static buffer
+layout, the crates also provide `Esp32BoardStreamStorage` and
+`Esp32s3BoardStreamStorage`. These storage structs contain target-sized
+transport and QR arrays, expose borrow-only buffer bundles, and can be passed
+directly to the NVS-backed stream-loop constructors. The ESP32-S3 storage is
+large enough that it is intended for static or SPIRAM-backed firmware placement,
+not host-test stack allocation.
 
 This does not yet flash a board, but it gives the pure-Rust firmware bring-up a
 concrete target API: implement the platform shim traits for an `esp-hal` or
